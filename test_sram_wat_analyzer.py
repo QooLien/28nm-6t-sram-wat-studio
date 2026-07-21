@@ -33,6 +33,9 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((image_dir/"00_28nm_6t_bitcell_architecture.svg").exists())
             self.assertEqual(len(list(image_dir.glob("*.svg"))), 13)
             self.assertTrue((image_dir/"image_manifest.csv").exists())
+            report_html = report.read_text(encoding="utf-8")
+            self.assertIn("WT sweep setup:", report_html)
+            self.assertIn("Start=", report_html)
             with open(report.parent/"sram_wat_results.csv", encoding="utf-8-sig") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 15)
 

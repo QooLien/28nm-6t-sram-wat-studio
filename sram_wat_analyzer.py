@@ -663,11 +663,12 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     </style></head><body><main>
     <h1>28 nm 6T SRAM × WAT Analysis</h1><p>Corner: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode","Grouped"))}</b> · Test target: <b>{analysis_target}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
     <div class="summary"><b>Data meaning:</b> PU / PG / PD is the selected WT test target. Scan4N, Select_Write and Select_Read Vmin are manually entered measured values. Any read/write Vmin inside sensitivity charts is explicitly a model estimate and is not substituted for measured WT data.</div>
+    <div class="summary"><b>WT sweep setup:</b> Start={cfg["vmin_start"]:.3f} V · Stop={cfg["vmin_stop"]:.3f} V · Step={cfg["vmin_step"]:.3f} V. These are actual tester recipe inputs and also define the model search range and resolution.</div>
     <div class="note"><b>28 nm 固定模型：</b>{html.escape(tech["topology"])}；L={tech["channel_length_nm"]:g} nm，WPU/WPG/WPD={tech["pu_width_nm"]:g}/{tech["pg_width_nm"]:g}/{tech["pd_width_nm"]:g} nm，T={tech["nominal_temperature_c"]:g} °C。這是 generic 28 nm 推演模型；沒有 foundry PDK，因此不宣稱對應特定晶圓廠或取代量產 sign-off。</div>
     <section><img src="{architecture_path}" alt="Generic 28 nm 6T bitcell architecture"></section>
     {wt_section}
     {individual_section}
-    <div class="summary"><b>Model sensitivity only:</b> Vt ±{cfg["vt_step"]*1000:.0f} mV and Ids ±{cfg["ids_step_pct"]:g}% are varied one at a time. Read SNM and model-estimated read/write margins are used only for directional comparison; they do not overwrite the manually entered WT Vmin. Positive ΔRSNM means improved model stability.</div>
+    <div class="summary"><b>Assumed sensitivity sweep — not WAT measured data:</b> Vt ±{cfg["vt_step"]*1000:.0f} mV and Isat/Ids ±{cfg["ids_step_pct"]:g}% are internal engineering scenarios varied one at a time. You do not need to obtain these two variation values from the WAT report. Model-estimated margins are used only for directional comparison and do not overwrite manually entered WT Vmin.</div>
     <section><h2>WAT Vt / Ids comparison</h2><table><thead><tr><th>Device</th><th>Vt (V)</th><th>Ids (uA)</th><th>Normalized Ids</th></tr></thead><tbody>{wat_rows}</tbody></table><p>{ratio}</p></section>
     {''.join(sections)}
     <p>Raw data: <code>sram_wat_results.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/</code> with <code>image_manifest.csv</code>.</p></main></body></html>'''
@@ -773,8 +774,8 @@ def launch_gui() -> None:
     BLUE, BLUE_DARK, BORDER, GREEN, RED = "#007AFF", "#0062CC", "#D2D2D7", "#34C759", "#FF3B30"
     root = tk.Tk()
     root.title("28 nm 6T SRAM — WAT Studio")
-    root.geometry("1120x780")
-    root.minsize(1040, 720)
+    root.geometry("1120x860")
+    root.minsize(1040, 790)
     root.configure(bg=BG)
 
     style = ttk.Style(root)
@@ -915,10 +916,20 @@ def launch_gui() -> None:
         ttk.Label(measured_grid, text="V", style="Meta.TLabel").grid(row=row, column=2, sticky="w")
     measured_grid.columnconfigure(0, weight=1)
 
+    ttk.Label(right, text="WT Sweep Setup", style="Body.TLabel").pack(anchor="w", pady=(2, 0))
+    ttk.Label(right, text="Actual tester recipe used to obtain the measured Vmin.",
+              style="Meta.TLabel", wraplength=330).pack(anchor="w", pady=(2, 5))
+    sweep_grid = ttk.Frame(right, style="Card.TFrame"); sweep_grid.pack(fill="x", pady=(0, 12))
+    for row, (key, label) in enumerate((("vmin_start", "Start"), ("vmin_stop", "Stop"), ("vmin_step", "Step"))):
+        ttk.Label(sweep_grid, text=label, style="Body.TLabel").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(sweep_grid, textvariable=numeric[key], width=10,
+                  style="Apple.TEntry").grid(row=row, column=1, sticky="e", padx=(10, 5))
+        ttk.Label(sweep_grid, text="V", style="Meta.TLabel").grid(row=row, column=2, sticky="w")
+    sweep_grid.columnconfigure(0, weight=1)
+
     ttk.Label(right, text="Model settings", style="Body.TLabel").pack(anchor="w", pady=(2, 0))
     config_grid = ttk.Frame(right, style="Card.TFrame"); config_grid.pack(fill="x")
     labels = [("nominal_vdd", "SRAM VDD", "V"), ("wat_vdd", "WAT VDD", "V"),
-              ("vt_step", "Vt variation", "V"), ("ids_step_pct", "Ids variation", "%"),
               ("read_snm_limit", "Read SNM limit", "V")]
     for row, (key, label, unit) in enumerate(labels):
         ttk.Label(config_grid, text=label, style="Body.TLabel").grid(row=row, column=0, sticky="w", pady=5)
