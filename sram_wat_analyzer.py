@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""6T SRAM / WAT compact-model correlation and sensitivity analyzer.
+"""6T SRAM / WAT compact-model correlation and cell-level SNM analyzer.
 
 This is an engineering exploration model.  It calibrates simple square-law MOS
 devices from WAT Vt and Ids and is intentionally independent of a PDK/ngspice.
@@ -37,6 +37,43 @@ class MosWat:
     """WAT parameters owned by one physical MOS in the bitcell."""
     vt: float
     ids: float
+
+
+@dataclass(frozen=True)
+class DatasheetTargets:
+    """PU/PG/PD datasheet targets used only for WAT comparison."""
+    pu: MosWat
+    pg: MosWat
+    pd: MosWat
+
+
+@dataclass(frozen=True)
+class JudgmentTargets:
+    """User-owned design/datasheet limits for model-derived cell metrics."""
+    cell_ratio_min: float = 1.20
+    pull_up_ratio_min: float = 1.50
+    hold_snm_min_mv: float = 300.0
+    read_snm_min_mv: float = 200.0
+    write_snm_min_mv: float = 100.0
+    marginal_band_pct: float = 10.0
+
+
+@dataclass(frozen=True)
+class TargetValidationSettings:
+    """User-owned bands/specs used to validate WAT targets against measured WT."""
+    vt_tolerance_mv: float = 15.0
+    idsat_tolerance_pct: float = 8.0
+    scan4n_vmin_max: float = 0.650
+    select_write_vmin_max: float = 0.600
+    select_read_vmin_max: float = 0.620
+    minimum_statistical_n: int = 10
+
+
+DISPLAY_MOS_NAMES = {
+    "pu1": "PUL", "pu2": "PUR",
+    "pg1": "PGL", "pg2": "PGR",
+    "pd1": "PDL", "pd2": "PDR",
+}
 
 
 @dataclass(frozen=True)
@@ -104,8 +141,8 @@ class Config:
     nominal_vdd: float = 0.90
     vt_step: float = 0.030
     ids_step_pct: float = 10.0
-    vmin_start: float = 0.25
-    vmin_stop: float = 1.05
+    vmin_start: float = 0.40
+    vmin_stop: float = 0.90
     vmin_step: float = 0.01
     read_snm_limit: float = 0.030
     grid_points: int = 301
@@ -208,6 +245,33 @@ class Sram6T:
                 hi = mid
         return (lo + hi) / 2
 
+    def transfer_with_bitline(self, vin: float, vdd: float, bitline: float) -> float:
+        """Inverter transfer with WL high and the access device tied to bitline."""
+        def balance(vout: float) -> float:
+            return (self.pu.current(vdd - vin, vdd - vout) - self.pd.current(vin, vout) +
+                    self._access_current(self.pg, vout, bitline, vdd))
+        lo, hi = 0.0, vdd
+        if balance(lo) <= 0:
+            return 0.0
+        if balance(hi) >= 0:
+            return vdd
+        for _ in range(48):
+            mid = (lo + hi) / 2
+            if balance(mid) > 0:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2
+
+    def write_vtc_pair(self, vdd: float, points: int = 201) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Write-condition VTC pair for BL=0 and BLB=VDD."""
+        low, high = [], []
+        for i in range(points):
+            vin = vdd * i / (points - 1)
+            low.append((vin, self.transfer_with_bitline(vin, vdd, 0.0)))
+            high.append((vin, self.transfer_with_bitline(vin, vdd, vdd)))
+        return low, high
+
     def vtc(self, vdd: float, mode: str = "hold", points: int | None = None) -> list[tuple[float, float]]:
         n = points or self.cfg.grid_points
         return [(vdd * i / (n - 1), self.transfer(vdd * i / (n - 1), vdd, mode)) for i in range(n)]
@@ -240,6 +304,44 @@ class Sram6T:
         for _ in range(42):
             mid = (lo + hi) / 2
             if fits(mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def strength_ratios(self) -> dict[str, float]:
+        """Return Vt-aware model-beta ratios plus direct WAT-current proxies."""
+        return {
+            "cell_ratio_beta": self.pd.beta / self.pg.beta,
+            "pull_up_ratio_beta": self.pg.beta / self.pu.beta,
+            "cell_ratio_ids_proxy": self.wat.pd_ids / self.wat.pg_ids,
+            "pull_up_ratio_ids_proxy": self.wat.pg_ids / self.wat.pu_ids,
+        }
+
+    def write_snm(self, vdd: float) -> float:
+        """Compact-model write bitline-noise margin (V).
+
+        The result is the largest voltage allowed on the nominally-low write
+        bitline while PG can still overcome PU at the hold inverter trip point.
+        This is a directional WAT-calibrated proxy, not a foundry sign-off WSNM.
+        """
+        if vdd <= 0:
+            return 0.0
+        trip = self.trip_point(vdd, "hold")
+        pull_up = self.pu.current(vdd, vdd - trip)
+
+        def writable(low_bitline: float) -> bool:
+            if low_bitline >= trip:
+                return False
+            access = self.pg.current(vdd - low_bitline, trip - low_bitline)
+            return access >= pull_up
+
+        if not writable(0.0):
+            return 0.0
+        lo, hi = 0.0, trip
+        for _ in range(42):
+            mid = (lo + hi) / 2
+            if writable(mid):
                 lo = mid
             else:
                 hi = mid
@@ -370,8 +472,10 @@ def metric(model: Sram6T, cfg: Config) -> dict[str, float | None]:
     return {
         "hold_snm_mv": 1000 * model.snm(cfg.nominal_vdd, "hold"),
         "read_snm_mv": 1000 * model.snm(cfg.nominal_vdd, "read"),
+        "write_snm_mv": 1000 * model.write_snm(cfg.nominal_vdd),
         "read_vmin_v": model.read_vmin(),
         "write_vmin_v": model.write_vmin(),
+        **model.strength_ratios(),
     }
 
 
@@ -384,66 +488,342 @@ def cell_metric(cell: SixTWatCell, cfg: Config) -> dict[str, float | None]:
     return {
         "hold_snm_mv": min(s["hold_snm_mv"] for s in sides),
         "read_snm_mv": min(s["read_snm_mv"] for s in sides),
+        "write_snm_mv": min(s["write_snm_mv"] for s in sides),
         "read_vmin_v": worst_high("read_vmin_v"),
         "write_vmin_v": worst_high("write_vmin_v"),
+        "cell_ratio_beta": min(s["cell_ratio_beta"] for s in sides),
+        "pull_up_ratio_beta": min(s["pull_up_ratio_beta"] for s in sides),
+        "cell_ratio_ids_proxy": min(s["cell_ratio_ids_proxy"] for s in sides),
+        "pull_up_ratio_ids_proxy": min(s["pull_up_ratio_ids_proxy"] for s in sides),
     }
+
+
+def evaluate_judgment(metrics: dict[str, float | None],
+                      targets: JudgmentTargets) -> dict:
+    """Evaluate four higher-is-better SRAM metrics against user-owned limits."""
+    definitions = (
+        ("cell_ratio", "Cell Ratio", "cell_ratio_beta", targets.cell_ratio_min, "ratio",
+         "Increase PD strength or reduce PG strength; then re-check write margin."),
+        ("pull_up_ratio", "Pull-up Ratio", "pull_up_ratio_beta", targets.pull_up_ratio_min, "ratio",
+         "Increase PG strength or reduce PU strength to improve writeability."),
+        ("hold_snm", "Hold SNM", "hold_snm_mv", targets.hold_snm_min_mv, "mV",
+         "Check PU/PD balance and left-right mismatch; PG is off during hold."),
+        ("read_snm", "Read SNM", "read_snm_mv", targets.read_snm_min_mv, "mV",
+         "Increase PD relative to PG, then verify the writeability trade-off."),
+        ("write_snm", "Write SNM", "write_snm_mv", targets.write_snm_min_mv, "mV",
+         "Increase PG strength or reduce PU strength; verify Read SNM trade-off."),
+    )
+    rows = []
+    for key, label, metric_key, target, unit, action in definitions:
+        value = metrics.get(metric_key)
+        if value is None:
+            status, margin, margin_pct = "N/A", None, None
+        else:
+            margin = value - target
+            margin_pct = margin / target * 100 if target else None
+            if value >= target:
+                status = "PASS"
+            elif value >= target * (1 - targets.marginal_band_pct / 100):
+                status = "MARGINAL"
+            else:
+                status = "FAIL"
+        displayed_action = ("Meets target; no corrective adjustment is required."
+                            if status == "PASS" else action)
+        rows.append({"key": key, "label": label, "metric_key": metric_key,
+                     "value": value, "target": target, "unit": unit,
+                     "margin": margin, "margin_pct": margin_pct,
+                     "status": status, "recommended_action": displayed_action})
+    statuses = [row["status"] for row in rows]
+    overall = "FAIL" if "FAIL" in statuses or "N/A" in statuses else (
+        "MARGINAL" if "MARGINAL" in statuses else "PASS")
+    return {"overall_status": overall, "marginal_band_pct": targets.marginal_band_pct,
+            "targets": asdict(targets), "items": rows,
+            "rule": "All five metrics must PASS; values below target but within the marginal band are MARGINAL."}
 
 
 def analyze(wat: WatPoint, cfg: Config) -> dict:
-    groups = {}
-    for dev in ("pu", "pg", "pd"):
-        items = []
-        for label, point in variants(wat, cfg, dev):
-            model = Sram6T(point, cfg)
-            items.append({"label": label, "wat": asdict(point), "metrics": metric(model, cfg),
-                          "read_vtc": model.vtc(cfg.nominal_vdd, "read", 161)})
-        groups[dev.upper()] = items
-    return {"technology": asdict(TECH_28NM), "wat": asdict(wat), "config": asdict(cfg), "groups": groups}
+    model = Sram6T(wat, cfg)
+    write_low, write_high = model.write_vtc_pair(cfg.nominal_vdd, 201)
+    baseline = {"metrics": metric(model, cfg),
+                "hold_vtc": model.vtc(cfg.nominal_vdd, "hold", 201),
+                "read_vtc": model.vtc(cfg.nominal_vdd, "read", 201),
+                "write_vtc_low": write_low, "write_vtc_high": write_high,
+                "hold_trip_v": model.trip_point(cfg.nominal_vdd, "hold"),
+                "read_trip_v": model.trip_point(cfg.nominal_vdd, "read")}
+    return {"technology": asdict(TECH_28NM), "wat": asdict(wat), "config": asdict(cfg),
+            "strength_ratios": model.strength_ratios(), "baseline_6t": baseline, "groups": {}}
 
 
-def analyze_six_mos(cell: SixTWatCell, cfg: Config, target: str = "PG",
-                    manual_vmin: ManualVmin | None = None) -> dict:
-    """Full report plus per-physical-MOS sensitivity for an OO six-device cell."""
+def _target_comparisons(cell: SixTWatCell | ThreeTWatCell,
+                        targets: DatasheetTargets | None) -> list[dict]:
+    """Compare each measured object against its matching datasheet device target."""
+    if targets is None:
+        return []
+    if isinstance(cell, ThreeTWatCell):
+        measured = ((name.upper(), name, getattr(cell, name)) for name in ("pu", "pg", "pd"))
+    else:
+        measured = ((DISPLAY_MOS_NAMES[name], name[:2], getattr(cell, name))
+                    for name in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2"))
+    rows = []
+    for object_name, device, actual in measured:
+        target = getattr(targets, device)
+        rows.append({
+            "object": object_name,
+            "device": device.upper(),
+            "target_vt_v": target.vt,
+            "measured_vt_v": actual.vt,
+            "delta_vt_mv": round((actual.vt - target.vt) * 1000, 6),
+            "target_isat_ua": target.ids,
+            "measured_isat_ua": actual.ids,
+            "delta_isat_ua": round(actual.ids - target.ids, 6),
+            "delta_isat_pct": round((actual.ids / target.ids - 1) * 100, 6),
+        })
+    return rows
+
+
+VALIDATION_COLUMNS = (
+    "lot_wafer", "pu_vt", "pu_idsat", "pg_vt", "pg_idsat", "pd_vt", "pd_idsat",
+    "scan4n_vmin", "select_write_vmin", "select_read_vmin",
+)
+
+
+def read_validation_csv(path: str | os.PathLike[str]) -> list[dict]:
+    """Read lot/wafer history. Blank WAT fields are allowed because WT is often full-test."""
+    aliases = {"corner": "lot_wafer", "pu_ids": "pu_idsat", "pg_ids": "pg_idsat",
+               "pd_ids": "pd_idsat", "scan4n": "scan4n_vmin",
+               "select_write": "select_write_vmin", "select_read": "select_read_vmin"}
+    records: list[dict] = []
+    with open(path, newline="", encoding="utf-8-sig") as source:
+        reader = csv.DictReader(source)
+        headers = {aliases.get(name.strip().lower(), name.strip().lower())
+                   for name in (reader.fieldnames or [])}
+        required = {"lot_wafer", "scan4n_vmin", "select_write_vmin", "select_read_vmin"}
+        if missing := required - headers:
+            raise ValueError("Validation CSV missing columns: " + ", ".join(sorted(missing)))
+        for line, raw in enumerate(reader, 2):
+            canonical = {aliases.get(str(key).strip().lower(), str(key).strip().lower()): value
+                         for key, value in raw.items() if key is not None}
+            record: dict[str, str | float | None] = {
+                "lot_wafer": str(canonical.get("lot_wafer", "")).strip() or f"row_{line}"
+            }
+            for name in VALIDATION_COLUMNS[1:]:
+                value = str(canonical.get(name, "") or "").strip()
+                if not value:
+                    record[name] = None
+                    continue
+                try:
+                    number = float(value)
+                except ValueError as exc:
+                    raise ValueError(f"Validation CSV line {line}: {name} is not numeric") from exc
+                if not math.isfinite(number) or number <= 0:
+                    raise ValueError(f"Validation CSV line {line}: {name} must be positive")
+                record[name] = number
+            records.append(record)
+    return records
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) < 3 or len(xs) != len(ys):
+        return None
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    dx, dy = [x - mx for x in xs], [y - my for y in ys]
+    den = math.sqrt(sum(x*x for x in dx) * sum(y*y for y in dy))
+    return None if den == 0 else sum(x*y for x, y in zip(dx, dy)) / den
+
+
+def _ranks(values: list[float]) -> list[float]:
+    order = sorted(range(len(values)), key=values.__getitem__)
+    ranks = [0.0] * len(values)
+    index = 0
+    while index < len(order):
+        end = index + 1
+        while end < len(order) and values[order[end]] == values[order[index]]:
+            end += 1
+        average_rank = (index + 1 + end) / 2
+        for position in order[index:end]:
+            ranks[position] = average_rank
+        index = end
+    return ranks
+
+
+def _validation_record(cell: SixTWatCell | ThreeTWatCell, measured: ManualVmin) -> dict:
+    wat = cell.representative()
+    return {"lot_wafer": cell.corner, "pu_vt": wat.pu_vt, "pu_idsat": wat.pu_ids,
+            "pg_vt": wat.pg_vt, "pg_idsat": wat.pg_ids, "pd_vt": wat.pd_vt,
+            "pd_idsat": wat.pd_ids, "scan4n_vmin": measured.scan4n,
+            "select_write_vmin": measured.select_write, "select_read_vmin": measured.select_read}
+
+
+def validate_datasheet_wat_target(cell: SixTWatCell | ThreeTWatCell,
+                                  measured: ManualVmin,
+                                  targets: DatasheetTargets,
+                                  settings: TargetValidationSettings,
+                                  historical_rows: list[dict] | None = None) -> dict:
+    """Validate whether closeness to WAT targets is associated with acceptable measured WT."""
+    current = _validation_record(cell, measured)
+    history = [dict(row) for row in (historical_rows or [])
+               if str(row.get("lot_wafer", "")) != cell.corner]
+    records = history + [current]
+    target_values = {
+        "pu_vt": targets.pu.vt, "pu_idsat": targets.pu.ids,
+        "pg_vt": targets.pg.vt, "pg_idsat": targets.pg.ids,
+        "pd_vt": targets.pd.vt, "pd_idsat": targets.pd.ids,
+    }
+    limits = {"scan4n_vmin": settings.scan4n_vmin_max,
+              "select_write_vmin": settings.select_write_vmin_max,
+              "select_read_vmin": settings.select_read_vmin_max}
+
+    analyzed: list[dict] = []
+    for record in records:
+        wt_complete = all(record.get(name) is not None for name in limits)
+        wat_complete = all(record.get(name) is not None for name in target_values)
+        wt_pass = (all(float(record[name]) <= limit for name, limit in limits.items())
+                   if wt_complete else None)
+        worst_normalized = (max(float(record[name]) / limit for name, limit in limits.items())
+                            if wt_complete else None)
+        deviations: list[float] = []
+        within_flags: list[bool] = []
+        if wat_complete:
+            for name, target in target_values.items():
+                value = float(record[name])
+                if name.endswith("_vt"):
+                    normalized = abs(value - target) * 1000 / settings.vt_tolerance_mv
+                else:
+                    normalized = abs(value / target - 1) * 100 / settings.idsat_tolerance_pct
+                deviations.append(normalized)
+                within_flags.append(normalized <= 1.0)
+        distance = math.sqrt(sum(x*x for x in deviations) / len(deviations)) if deviations else None
+        target_band_pass = all(within_flags) if within_flags else None
+        if target_band_pass is None or wt_pass is None:
+            consistency = "N/A"
+        elif target_band_pass and wt_pass:
+            consistency = "TRUE ACCEPT"
+        elif target_band_pass and not wt_pass:
+            consistency = "FALSE ACCEPT"
+        elif not target_band_pass and wt_pass:
+            consistency = "FALSE REJECT"
+        else:
+            consistency = "TRUE REJECT"
+        analyzed.append({**record, "wat_complete": wat_complete, "wt_complete": wt_complete,
+                         "target_distance": distance, "target_band_pass": target_band_pass,
+                         "wt_pass": wt_pass, "worst_normalized_vmin": worst_normalized,
+                         "consistency": consistency})
+
+    paired = [row for row in analyzed if row["wat_complete"] and row["wt_complete"]]
+    inside = [row for row in paired if row["target_band_pass"]]
+    outside = [row for row in paired if not row["target_band_pass"]]
+    pass_rate = lambda group: (100 * sum(bool(row["wt_pass"]) for row in group) / len(group)
+                               if group else None)
+    inside_rate, outside_rate = pass_rate(inside), pass_rate(outside)
+    gap = None if inside_rate is None or outside_rate is None else inside_rate - outside_rate
+    xs = [float(row["target_distance"]) for row in paired]
+    ys = [float(row["worst_normalized_vmin"]) for row in paired]
+    pearson = _pearson(xs, ys)
+    spearman = _pearson(_ranks(xs), _ranks(ys)) if len(xs) >= 3 else None
+
+    enough = (len(paired) >= settings.minimum_statistical_n and len(inside) >= 3 and len(outside) >= 3)
+    if not enough:
+        verdict = "INSUFFICIENT DATA"
+        explanation = (f"Need at least {settings.minimum_statistical_n} paired rows and at least 3 rows "
+                       "inside and outside the WAT target band.")
+    elif gap is not None and gap >= 10 and spearman is not None and spearman >= 0.20:
+        verdict = "SUPPORTED"
+        explanation = "Target-band lots show a materially higher WT pass rate and target deviation tracks worse Vmin."
+    elif gap is not None and gap <= -10:
+        verdict = "CONTRADICTED"
+        explanation = "Target-band lots have a lower WT pass rate; review target center, tolerance, and sampling alignment."
+    else:
+        verdict = "INCONCLUSIVE"
+        explanation = "Available data does not show enough separation to prove this WAT target is an effective WT screen."
+
+    parameter_evidence = []
+    parameter_labels = {"pu_vt": "PU Vt", "pu_idsat": "PU Isat", "pg_vt": "PG Vt",
+                        "pg_idsat": "PG Isat", "pd_vt": "PD Vt", "pd_idsat": "PD Isat"}
+    for name, target in target_values.items():
+        feature_rows = [row for row in analyzed if row.get(name) is not None and row["wt_complete"]]
+        tolerance = (settings.vt_tolerance_mv / 1000 if name.endswith("_vt")
+                     else target * settings.idsat_tolerance_pct / 100)
+        feature_distance = [abs(float(row[name]) - target) / tolerance for row in feature_rows]
+        feature_worst = [float(row["worst_normalized_vmin"]) for row in feature_rows]
+        feature_inside = [row for row, distance in zip(feature_rows, feature_distance) if distance <= 1]
+        feature_outside = [row for row, distance in zip(feature_rows, feature_distance) if distance > 1]
+        feature_inside_rate, feature_outside_rate = pass_rate(feature_inside), pass_rate(feature_outside)
+        feature_lift = (None if feature_inside_rate is None or feature_outside_rate is None
+                        else feature_inside_rate - feature_outside_rate)
+        feature_spearman = (_pearson(_ranks(feature_distance), _ranks(feature_worst))
+                            if len(feature_rows) >= 3 else None)
+        feature_enough = (len(feature_rows) >= settings.minimum_statistical_n and
+                          len(feature_inside) >= 3 and len(feature_outside) >= 3)
+        if not feature_enough:
+            feature_verdict = "INSUFFICIENT DATA"
+        elif feature_lift is not None and feature_lift >= 10 and feature_spearman is not None and feature_spearman >= .20:
+            feature_verdict = "SUPPORTED"
+        elif feature_lift is not None and feature_lift <= -10:
+            feature_verdict = "CONTRADICTED"
+        else:
+            feature_verdict = "INCONCLUSIVE"
+        parameter_evidence.append({"parameter": parameter_labels[name], "field": name,
+                                   "target": target, "paired_n": len(feature_rows),
+                                   "inside_n": len(feature_inside), "outside_n": len(feature_outside),
+                                   "inside_wt_pass_rate_pct": feature_inside_rate,
+                                   "outside_wt_pass_rate_pct": feature_outside_rate,
+                                   "pass_rate_lift_pct_points": feature_lift,
+                                   "deviation_vs_worst_vmin_spearman": feature_spearman,
+                                   "verdict": feature_verdict})
+
+    return {
+        "objective": "Validate datasheet WAT targets using measured WT Vmin outcomes",
+        "verdict": verdict, "explanation": explanation, "settings": asdict(settings),
+        "counts": {"all_rows": len(analyzed), "wt_complete": sum(row["wt_complete"] for row in analyzed),
+                   "paired_wat_wt": len(paired), "inside_target_band": len(inside),
+                   "outside_target_band": len(outside)},
+        "statistics": {"inside_wt_pass_rate_pct": inside_rate,
+                       "outside_wt_pass_rate_pct": outside_rate,
+                       "pass_rate_lift_pct_points": gap,
+                       "target_distance_vs_worst_vmin_pearson": pearson,
+                       "target_distance_vs_worst_vmin_spearman": spearman},
+        "current_row": analyzed[-1], "rows": analyzed, "parameter_evidence": parameter_evidence,
+        "interpretation": "Positive correlation means farther from the WAT target tends to accompany higher (worse) WT Vmin.",
+    }
+
+
+def analyze_six_mos(cell: SixTWatCell, cfg: Config,
+                    datasheet_targets: DatasheetTargets | None = None,
+                    manual_vmin: ManualVmin | None = None,
+                    judgment_targets: JudgmentTargets | None = None,
+                    validation_settings: TargetValidationSettings | None = None,
+                    historical_rows: list[dict] | None = None) -> dict:
+    """Full cell-level report for an OO six-device cell."""
     result = analyze(cell.representative(), cfg)
-    target = target.upper()
-    if target not in {"PU", "PG", "PD"}:
-        raise ValueError("target must be PU, PG or PD")
-    result["analysis_target"] = target
     result["object_mode"] = "6T Independent"
     result["cell"] = {
         "corner": cell.corner,
-        "mos": {name.upper(): asdict(getattr(cell, name)) for name in ("pu1","pu2","pg1","pg2","pd1","pd2")},
+        "mos": {DISPLAY_MOS_NAMES[name]: asdict(getattr(cell, name))
+                for name in ("pu1","pu2","pg1","pg2","pd1","pd2")},
         "method": "two half-cell compact models; report uses lower SNM and higher Vmin",
     }
     baseline = cell_metric(cell, cfg)
-    sensitivity = {}
-    for name in ("pu1","pu2","pg1","pg2","pd1","pd2"):
-        mos = getattr(cell, name); items = []
-        scenarios = [
-            ("Baseline", cell),
-            (f"Vt -{cfg.vt_step*1000:.0f}mV", cell.replace_mos(name, vt=max(.01, mos.vt-cfg.vt_step))),
-            (f"Vt +{cfg.vt_step*1000:.0f}mV", cell.replace_mos(name, vt=mos.vt+cfg.vt_step)),
-            (f"Ids -{cfg.ids_step_pct:g}%", cell.replace_mos(name, ids=mos.ids*(1-cfg.ids_step_pct/100))),
-            (f"Ids +{cfg.ids_step_pct:g}%", cell.replace_mos(name, ids=mos.ids*(1+cfg.ids_step_pct/100))),
-        ]
-        for label, variant in scenarios:
-            items.append({"label": label, "metrics": cell_metric(variant, cfg)})
-        sensitivity[name.upper()] = items
     result["cell"]["baseline_metrics"] = baseline
-    result["mos_sensitivity"] = sensitivity
+    if judgment_targets:
+        result["judgment"] = evaluate_judgment(baseline, judgment_targets)
     result["wt_test_0bit"] = manual_vmin.rows() if manual_vmin else WtZeroBitVminTest(cell, cfg).run()
     result["vmin_source"] = "manual" if manual_vmin else "model"
+    result["datasheet_targets"] = asdict(datasheet_targets) if datasheet_targets else None
+    result["target_comparisons"] = _target_comparisons(cell, datasheet_targets)
+    if datasheet_targets and manual_vmin and validation_settings:
+        result["target_validation"] = validate_datasheet_wat_target(
+            cell, manual_vmin, datasheet_targets, validation_settings, historical_rows)
     return result
 
 
-def analyze_three_mos(cell: ThreeTWatCell, cfg: Config, target: str = "PG",
-                      manual_vmin: ManualVmin | None = None) -> dict:
+def analyze_three_mos(cell: ThreeTWatCell, cfg: Config,
+                      datasheet_targets: DatasheetTargets | None = None,
+                      manual_vmin: ManualVmin | None = None,
+                      judgment_targets: JudgmentTargets | None = None,
+                      validation_settings: TargetValidationSettings | None = None,
+                      historical_rows: list[dict] | None = None) -> dict:
     """Analyze a shared PU/PG/PD object set mapped onto the physical 6T cell."""
-    target = target.upper()
-    if target not in {"PU", "PG", "PD"}:
-        raise ValueError("target must be PU, PG or PD")
     result = analyze(cell.representative(), cfg)
-    result["analysis_target"] = target
     result["object_mode"] = "3T Merged"
     result["cell"] = {
         "corner": cell.corner,
@@ -453,6 +833,13 @@ def analyze_three_mos(cell: ThreeTWatCell, cfg: Config, target: str = "PG",
     }
     result["wt_test_0bit"] = manual_vmin.rows() if manual_vmin else WtZeroBitVminTest(cell.to_six_t(), cfg).run()
     result["vmin_source"] = "manual" if manual_vmin else "model"
+    result["datasheet_targets"] = asdict(datasheet_targets) if datasheet_targets else None
+    result["target_comparisons"] = _target_comparisons(cell, datasheet_targets)
+    if judgment_targets:
+        result["judgment"] = evaluate_judgment(result["cell"]["baseline_metrics"], judgment_targets)
+    if datasheet_targets and manual_vmin and validation_settings:
+        result["target_validation"] = validate_datasheet_wat_target(
+            cell, manual_vmin, datasheet_targets, validation_settings, historical_rows)
     return result
 
 
@@ -480,7 +867,7 @@ def butterfly_svg(items: list[dict], vdd: float, width: int = 900, height: int =
     pw, ph = width-left-right, height-top-bottom
     def xy(x: float, y: float) -> tuple[float, float]:
         return left + x/vdd*pw, top + (1-y/vdd)*ph
-    parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Read butterfly curve">',
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Read butterfly curve" style="font-family:Calibri,Arial,sans-serif">',
              '<rect width="100%" height="100%" fill="white"/>']
     for i in range(6):
         val = vdd*i/5; x, y = xy(val, val)
@@ -505,11 +892,11 @@ def bar_svg(items: list[dict], key: str, title: str, unit: str, width: int = 900
     vals = [x["metrics"][key] for x in items]
     finite = [v for v in vals if v is not None]
     ymax = max(finite or [1.0]) * 1.18 or 1.0
-    left, top, bottom = 55, 35, 55
+    left, top, bottom = 55, 45, 55
     pw, ph = width-left-15, height-top-bottom
     barw = pw/len(items)*0.58
-    p = [f'<svg viewBox="0 0 {width} {height}"><rect width="100%" height="100%" fill="white"/>',
-         f'<text x="{width/2}" y="24" text-anchor="middle" font-size="19" font-weight="650">{html.escape(title)}</text>',
+    p = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Arial,sans-serif"><rect width="100%" height="100%" fill="white"/>',
+         f'<text x="{width/2}" y="30" text-anchor="middle" font-size="19" font-weight="650">{html.escape(title)}</text>',
          f'<path d="M {left} {top} V {top+ph} H {left+pw}" fill="none" stroke="#374151"/>']
     for i, (item, val) in enumerate(zip(items, vals)):
         x = left + (i+.5)*pw/len(items); h = 0 if val is None else val/ymax*ph
@@ -520,26 +907,244 @@ def bar_svg(items: list[dict], key: str, title: str, unit: str, width: int = 900
     return "".join(p)
 
 
+def snm_overview_svg(result: dict, width: int = 1620, height: int = 620) -> str:
+    """Cell-level Hold/Read/Write butterfly overview with limiting SNM squares."""
+    base, cfg = result["baseline_6t"], result["config"]
+    vdd, metrics = cfg["nominal_vdd"], base["metrics"]
+    panels = [
+        ("Hold SNM", "WL=0; cell retention", base["hold_vtc"], None,
+         base["hold_trip_v"], metrics["hold_snm_mv"] / 1000, "HSNM"),
+        ("Read SNM", "WL=1; BL/BLB precharged", base["read_vtc"], None,
+         base["read_trip_v"], metrics["read_snm_mv"] / 1000, "RSNM"),
+        ("Write SNM", "BL=0 / BLB=VDD; compact-model proxy", base["write_vtc_low"],
+         base["write_vtc_high"], vdd / 2, metrics["write_snm_mv"] / 1000, "WSNM*"),
+    ]
+    margin_x, gap, panel_w = 44, 42, (width - 88 - 84) / 3
+    plot_top, plot_h = 132, 390
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="6T SRAM cell SNM butterfly analysis" style="font-family:Calibri,Arial,sans-serif">',
+             '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+             '<path d="M42 38 h28" stroke="#007AFF" stroke-width="4"/><text x="80" y="43" fill="#3A3A3C" font-size="18">Inverter VTC</text>',
+             '<path d="M240 38 h28" stroke="#FF9500" stroke-width="4" stroke-dasharray="9 7"/><text x="278" y="43" fill="#3A3A3C" font-size="18">Mirrored VTC</text>',
+             '<rect x="465" y="25" width="18" height="18" fill="none" stroke="#34C759" stroke-width="3"/><text x="494" y="42" fill="#3A3A3C" font-size="18">SNM squares in both butterfly lobes</text>']
+    for index, (title, subtitle, curve1, curve2, trip, snm_v, short) in enumerate(panels):
+        x0 = margin_x + index * (panel_w + gap)
+        plot_left, plot_w = x0 + 55, panel_w - 72
+        def xy(x: float, y: float) -> tuple[float, float]:
+            return plot_left + x / vdd * plot_w, plot_top + (1 - y / vdd) * plot_h
+        parts += [f'<text x="{x0:.1f}" y="88" fill="#1D1D1F" font-size="27" font-weight="700">{index+1}. {title}</text>',
+                  f'<text x="{x0:.1f}" y="116" fill="#6E6E73" font-size="17">{html.escape(subtitle)}</text>']
+        for tick in (0, .5, 1):
+            px, py = xy(tick*vdd, tick*vdd)
+            parts.append(f'<path d="M{px:.1f} {plot_top} V{plot_top+plot_h} M{plot_left} {py:.1f} H{plot_left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>')
+            parts.append(f'<text x="{px:.1f}" y="{plot_top+plot_h+25}" text-anchor="middle" fill="#6E6E73" font-size="15">{tick:.1f}</text>')
+            parts.append(f'<text x="{plot_left-10}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{tick:.1f}</text>')
+        blue = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x,y in curve1)
+        mirrored_source = curve2 if curve2 is not None else curve1
+        orange = " ".join(f'{xy(y,x)[0]:.1f},{xy(y,x)[1]:.1f}' for x,y in mirrored_source)
+        parts += [f'<polyline points="{blue}" fill="none" stroke="#007AFF" stroke-width="4"/>',
+                  f'<polyline points="{orange}" fill="none" stroke="#FF9500" stroke-width="4" stroke-dasharray="10 7"/>']
+        side = max(0.0, min(snm_v, vdd-trip, trip))
+        sx, sy = xy(trip, trip)
+        side_px_x, side_px_y = side/vdd*plot_w, side/vdd*plot_h
+        if index < 2:
+            ux, uy = xy(trip - side, trip + side)
+            parts += [f'<rect x="{ux:.1f}" y="{uy:.1f}" width="{side_px_x:.1f}" height="{side_px_y:.1f}" fill="none" stroke="#34C759" stroke-width="4"/>',
+                      f'<rect x="{sx:.1f}" y="{sy:.1f}" width="{side_px_x:.1f}" height="{side_px_y:.1f}" fill="none" stroke="#34C759" stroke-width="4"/>',
+                      f'<text x="{sx+side_px_x/2:.1f}" y="{sy+side_px_y/2+6:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">{short}</text>']
+        else:
+            bracket_y = sy + 34
+            parts += [f'<path d="M{sx:.1f} {bracket_y:.1f} H{sx+side_px_x:.1f} M{sx:.1f} {bracket_y-9:.1f} V{bracket_y+9:.1f} M{sx+side_px_x:.1f} {bracket_y-9:.1f} V{bracket_y+9:.1f}" fill="none" stroke="#34C759" stroke-width="4"/>',
+                      f'<text x="{sx+side_px_x/2:.1f}" y="{bracket_y-12:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">Write-noise proxy</text>']
+        parts += [f'<text x="{plot_left+plot_w-5:.1f}" y="{plot_top+24}" text-anchor="end" fill="#1D1D1F" font-size="18" font-weight="700">{snm_v*1000:.1f} mV</text>',
+                  f'<text x="{plot_left+plot_w/2:.1f}" y="{height-40}" text-anchor="middle" fill="#6E6E73" font-size="17">VQ / VDD</text>',
+                  f'<text x="{x0+15:.1f}" y="{plot_top+plot_h/2:.1f}" transform="rotate(-90 {x0+15:.1f} {plot_top+plot_h/2:.1f})" text-anchor="middle" fill="#6E6E73" font-size="17">VQB / VDD</text>']
+    parts.append('<text x="810" y="602" text-anchor="middle" fill="#6E6E73" font-size="15">* WSNM is the WAT-calibrated compact-model write-noise proxy; use foundry simulation for sign-off.</text></svg>')
+    return "".join(parts)
+
+
 def architecture_svg(width: int = 1080, height: int = 445) -> str:
     """Self-contained schematic-style view of the fixed 28 nm 6T topology."""
-    return f'''<svg viewBox="0 0 760 315" width="{width}" height="{height}" role="img" aria-label="28 nm 6T SRAM architecture">
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 500" width="{width}" height="{height}" role="img" aria-label="28 nm 6T SRAM architecture" style="font-family:Calibri,Arial,sans-serif">
     <rect width="100%" height="100%" fill="white"/>
-    <text x="380" y="24" text-anchor="middle" font-size="16" font-weight="700">Generic 28 nm 6T SRAM bitcell</text>
-    <path d="M120 55 V260 M640 55 V260 M120 75 H235 M525 75 H640 M120 240 H235 M525 240 H640" stroke="#334155" stroke-width="2" fill="none"/>
-    <text x="105" y="48" font-size="12">BL</text><text x="635" y="48" font-size="12">BLB</text>
-    <path d="M235 64 h55 v22 h-55 z M470 64 h55 v22 h-55 z" fill="#fee2e2" stroke="#dc2626"/>
-    <path d="M235 229 h55 v22 h-55 z M470 229 h55 v22 h-55 z" fill="#dbeafe" stroke="#2563eb"/>
-    <path d="M145 147 h55 v22 h-55 z M560 147 h55 v22 h-55 z" fill="#dcfce7" stroke="#059669"/>
-    <text x="262" y="80" text-anchor="middle" font-size="11">PU1 PMOS</text><text x="497" y="80" text-anchor="middle" font-size="11">PU2 PMOS</text>
-    <text x="262" y="245" text-anchor="middle" font-size="11">PD1 NMOS</text><text x="497" y="245" text-anchor="middle" font-size="11">PD2 NMOS</text>
-    <text x="172" y="163" text-anchor="middle" font-size="11">PG1</text><text x="587" y="163" text-anchor="middle" font-size="11">PG2</text>
-    <path d="M290 75 H380 V145 M470 75 H380 M290 240 H380 V170 M470 240 H380 M200 158 H340 M420 158 H560" stroke="#334155" stroke-width="2" fill="none"/>
-    <circle cx="340" cy="158" r="6" fill="#111827"/><circle cx="420" cy="158" r="6" fill="#111827"/>
-    <text x="330" y="144" font-size="13" font-weight="700">Q</text><text x="427" y="144" font-size="13" font-weight="700">QB</text>
-    <path d="M340 158 C340 112 430 112 470 92 M420 158 C420 204 330 204 290 222" stroke="#7c3aed" stroke-width="1.8" fill="none" stroke-dasharray="5 4"/>
-    <path d="M105 285 H655" stroke="#059669" stroke-width="2"/><text x="380" y="303" text-anchor="middle" font-size="12">WL controls PG1 / PG2</text>
-    <text x="380" y="275" text-anchor="middle" font-size="11" fill="#475569">L=28 nm · WPU=70 nm · WPG=100 nm · WPD=140 nm</text>
+    <text x="450" y="28" text-anchor="middle" font-size="19" font-weight="700">Generic 28 nm 6T SRAM bitcell</text>
+    <path d="M95 72 H805 M125 72 V418 M775 72 V418" stroke="#94a3b8" stroke-width="2" fill="none"/>
+    <text x="450" y="62" text-anchor="middle" font-size="17" font-weight="700">WL</text>
+    <text x="125" y="447" text-anchor="middle" font-size="17" font-weight="700">BLB</text>
+    <text x="775" y="447" text-anchor="middle" font-size="17" font-weight="700">BL</text>
+    <path d="M315 105 H585 M450 105 V82 M315 390 H585 M450 390 V414" stroke="#334155" stroke-width="2.5" fill="none"/>
+    <text x="450" y="97" text-anchor="middle" font-size="15" font-weight="700">VDD</text>
+    <text x="450" y="438" text-anchor="middle" font-size="15" font-weight="700">GND</text>
+    <path d="M315 105 V145 M585 105 V145 M315 205 V255 M585 205 V255 M315 315 V390 M585 315 V390" stroke="#334155" stroke-width="2.5"/>
+    <rect x="270" y="145" width="90" height="60" rx="12" fill="#fff1f0" stroke="#ff3b30" stroke-width="2"/>
+    <rect x="540" y="145" width="90" height="60" rx="12" fill="#fff1f0" stroke="#ff3b30" stroke-width="2"/>
+    <rect x="270" y="255" width="90" height="60" rx="12" fill="#eef6ff" stroke="#007aff" stroke-width="2"/>
+    <rect x="540" y="255" width="90" height="60" rx="12" fill="#eef6ff" stroke="#007aff" stroke-width="2"/>
+    <rect x="145" y="220" width="100" height="60" rx="12" fill="#effcf2" stroke="#34c759" stroke-width="2"/>
+    <rect x="655" y="220" width="100" height="60" rx="12" fill="#effcf2" stroke="#34c759" stroke-width="2"/>
+    <text x="315" y="171" text-anchor="middle" font-size="15" font-weight="700">PUL</text><text x="315" y="190" text-anchor="middle" font-size="12">PMOS</text>
+    <text x="585" y="171" text-anchor="middle" font-size="15" font-weight="700">PUR</text><text x="585" y="190" text-anchor="middle" font-size="12">PMOS</text>
+    <text x="315" y="281" text-anchor="middle" font-size="15" font-weight="700">PDL</text><text x="315" y="300" text-anchor="middle" font-size="12">NMOS</text>
+    <text x="585" y="281" text-anchor="middle" font-size="15" font-weight="700">PDR</text><text x="585" y="300" text-anchor="middle" font-size="12">NMOS</text>
+    <text x="195" y="246" text-anchor="middle" font-size="15" font-weight="700">PGL</text><text x="195" y="265" text-anchor="middle" font-size="12">ACCESS</text>
+    <text x="705" y="246" text-anchor="middle" font-size="15" font-weight="700">PGR</text><text x="705" y="265" text-anchor="middle" font-size="12">ACCESS</text>
+    <path d="M125 250 H145 M245 250 H315 M585 250 H655 M755 250 H775" stroke="#334155" stroke-width="2.5" fill="none"/>
+    <circle cx="315" cy="250" r="6" fill="#1d1d1f"/><circle cx="585" cy="250" r="6" fill="#1d1d1f"/>
+    <text x="294" y="238" font-size="15" font-weight="700">QB</text><text x="598" y="238" font-size="15" font-weight="700">Q</text>
+    <path d="M315 250 H420 V175 H540 M585 250 H480 V285 H360" stroke="#af52de" stroke-width="2" fill="none" stroke-dasharray="7 5"/>
+    <path d="M195 220 V72 M705 220 V72" stroke="#34c759" stroke-width="2" fill="none"/>
+    <text x="450" y="475" text-anchor="middle" font-size="12" fill="#64748b">L=28 nm · WPU=70 nm · WPG=100 nm · WPD=140 nm</text>
     </svg>'''
+
+
+def export_pdf_report(result: dict, out: Path, image_dir: Path) -> Path:
+    """Build a sharp, browser-independent PDF from the analysis and SVG charts."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import (KeepTogether, PageBreak, Paragraph, SimpleDocTemplate,
+                                       Spacer, Table, TableStyle)
+        from svglib.svglib import svg2rlg
+    except ImportError as exc:
+        raise RuntimeError("PDF export packages are missing. Run: python -m pip install -r requirements.txt") from exc
+
+    pdf_dir = out / "pdf"; pdf_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = pdf_dir / "HV28_SRAM_Analysis.pdf"
+    regular, bold = "Helvetica", "Helvetica-Bold"
+    calibri = Path(r"C:\Windows\Fonts\calibri.ttf")
+    calibrib = Path(r"C:\Windows\Fonts\calibrib.ttf")
+    if calibri.exists() and calibrib.exists():
+        pdfmetrics.registerFont(TTFont("Calibri", str(calibri)))
+        pdfmetrics.registerFont(TTFont("Calibri-Bold", str(calibrib)))
+        regular, bold = "Calibri", "Calibri-Bold"
+
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle("HVTitle", parent=styles["Title"], fontName=bold, fontSize=29,
+                           leading=32, textColor=colors.HexColor("#1D1D1F"), spaceAfter=5*mm)
+    h1 = ParagraphStyle("HVH1", parent=styles["Heading1"], fontName=bold, fontSize=18,
+                        leading=21, textColor=colors.HexColor("#1D1D1F"), spaceBefore=3*mm, spaceAfter=3*mm)
+    h2 = ParagraphStyle("HVH2", parent=styles["Heading2"], fontName=bold, fontSize=12,
+                        leading=14, textColor=colors.HexColor("#1D1D1F"), spaceBefore=2*mm, spaceAfter=2*mm)
+    body = ParagraphStyle("HVBody", parent=styles["BodyText"], fontName=regular, fontSize=9.5,
+                          leading=13, textColor=colors.HexColor("#3A3A3C"))
+    small = ParagraphStyle("HVSmall", parent=body, fontSize=8, leading=10)
+
+    def svg_drawing(filename: str, max_width: float, max_height: float):
+        drawing = svg2rlg(str(image_dir / filename))
+        if drawing is None or not drawing.width or not drawing.height:
+            raise RuntimeError(f"Could not render SVG chart: {filename}")
+        factor = min(max_width / drawing.width, max_height / drawing.height)
+        drawing.width *= factor; drawing.height *= factor
+        drawing.scale(factor, factor)
+        return drawing
+
+    table_header = colors.HexColor("#EEF4FC")
+    border = colors.HexColor("#D2D2D7")
+    def data_table(data: list[list], widths=None, font_size: float = 8):
+        table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+        table.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, 0), bold), ("FONTNAME", (0, 1), (-1, -1), regular),
+            ("FONTSIZE", (0, 0), (-1, -1), font_size), ("LEADING", (0, 0), (-1, -1), font_size+2),
+            ("BACKGROUND", (0, 0), (-1, 0), table_header), ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1D1D1F")),
+            ("GRID", (0, 0), (-1, -1), .35, border), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (1, 1), (-1, -1), "RIGHT"), ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        return table
+
+    def footer(canvas, doc):
+        canvas.saveState(); canvas.setFont(regular, 8); canvas.setFillColor(colors.HexColor("#6E6E73"))
+        canvas.drawString(12*mm, 7*mm, "HV28 SRAM Analysis")
+        canvas.drawRightString(landscape(A4)[0]-12*mm, 7*mm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    cfg, wat = result["config"], result["wat"]
+    ratios = result.get("strength_ratios", Sram6T(WatPoint(**wat), Config(**cfg)).strength_ratios())
+    doc = SimpleDocTemplate(str(pdf_path), pagesize=landscape(A4), leftMargin=11*mm, rightMargin=11*mm,
+                            topMargin=10*mm, bottomMargin=12*mm, title="HV28 SRAM Analysis")
+    story = [Paragraph("HV28 SRAM Analysis", title),
+             Paragraph(f'Lot/Wafer: <b>{html.escape(wat["corner"])}</b> &nbsp;&nbsp; Object mode: <b>{html.escape(result.get("object_mode", "Grouped"))}</b> &nbsp;&nbsp; SRAM VDD: <b>{cfg["nominal_vdd"]:.3f} V</b>', body),
+             Spacer(1, 4*mm), svg_drawing("00_28nm_6t_bitcell_architecture.svg", 250*mm, 116*mm),
+             Spacer(1, 3*mm), Paragraph("Generic 28 nm 6T compact model. Datasheet targets are comparison references; model estimates remain calibrated from measured WAT inputs.", small)]
+
+    comparisons = result.get("target_comparisons", [])
+    if comparisons:
+        story += [PageBreak(), Paragraph("Datasheet Target vs WAT Measured", h1)]
+        rows = [["Object", "Type", "Target Vt (V)", "WAT Vt (V)", "Delta Vt (mV)",
+                 "Target Isat (uA)", "WAT Isat (uA)", "Delta Isat (uA)", "Delta Isat (%)"]]
+        rows += [[x["object"], x["device"], f'{x["target_vt_v"]:.3f}', f'{x["measured_vt_v"]:.3f}',
+                  f'{x["delta_vt_mv"]:+.1f}', f'{x["target_isat_ua"]:.2f}', f'{x["measured_isat_ua"]:.2f}',
+                  f'{x["delta_isat_ua"]:+.2f}', f'{x["delta_isat_pct"]:+.2f}%'] for x in comparisons]
+        story += [data_table(rows, font_size=7.5), Spacer(1, 5*mm)]
+
+    if result.get("wt_test_0bit"):
+        story += [Paragraph("WT Test 0-Bit Vmin", h1)]
+        rows = [["WT mode", "Measured Vmin (V)", "Source"]] + [
+            [x["test"], _fmt(x["vmin_v"], 3), x.get("source", "Model estimate")] for x in result["wt_test_0bit"]]
+        story += [data_table(rows, widths=[55*mm, 48*mm, 82*mm]), Spacer(1, 4*mm),
+                  Paragraph(f'WT sweep setup: Start={cfg["vmin_start"]:.3f} V, Stop={cfg["vmin_stop"]:.3f} V, Step={cfg["vmin_step"]:.3f} V.', body)]
+
+    if result.get("cell"):
+        story += [Paragraph(f'{result.get("object_mode", "6T Independent")} WAT Objects', h1)]
+        rows = [["MOS object", "Vt (V)", "Isat / Ids (uA)"]] + [
+            [name, f'{values["vt"]:.3f}', f'{values["ids"]:.2f}'] for name, values in result["cell"]["mos"].items()]
+        story += [data_table(rows, widths=[50*mm, 40*mm, 50*mm])]
+
+    story += [PageBreak(), Paragraph("WAT Vt / Isat Overview", h1)]
+    rows = [["Device", "Vt (V)", "Isat / Ids (uA)"]] + [
+        [dev, f'{wat[dev.lower()+"_vt"]:.3f}', f'{wat[dev.lower()+"_ids"]:.2f}'] for dev in ("PU", "PG", "PD")]
+    ratio_rows = [["Ratio", "Model beta (Vt-aware)", "WAT Isat proxy", "Definition"],
+                  ["Cell Ratio", f'{ratios["cell_ratio_beta"]:.3f}', f'{ratios["cell_ratio_ids_proxy"]:.3f}', "PD / PG"],
+                  ["Pull-up Ratio", f'{ratios["pull_up_ratio_beta"]:.3f}', f'{ratios["pull_up_ratio_ids_proxy"]:.3f}', "PG / PU"]]
+    story += [data_table(rows, widths=[50*mm, 40*mm, 50*mm]), Spacer(1, 4*mm),
+              Paragraph("Cell Strength Ratios", h2),
+              data_table(ratio_rows, widths=[48*mm, 48*mm, 45*mm, 40*mm]), Spacer(1, 3*mm),
+              Paragraph(f'Model beta ratios include Vt through WAT calibration; Isat ratios are direct measured-current proxies. Assumed sensitivity sweep: Vt +/-{cfg["vt_step"]*1000:.0f} mV and Isat +/-{cfg["ids_step_pct"]:g}%.', body)]
+
+    judgment = result.get("judgment")
+    if judgment:
+        story += [Spacer(1, 5*mm), Paragraph(f'Model Judgment: {judgment["overall_status"]}', h1)]
+        judgment_rows = [["Parameter", "Model value", "Design target", "Margin", "Status", "Recommended action"]]
+        for item in judgment["items"]:
+            unit = item["unit"]
+            digits = 3 if unit == "ratio" else 2
+            suffix = "" if unit == "ratio" else f" {unit}"
+            judgment_rows.append([
+                item["label"], f'{item["value"]:.{digits}f}{suffix}',
+                f'{item["target"]:.{digits}f}{suffix}', f'{item["margin"]:+.{digits}f}{suffix}',
+                item["status"], Paragraph(item["recommended_action"], small)])
+        story += [data_table(judgment_rows, widths=[31*mm, 30*mm, 30*mm, 28*mm, 24*mm, 116*mm], font_size=7),
+                  Spacer(1, 2*mm), Paragraph(f'MARGINAL band: {judgment["marginal_band_pct"]:.1f}% below the user-entered target. These limits are design/datasheet inputs, not universal 28 nm criteria.', small)]
+
+    for index, (dev, items) in enumerate(result["groups"].items(), 1):
+        story += [PageBreak(), Paragraph(f"{dev} Sensitivity", h1)]
+        prefix = f"{index:02d}_{dev.lower()}"
+        charts = [[svg_drawing(f"{prefix}_read_butterfly.svg", 125*mm, 48*mm),
+                   svg_drawing(f"{prefix}_read_snm_sensitivity.svg", 125*mm, 48*mm)],
+                  [svg_drawing(f"{prefix}_hold_snm_sensitivity.svg", 125*mm, 39*mm),
+                   svg_drawing(f"{prefix}_write_snm_sensitivity.svg", 125*mm, 39*mm)],
+                  [svg_drawing(f"{prefix}_model_read_vmin_sensitivity.svg", 125*mm, 39*mm),
+                   svg_drawing(f"{prefix}_model_write_vmin_sensitivity.svg", 125*mm, 39*mm)]]
+        chart_table = Table(charts, colWidths=[132*mm, 132*mm], hAlign="CENTER")
+        chart_table.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("ALIGN", (0,0), (-1,-1), "CENTER"),
+                                         ("LEFTPADDING", (0,0), (-1,-1), 2), ("RIGHTPADDING", (0,0), (-1,-1), 2),
+                                         ("TOPPADDING", (0,0), (-1,-1), 2), ("BOTTOMPADDING", (0,0), (-1,-1), 2)]))
+        baseline = items[0]["metrics"]
+        rows = [["Scenario", "Cell ratio", "PU ratio", "Hold SNM", "Read SNM", "Write SNM*", "Delta WSNM", "Read Vmin", "Write Vmin"]]
+        for item in items:
+            m = item["metrics"]; w = item["wat"]
+            rows.append([item["label"], f'{m["cell_ratio_beta"]:.3f}', f'{m["pull_up_ratio_beta"]:.3f}',
+                         f'{m["hold_snm_mv"]:.2f}', f'{m["read_snm_mv"]:.2f}', f'{m["write_snm_mv"]:.2f}', f'{m["write_snm_mv"]-baseline["write_snm_mv"]:+.2f}',
+                         _fmt(m["read_vmin_v"], 2), _fmt(m["write_vmin_v"], 2)])
+        story += [chart_table, Spacer(1, 1*mm), data_table(rows, font_size=6.5),
+                  Paragraph("* Write SNM is the compact-model bitline-noise margin proxy, not foundry/SPICE sign-off WSNM.", small)]
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return pdf_path
 
 
 def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
@@ -548,30 +1153,34 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     image_manifest: list[dict[str, str]] = []
 
     def save_image(filename: str, svg: str, description: str, device: str = "CELL") -> str:
-        (image_dir/filename).write_text(svg, encoding="utf-8")
-        image_manifest.append({"filename": filename, "device": device,
-                               "description": description})
-        return f'images/{filename}'
+        """Publish a scalable SVG and a high-resolution PNG for the HTML report."""
+        try:
+            from reportlab.graphics import renderPM
+            from svglib.svglib import svg2rlg
+        except ImportError as exc:
+            raise RuntimeError("PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
+        svg_path = image_dir/filename
+        svg_path.write_text(svg, encoding="utf-8")
+        png_name = str(Path(filename).with_suffix(".png"))
+        png_path = image_dir/png_name
+        drawing = svg2rlg(str(svg_path))
+        if drawing is None:
+            raise RuntimeError(f"Could not render chart image: {filename}")
+        renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
+        image_manifest.extend([
+            {"filename": png_name, "format": "PNG", "role": "Primary image",
+             "device": device, "description": description},
+            {"filename": filename, "format": "SVG", "role": "Scalable chart source",
+             "device": device, "description": description},
+        ])
+        return f'images/{png_name}'
 
-    analysis_target = result.get("analysis_target", "ALL")
-    rows = []
-    for dev, items in result["groups"].items():
-        for item in items:
-            rows.append({"device": dev, "is_test_target": dev == analysis_target,
-                         "scenario": item["label"], **item["wat"], **item["metrics"]})
+    rows = [{"device": "6T Cell", "scenario": "Baseline", **result["wat"],
+             **result["baseline_6t"]["metrics"]}]
     with open(out/"sram_wat_results.csv", "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     with open(out/"sram_wat_results.json", "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-    if "mos_sensitivity" in result:
-        mos_rows_csv = []
-        for name, items in result["mos_sensitivity"].items():
-            source = result["cell"]["mos"][name]
-            for item in items:
-                mos_rows_csv.append({"mos": name, "scenario": item["label"], "input_vt_v": source["vt"],
-                                     "input_ids_ua": source["ids"], **item["metrics"]})
-        with open(out/"sram_mos_results.csv", "w", newline="", encoding="utf-8-sig") as f:
-            writer=csv.DictWriter(f,fieldnames=list(mos_rows_csv[0])); writer.writeheader(); writer.writerows(mos_rows_csv)
     if "wt_test_0bit" in result:
         wt_rows=[]
         for item in result["wt_test_0bit"]:
@@ -582,38 +1191,71 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
                             "phases_at_vmin":"; ".join(k for k,v in item.get("phases_at_vmin",{}).items() if v)})
         with open(out/"wt_test_0bit_vmin.csv","w",newline="",encoding="utf-8-sig") as f:
             writer=csv.DictWriter(f,fieldnames=list(wt_rows[0])); writer.writeheader(); writer.writerows(wt_rows)
+    comparisons = result.get("target_comparisons", [])
+    if comparisons:
+        with open(out/"wat_target_comparison.csv", "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(comparisons[0]))
+            writer.writeheader(); writer.writerows(comparisons)
+    if result.get("judgment"):
+        judgment_rows = result["judgment"]["items"]
+        with open(out/"parameter_judgment.csv", "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(judgment_rows[0]))
+            writer.writeheader(); writer.writerows(judgment_rows)
+    if result.get("target_validation"):
+        validation = result["target_validation"]
+        with open(out/"wat_target_validation_rows.csv", "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(validation["rows"][0]))
+            writer.writeheader(); writer.writerows(validation["rows"])
+        summary_row = {"verdict": validation["verdict"], **validation["counts"], **validation["statistics"]}
+        with open(out/"wat_target_validation_summary.csv", "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(summary_row))
+            writer.writeheader(); writer.writerow(summary_row)
+        with open(out/"wat_target_parameter_evidence.csv", "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(validation["parameter_evidence"][0]))
+            writer.writeheader(); writer.writerows(validation["parameter_evidence"])
 
     cfg = result["config"]; wat = result["wat"]; tech = result["technology"]
     sections = []
-    ordered_groups = sorted(result["groups"].items(), key=lambda pair: pair[0] != analysis_target)
+    ordered_groups = list(result["groups"].items())
     for group_index, (dev, items) in enumerate(ordered_groups, 1):
         baseline = items[0]["metrics"]
         trs = "".join("<tr>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in
             [x["label"], f'{x["wat"][dev.lower()+"_vt"]:.3f}', f'{x["wat"][dev.lower()+"_ids"]:.2f}',
              f'{x["metrics"]["hold_snm_mv"]:.2f}', f'{x["metrics"]["read_snm_mv"]:.2f}',
              f'{x["metrics"]["read_snm_mv"]-baseline["read_snm_mv"]:+.2f}',
+             f'{x["metrics"]["write_snm_mv"]:.2f}',
+             f'{x["metrics"]["write_snm_mv"]-baseline["write_snm_mv"]:+.2f}',
+             f'{x["metrics"]["cell_ratio_beta"]:.3f}', f'{x["metrics"]["pull_up_ratio_beta"]:.3f}',
              _fmt(x["metrics"]["read_vmin_v"],2),
              "N/A" if x["metrics"]["read_vmin_v"] is None or baseline["read_vmin_v"] is None else f'{x["metrics"]["read_vmin_v"]-baseline["read_vmin_v"]:+.2f}',
              _fmt(x["metrics"]["write_vmin_v"],2),
              "N/A" if x["metrics"]["write_vmin_v"] is None or baseline["write_vmin_v"] is None else f'{x["metrics"]["write_vmin_v"]-baseline["write_vmin_v"]:+.2f}']) + "</tr>" for x in items)
-        target_badge = '<span class="target-badge">TEST TARGET</span>' if dev == analysis_target else ''
-        target_name = "_target" if dev == analysis_target else ""
-        prefix = f"{group_index:02d}_{dev.lower()}{target_name}"
+        prefix = f"{group_index:02d}_{dev.lower()}"
         butterfly_path = save_image(f"{prefix}_read_butterfly.svg", butterfly_svg(items,cfg["nominal_vdd"]),
                                     f"{dev} read butterfly and SNM curves", dev)
         snm_path = save_image(f"{prefix}_read_snm_sensitivity.svg", bar_svg(items,"read_snm_mv",dev+" Read SNM","mV"),
                               f"{dev} read SNM sensitivity", dev)
+        hold_snm_path = save_image(f"{prefix}_hold_snm_sensitivity.svg", bar_svg(items,"hold_snm_mv",dev+" Hold SNM","mV"),
+                                   f"{dev} hold SNM sensitivity", dev)
+        write_snm_path = save_image(f"{prefix}_write_snm_sensitivity.svg", bar_svg(items,"write_snm_mv",dev+" Write SNM (bitline-noise proxy)","mV"),
+                                    f"{dev} compact-model write SNM sensitivity", dev)
         read_vmin_path = save_image(f"{prefix}_model_read_vmin_sensitivity.svg", bar_svg(items,"read_vmin_v",dev+" Model Read Vmin","V"),
                                     f"{dev} model-estimated read Vmin sensitivity", dev)
         write_vmin_path = save_image(f"{prefix}_model_write_vmin_sensitivity.svg", bar_svg(items,"write_vmin_v",dev+" Model Write Vmin","V"),
                                      f"{dev} model-estimated write Vmin sensitivity", dev)
-        sections.append(f'''<section><h2>{dev} sensitivity {target_badge}</h2>
+        sections.append(f'''<section><h2>{dev} sensitivity</h2>
         <div class="grid"><div><img src="{butterfly_path}" alt="{dev} read butterfly"></div>
         <div><img src="{snm_path}" alt="{dev} read SNM sensitivity"></div>
+        <div><img src="{hold_snm_path}" alt="{dev} hold SNM sensitivity"></div>
+        <div><img src="{write_snm_path}" alt="{dev} write SNM sensitivity"></div>
         <div><img src="{read_vmin_path}" alt="{dev} model read Vmin sensitivity"></div>
         <div><img src="{write_vmin_path}" alt="{dev} model write Vmin sensitivity"></div></div>
-        <table><thead><tr><th>Scenario</th><th>Vt (V)</th><th>Ids (uA)</th><th>Hold SNM (mV)</th><th>Read SNM (mV)</th><th>ΔRSNM</th><th>Model Read Vmin (V)</th><th>ΔRVmin</th><th>Model Write Vmin (V)</th><th>ΔWVmin</th></tr></thead><tbody>{trs}</tbody></table></section>''')
-    ratio = f'Cell ratio PD/PG={wat["pd_ids"]/wat["pg_ids"]:.3f}; Pull-up ratio PG/PU={wat["pg_ids"]/wat["pu_ids"]:.3f}'
+        <table><thead><tr><th>Scenario</th><th>Vt (V)</th><th>Ids (uA)</th><th>Hold SNM (mV)</th><th>Read SNM (mV)</th><th>ΔRSNM</th><th>Write SNM* (mV)</th><th>ΔWSNM</th><th>Cell ratio β</th><th>Pull-up ratio β</th><th>Model Read Vmin (V)</th><th>ΔRVmin</th><th>Model Write Vmin (V)</th><th>ΔWVmin</th></tr></thead><tbody>{trs}</tbody></table>
+        <p><small>* Compact-model bitline-noise margin proxy; not foundry/SPICE sign-off WSNM.</small></p></section>''')
+    ratios = result.get("strength_ratios", Sram6T(WatPoint(**wat), Config(**cfg)).strength_ratios())
+    ratio = (f'Model β Cell Ratio (PD/PG)={ratios["cell_ratio_beta"]:.3f}; '
+             f'Model β Pull-up Ratio (PG/PU)={ratios["pull_up_ratio_beta"]:.3f}; '
+             f'WAT Isat proxies={ratios["cell_ratio_ids_proxy"]:.3f} / {ratios["pull_up_ratio_ids_proxy"]:.3f}')
     wat_rows = "".join(f'<tr><td>{d}</td><td>{wat[d.lower()+"_vt"]:.3f}</td><td>{wat[d.lower()+"_ids"]:.2f}</td><td>{wat[d.lower()+"_ids"]/sum(wat[x+"_ids"] for x in ("pu","pg","pd")):.3f}</td></tr>' for d in ("PU","PG","PD"))
     individual_section = ""
     if "cell" in result:
@@ -622,14 +1264,27 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         for name, items in result.get("mos_sensitivity", {}).items():
             base = items[0]["metrics"]
             body = "".join("<tr>"+"".join(f"<td>{html.escape(str(v))}</td>" for v in [
-                x["label"], f'{x["metrics"]["read_snm_mv"]:.2f}', f'{x["metrics"]["read_snm_mv"]-base["read_snm_mv"]:+.2f}',
+                x["label"], f'{x["metrics"]["hold_snm_mv"]:.2f}', f'{x["metrics"]["read_snm_mv"]:.2f}',
+                f'{x["metrics"]["write_snm_mv"]:.2f}', f'{x["metrics"]["cell_ratio_beta"]:.3f}',
+                f'{x["metrics"]["pull_up_ratio_beta"]:.3f}',
                 _fmt(x["metrics"]["read_vmin_v"],2), _fmt(x["metrics"]["write_vmin_v"],2)])+"</tr>" for x in items)
-            sensitivity_blocks.append(f'<div><h3>{name}</h3><table><thead><tr><th>Scenario</th><th>Read SNM (mV)</th><th>ΔRSNM</th><th>Read Vmin</th><th>Write Vmin</th></tr></thead><tbody>{body}</tbody></table></div>')
+            sensitivity_blocks.append(f'<div><h3>{name}</h3><table><thead><tr><th>Scenario</th><th>Hold SNM</th><th>Read SNM</th><th>Write SNM*</th><th>Cell ratio β</th><th>Pull-up ratio β</th><th>Read Vmin</th><th>Write Vmin</th></tr></thead><tbody>{body}</tbody></table></div>')
         object_mode = result.get("object_mode", "6T Independent")
         individual_section = f'''<section><h2>{object_mode} objects</h2>
-        <p>Object mode: {object_mode}. Test target: <b>{analysis_target}</b>. Model-estimated margins are kept separate from manually entered WT Vmin.</p>
+        <p>Object mode: {object_mode}. Model-estimated margins are kept separate from manually entered WT Vmin.</p>
         <table><thead><tr><th>MOS object</th><th>Vt (V)</th><th>Ids (µA)</th></tr></thead><tbody>{mos_rows}</tbody></table>
         <div class="grid">{''.join(sensitivity_blocks)}</div></section>'''
+    target_section = ""
+    if comparisons:
+        target_rows = "".join(
+            f'<tr><td>{x["object"]}</td><td>{x["device"]}</td><td>{x["target_vt_v"]:.3f}</td>'
+            f'<td>{x["measured_vt_v"]:.3f}</td><td>{x["delta_vt_mv"]:+.1f}</td>'
+            f'<td>{x["target_isat_ua"]:.2f}</td><td>{x["measured_isat_ua"]:.2f}</td>'
+            f'<td>{x["delta_isat_ua"]:+.2f}</td><td>{x["delta_isat_pct"]:+.2f}%</td></tr>'
+            for x in comparisons)
+        target_section = f'''<section><h2>Datasheet Target vs WAT Measured</h2>
+        <p>Target values are comparison references only. The compact model remains calibrated from the measured WAT values.</p>
+        <table><thead><tr><th>MOS object</th><th>Type</th><th>Target Vt (V)</th><th>WAT Vt (V)</th><th>ΔVt (mV)</th><th>Target Isat (µA)</th><th>WAT Isat (µA)</th><th>ΔIsat (µA)</th><th>ΔIsat (%)</th></tr></thead><tbody>{target_rows}</tbody></table></section>'''
     wt_section = ""
     if "wt_test_0bit" in result:
         wt_defs={
@@ -642,36 +1297,100 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         wt_section=f'''<section><h2>WT Test 0-Bit Vmin</h2>
         <p>{"Values below were entered manually after WT measurement; the Python model did not generate them." if manual_source else "Model-estimated values; no manual WT values were supplied."}</p>
         <table><thead><tr><th>WT mode</th><th>Measured Vmin (V)</th><th>Source</th><th>Test definition</th></tr></thead><tbody>{wt_rows}</tbody></table></section>'''
-    architecture_path = save_image("00_28nm_6t_bitcell_architecture.svg", architecture_svg(),
-                                   "Generic 28 nm physical 6T bitcell architecture")
+    judgment_section = ""
+    if result.get("judgment"):
+        judgment = result["judgment"]
+        judgment_rows = "".join(
+            f'<tr><td>{item["label"]}</td><td>{item["value"]:.3f} {"" if item["unit"] == "ratio" else item["unit"]}</td>'
+            f'<td>{item["target"]:.3f} {"" if item["unit"] == "ratio" else item["unit"]}</td>'
+            f'<td>{item["margin"]:+.3f}</td><td><b>{item["status"]}</b></td>'
+            f'<td>{html.escape(item["recommended_action"])}</td></tr>' for item in judgment["items"])
+        judgment_section = f'''<section class="judgment"><h2>Parameter Judgment: {judgment["overall_status"]}</h2>
+        <p>PASS requires the model value to meet the user-entered design target. MARGINAL means it is within {judgment["marginal_band_pct"]:.1f}% below target. These are not universal 28 nm limits.</p>
+        <table><thead><tr><th>Parameter</th><th>Model value</th><th>Design target</th><th>Margin</th><th>Status</th><th>Recommended action</th></tr></thead><tbody>{judgment_rows}</tbody></table></section>'''
+    validation_section = ""
+    if result.get("target_validation"):
+        validation = result["target_validation"]
+        counts, stats, current = validation["counts"], validation["statistics"], validation["current_row"]
+        stat_rows = "".join(
+            f'<tr><td>{label}</td><td>{value}</td><td>{meaning}</td></tr>' for label, value, meaning in (
+                ("WT-complete rows", counts["wt_complete"], "All three measured WT Vmin values are present"),
+                ("Paired WAT + WT rows", counts["paired_wat_wt"], "Rows usable for target validation"),
+                ("Inside / outside target band", f'{counts["inside_target_band"]} / {counts["outside_target_band"]}', "Both groups need at least 3 rows"),
+                ("WT pass rate inside band", _fmt(stats["inside_wt_pass_rate_pct"], 1) + "%" if stats["inside_wt_pass_rate_pct"] is not None else "N/A", "Higher is better"),
+                ("WT pass rate outside band", _fmt(stats["outside_wt_pass_rate_pct"], 1) + "%" if stats["outside_wt_pass_rate_pct"] is not None else "N/A", "Comparison population"),
+                ("Pass-rate lift", (_fmt(stats["pass_rate_lift_pct_points"], 1) + " pp") if stats["pass_rate_lift_pct_points"] is not None else "N/A", "Inside minus outside"),
+                ("Spearman correlation", _fmt(stats["target_distance_vs_worst_vmin_spearman"], 3), "Positive: farther from target tends to worsen Vmin"),
+                ("Pearson correlation", _fmt(stats["target_distance_vs_worst_vmin_pearson"], 3), "Linear association; use with Spearman"),
+            ))
+        parameter_rows = "".join(
+            f'<tr><td>{item["parameter"]}</td><td>{item["paired_n"]}</td>'
+            f'<td>{item["inside_n"]} / {item["outside_n"]}</td>'
+            f'<td>{(_fmt(item["pass_rate_lift_pct_points"], 1) + " pp") if item["pass_rate_lift_pct_points"] is not None else "N/A"}</td>'
+            f'<td>{_fmt(item["deviation_vs_worst_vmin_spearman"], 3)}</td><td><b>{item["verdict"]}</b></td></tr>'
+            for item in validation["parameter_evidence"])
+        settings = validation["settings"]
+        verdict_class = "ok" if validation["verdict"] == "SUPPORTED" else ("bad" if validation["verdict"] == "CONTRADICTED" else "warn")
+        validation_section = f'''<section class="validation"><div class="section-heading"><div><h2>Datasheet WAT Target Validation</h2><p>Primary decision: do lots near the WAT target actually achieve acceptable measured WT Vmin?</p></div><span class="verdict {verdict_class}">{validation["verdict"]}</span></div>
+        <div class="validation-cards"><div><span>Current Lot/Wafer</span><b>{html.escape(str(current["lot_wafer"]))}</b></div><div><span>WAT band result</span><b>{"IN BAND" if current["target_band_pass"] else "OUT OF BAND"}</b></div><div><span>WT result</span><b>{"PASS" if current["wt_pass"] else "FAIL"}</b></div><div><span>Screen outcome</span><b>{current["consistency"]}</b></div></div>
+        <p><b>Conclusion:</b> {html.escape(validation["explanation"])}</p>
+        <p>Target band: Vt ±{settings["vt_tolerance_mv"]:.1f} mV and Isat ±{settings["idsat_tolerance_pct"]:.1f}%. WT pass limits: Scan4N ≤ {settings["scan4n_vmin_max"]:.3f} V, Select_Write ≤ {settings["select_write_vmin_max"]:.3f} V, Select_Read ≤ {settings["select_read_vmin_max"]:.3f} V.</p>
+        <table><thead><tr><th>Evidence</th><th>Value</th><th>Interpretation</th></tr></thead><tbody>{stat_rows}</tbody></table>
+        <h3>Individual WAT Target Evidence</h3><p>Each parameter uses every row where that WAT item and all three WT Vmin results are available; other missing WAT items do not discard the row.</p>
+        <table><thead><tr><th>WAT target</th><th>Paired N</th><th>Inside / outside N</th><th>Pass-rate lift</th><th>Deviation–Vmin Spearman</th><th>Evidence</th></tr></thead><tbody>{parameter_rows}</tbody></table>
+        <p class="footnote">WT-only rows remain in coverage counts, while correlation and band discrimination use paired WAT+WT rows only. Association supports screening usefulness but does not prove transistor-level causality.</p></section>'''
+    snm_overview_path = save_image("01_6t_cell_snm_butterfly.svg", snm_overview_svg(result),
+                                   "6T cell Hold, Read and Write SNM butterfly analysis", "6T CELL")
+    snm_metrics = result["baseline_6t"]["metrics"]
+    snm_section = f'''<section><h2>6T Cell SNM Analysis</h2>
+    <p>SNM is evaluated at complete-cell level. PU, PG and PD are not assigned separate SNM values.</p>
+    <p>Both axes span 0 to VDD, so the butterfly is entirely in the first quadrant. Hold and Read SNM evaluate the largest square in each lobe and use the smaller result. The two squares coincide in size for this symmetric 3T-merged input. Write is displayed as a write-noise proxy bracket because it is not calculated by the same symmetric butterfly-square rule.</p>
+    <img src="{snm_overview_path}" alt="6T SRAM Hold Read Write SNM butterfly analysis">
+    <table><thead><tr><th>Cell-level metric</th><th>Value (mV)</th><th>Operating condition</th></tr></thead><tbody>
+    <tr><td>Hold SNM</td><td>{snm_metrics["hold_snm_mv"]:.2f}</td><td>WL off; data retention</td></tr>
+    <tr><td>Read SNM</td><td>{snm_metrics["read_snm_mv"]:.2f}</td><td>WL on; BL and BLB precharged</td></tr>
+    <tr><td>Write SNM*</td><td>{snm_metrics["write_snm_mv"]:.2f}</td><td>BL=0 / BLB=VDD compact-model proxy</td></tr>
+    </tbody></table></section>'''
     with open(image_dir/"image_manifest.csv", "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=["filename", "device", "description"])
+        writer = csv.DictWriter(f, fieldnames=["filename", "format", "role", "device", "description"])
         writer.writeheader(); writer.writerows(sorted(image_manifest, key=lambda row: row["filename"]))
 
-    doc = f'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>6T SRAM × WAT 分析</title>
+    doc = f'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HV28 SRAM Analysis</title>
     <style>
-    :root{{font:100%/1.5 system-ui,-apple-system,"Segoe UI","Microsoft JhengHei",sans-serif;color:#1d1d1f;background:#f5f5f7;font-optical-sizing:auto}}
+    :root{{font:100%/1.5 Calibri,"Microsoft JhengHei",Arial,sans-serif;color:#1d1d1f;background:#f5f5f7}}
     *{{box-sizing:border-box}} body{{margin:0;padding:clamp(1.25rem,4vw,3rem);background:radial-gradient(circle at 85% 0,#e8f2ff 0,transparent 28rem),#f5f5f7}}
     main{{max-width:1760px;margin:auto}} h1{{font-size:clamp(2.2rem,4vw,4rem);line-height:1.05;letter-spacing:-.035em;margin:.5rem 0 .35rem}} h2{{font-size:1.7rem;letter-spacing:-.018em;margin-top:0}} h3{{font-size:1.3rem;letter-spacing:-.01em}}
     .note,.summary,section{{background:rgba(255,255,255,.82);backdrop-filter:blur(22px) saturate(160%);border:1px solid rgba(255,255,255,.75);border-radius:1.25rem;box-shadow:0 1px 2px #0000000a,0 12px 36px #0000000d;padding:clamp(1rem,2.4vw,1.65rem);margin:1rem 0}}
     .note{{border-left:4px solid #007aff}} .summary{{color:#3a3a3c;font-size:1.05rem}} .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,42rem),1fr));gap:1.5rem}}
     .target-badge{{display:inline-block;vertical-align:middle;margin-left:.55rem;padding:.28rem .55rem;border-radius:999px;background:#e5f1ff;color:#007aff;font-size:.72rem;letter-spacing:.04em}}
+    .section-heading{{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem}} .section-heading h2{{margin-bottom:.2rem}} .section-heading p{{margin:.1rem 0;color:#6e6e73}}
+    .verdict{{white-space:nowrap;border-radius:999px;padding:.45rem .75rem;font-weight:700;font-size:.82rem}} .verdict.ok{{background:#eaf8ee;color:#167a36}} .verdict.warn{{background:#fff4df;color:#946200}} .verdict.bad{{background:#ffebe9;color:#c5221f}}
+    .validation-cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:.75rem;margin:1rem 0}} .validation-cards>div{{background:#f5f5f7;border-radius:.85rem;padding:.85rem 1rem}} .validation-cards span{{display:block;color:#6e6e73;font-size:.85rem;margin-bottom:.25rem}} .validation-cards b{{font-size:1.05rem}} .footnote{{color:#6e6e73;font-size:.9rem}}
     svg,img{{display:block;width:100%;min-height:24rem;height:auto;border:1px solid #e5e5ea;border-radius:1rem;overflow:hidden}} table{{border-collapse:separate;border-spacing:0;width:100%;margin-top:1rem;font-size:1rem;line-height:1.55;overflow:hidden}}
     th,td{{padding:.9rem .8rem;border-bottom:1px solid #e5e5ea;text-align:right;font-variant-numeric:tabular-nums}} th{{color:#6e6e73;font-size:.9rem;font-weight:680;letter-spacing:.015em}} th:first-child,td:first-child{{text-align:left}} tbody tr:last-child td{{border-bottom:0}} code{{background:#f2f2f7;padding:.18rem .38rem;border-radius:.35rem}}
     @media(prefers-reduced-transparency:reduce){{.note,.summary,section{{background:#fff;backdrop-filter:none;border-color:#d2d2d7}}}}
     @media(prefers-contrast:more){{.note,.summary,section{{background:#fff;border:2px solid #1d1d1f}}}}
+    @page{{size:A4 landscape;margin:11mm}}
+    @media print{{
+      :root{{font-size:10pt}} body{{padding:0;background:#fff}} main{{max-width:none}}
+      h1{{font-size:28pt}} h2{{font-size:18pt;break-after:avoid}} h3{{font-size:14pt;break-after:avoid}}
+      .note,.summary,section{{background:#fff;border:1px solid #d2d2d7;box-shadow:none;backdrop-filter:none;margin:7mm 0;padding:6mm}}
+      .summary,.note,table,.grid>div{{break-inside:avoid}} .grid{{grid-template-columns:1fr 1fr;gap:6mm}}
+      svg,img{{min-height:0;max-height:155mm;object-fit:contain;border-radius:3mm}}
+      table{{font-size:8.5pt;line-height:1.25}} th,td{{padding:5pt 4pt}}
+    }}
     </style></head><body><main>
-    <h1>28 nm 6T SRAM × WAT Analysis</h1><p>Corner: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode","Grouped"))}</b> · Test target: <b>{analysis_target}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
-    <div class="summary"><b>Data meaning:</b> PU / PG / PD is the selected WT test target. Scan4N, Select_Write and Select_Read Vmin are manually entered measured values. Any read/write Vmin inside sensitivity charts is explicitly a model estimate and is not substituted for measured WT data.</div>
+    <h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode","Grouped"))}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
+    <div class="summary"><b>Data meaning:</b> Datasheet PU / PG / PD Vt and Isat are target references compared with measured WAT values. Scan4N, Select_Write and Select_Read Vmin are manually entered measured values. Model Read/Write Vmin is kept separate.</div>
     <div class="summary"><b>WT sweep setup:</b> Start={cfg["vmin_start"]:.3f} V · Stop={cfg["vmin_stop"]:.3f} V · Step={cfg["vmin_step"]:.3f} V. These are actual tester recipe inputs and also define the model search range and resolution.</div>
-    <div class="note"><b>28 nm 固定模型：</b>{html.escape(tech["topology"])}；L={tech["channel_length_nm"]:g} nm，WPU/WPG/WPD={tech["pu_width_nm"]:g}/{tech["pg_width_nm"]:g}/{tech["pd_width_nm"]:g} nm，T={tech["nominal_temperature_c"]:g} °C。這是 generic 28 nm 推演模型；沒有 foundry PDK，因此不宣稱對應特定晶圓廠或取代量產 sign-off。</div>
-    <section><img src="{architecture_path}" alt="Generic 28 nm 6T bitcell architecture"></section>
+    {target_section}
     {wt_section}
+    {validation_section}
+    {judgment_section}
+    {snm_section}
     {individual_section}
-    <div class="summary"><b>Assumed sensitivity sweep — not WAT measured data:</b> Vt ±{cfg["vt_step"]*1000:.0f} mV and Isat/Ids ±{cfg["ids_step_pct"]:g}% are internal engineering scenarios varied one at a time. You do not need to obtain these two variation values from the WAT report. Model-estimated margins are used only for directional comparison and do not overwrite manually entered WT Vmin.</div>
     <section><h2>WAT Vt / Ids comparison</h2><table><thead><tr><th>Device</th><th>Vt (V)</th><th>Ids (uA)</th><th>Normalized Ids</th></tr></thead><tbody>{wat_rows}</tbody></table><p>{ratio}</p></section>
-    {''.join(sections)}
-    <p>Raw data: <code>sram_wat_results.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/</code> with <code>image_manifest.csv</code>.</p></main></body></html>'''
+    <p>Raw data: <code>sram_wat_results.csv</code>, <code>wat_target_comparison.csv</code>, <code>wat_target_validation_rows.csv</code>, <code>wat_target_validation_summary.csv</code>, <code>wat_target_parameter_evidence.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/</code> with <code>image_manifest.csv</code>.</p></main></body></html>'''
     report = out/"sram_wat_report.html"; report.write_text(doc, encoding="utf-8")
     return report
 
@@ -694,25 +1413,27 @@ def run_analysis(csv_path: str, out_dir: str, cfg: Config, corner: str | None = 
 def _launch_legacy_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
-    root = tk.Tk(); root.title("28 nm 6T SRAM × WAT Analyzer"); root.geometry("820x720"); root.minsize(760, 680)
-    values = {"out": tk.StringVar(value=str(Path.cwd()/"output")), "corner": tk.StringVar(value="TT")}
-    defaults={"pu":("0.38","45"),"pg":("0.37","80"),"pd":("0.36","120")}
+    root = tk.Tk(); root.title("HV28 SRAM Analysis"); root.geometry("820x720"); root.minsize(760, 680)
+    values = {"out": tk.StringVar(value=str(Path.cwd()/"output")),
+              "corner": tk.StringVar(value="DEMO28_TT_W01"),
+              "history_csv": tk.StringVar(value="")}
+    defaults={"pu":("0.385","44"),"pg":("0.365","82"),"pd":("0.355","124")}
     wat_values={}
     for dev in ("pu1","pu2","pg1","pg2","pd1","pd2"):
         vt,ids=defaults[dev[:2]]
         wat_values[f"{dev}_vt"]=tk.StringVar(value=vt); wat_values[f"{dev}_ids"]=tk.StringVar(value=ids)
     numeric = {k: tk.StringVar(value=str(v)) for k,v in asdict(Config()).items() if k != "grid_points"}
     frame = ttk.Frame(root, padding=18); frame.pack(fill="both", expand=True)
-    ttk.Label(frame, text="28 nm 6T SRAM × WAT PU / PG / PD", font=("Segoe UI", 17, "bold")).grid(row=0,column=0,columnspan=4,sticky="w")
+    ttk.Label(frame, text="HV28 SRAM Analysis", font=("Calibri", 17, "bold")).grid(row=0,column=0,columnspan=4,sticky="w")
     ttk.Label(frame, text="固定 28 nm 6T 架構；手動輸入 WAT，Python 產生 SNM 與 R/W Vmin（不使用 SPICE）",
               foreground="#475569").grid(row=1,column=0,columnspan=4,sticky="w",pady=(3,14))
 
     wat_box = ttk.LabelFrame(frame, text="WAT 手動輸入", padding=12)
     wat_box.grid(row=2,column=0,columnspan=4,sticky="ew",pady=5)
-    ttk.Label(wat_box,text="Corner / Lot ID").grid(row=0,column=0,sticky="w",padx=(0,8))
+    ttk.Label(wat_box,text="Lot / Wafer ID").grid(row=0,column=0,sticky="w",padx=(0,8))
     ttk.Entry(wat_box,textvariable=values["corner"],width=16).grid(row=0,column=1,sticky="w")
-    ttk.Label(wat_box,text="Q side",font=("Segoe UI",10,"bold")).grid(row=1,column=0,columnspan=3,pady=(10,3))
-    ttk.Label(wat_box,text="QB side",font=("Segoe UI",10,"bold")).grid(row=1,column=3,columnspan=3,pady=(10,3))
+    ttk.Label(wat_box,text="Q side",font=("Calibri",10,"bold")).grid(row=1,column=0,columnspan=3,pady=(10,3))
+    ttk.Label(wat_box,text="QB side",font=("Calibri",10,"bold")).grid(row=1,column=3,columnspan=3,pady=(10,3))
     # Cards are placed like the physical cell: PU top, PG center, PD bottom.
     for row,(kind,desc) in enumerate((("pu","PMOS"),("pg","access"),("pd","NMOS")),2):
         for side,col in (("1",0),("2",3)):
@@ -768,37 +1489,48 @@ def launch_gui() -> None:
     import queue
     import threading
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import filedialog, font as tkfont, messagebox, ttk
 
     BG, CARD, TEXT, SECONDARY = "#F5F5F7", "#FFFFFF", "#1D1D1F", "#6E6E73"
     BLUE, BLUE_DARK, BORDER, GREEN, RED = "#007AFF", "#0062CC", "#D2D2D7", "#34C759", "#FF3B30"
     root = tk.Tk()
-    root.title("28 nm 6T SRAM — WAT Studio")
-    root.geometry("1120x860")
-    root.minsize(1040, 790)
+    root.title("HV28 SRAM Analysis")
+    root.geometry("1180x940")
+    root.minsize(1080, 860)
     root.configure(bg=BG)
+    if sys.platform == "win32":
+        root.after(0, lambda: root.state("zoomed"))
+    for named_font in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont",
+                       "TkCaptionFont", "TkSmallCaptionFont", "TkIconFont", "TkTooltipFont"):
+        try:
+            tkfont.nametofont(named_font).configure(family="Calibri")
+        except tk.TclError:
+            pass
 
     style = ttk.Style(root)
     style.theme_use("clam")
     style.configure("Root.TFrame", background=BG)
     style.configure("Card.TFrame", background=CARD, relief="flat")
-    style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Segoe UI Variable Display", 24, "bold"))
-    style.configure("Subtitle.TLabel", background=BG, foreground=SECONDARY, font=("Segoe UI Variable Text", 10))
-    style.configure("Section.TLabel", background=CARD, foreground=TEXT, font=("Segoe UI Variable Text", 13, "bold"))
-    style.configure("Body.TLabel", background=CARD, foreground=TEXT, font=("Segoe UI Variable Text", 10))
-    style.configure("Meta.TLabel", background=CARD, foreground=SECONDARY, font=("Segoe UI Variable Text", 9))
+    style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Calibri", 24, "bold"))
+    style.configure("Subtitle.TLabel", background=BG, foreground=SECONDARY, font=("Calibri", 10))
+    style.configure("Section.TLabel", background=CARD, foreground=TEXT, font=("Calibri", 13, "bold"))
+    style.configure("Body.TLabel", background=CARD, foreground=TEXT, font=("Calibri", 10))
+    style.configure("Meta.TLabel", background=CARD, foreground=SECONDARY, font=("Calibri", 9))
     style.configure("Apple.TEntry", fieldbackground="#F2F2F7", foreground=TEXT, bordercolor="#E5E5EA",
                     lightcolor="#E5E5EA", darkcolor="#E5E5EA", padding=(8, 6))
     style.map("Apple.TEntry", bordercolor=[("focus", BLUE)])
     style.configure("Accent.TButton", background=BLUE, foreground="white", borderwidth=0,
-                    font=("Segoe UI Variable Text", 11, "bold"), padding=(18, 11))
+                    font=("Calibri", 11, "bold"), padding=(18, 11))
     style.map("Accent.TButton", background=[("pressed", BLUE_DARK), ("active", "#1689FF"), ("disabled", "#A7CFFF")])
     style.configure("Quiet.TButton", background="#E9E9ED", foreground=TEXT, borderwidth=0, padding=(10, 7))
     style.map("Quiet.TButton", background=[("pressed", "#D8D8DC"), ("active", "#E2E2E7")])
     style.configure("Apple.Horizontal.TProgressbar", background=BLUE, troughcolor="#E5E5EA", borderwidth=0)
 
-    values = {"out": tk.StringVar(value=str(Path.cwd()/"output")), "corner": tk.StringVar(value="TT")}
-    defaults = {"pu": ("0.38", "45"), "pg": ("0.37", "80"), "pd": ("0.36", "120")}
+    values = {"out": tk.StringVar(value=str(Path.cwd()/"output")),
+              "corner": tk.StringVar(value="DEMO28_TT_W01"),
+              "history_csv": tk.StringVar(value="")}
+    defaults = {"pu": ("0.385", "44"), "pg": ("0.365", "82"), "pd": ("0.355", "124")}
+    target_defaults = {"pu": ("0.380", "45"), "pg": ("0.370", "80"), "pd": ("0.360", "120")}
     wat_values: dict[str, tk.StringVar] = {}
     for dev in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2"):
         vt, ids = defaults[dev[:2]]
@@ -810,99 +1542,160 @@ def launch_gui() -> None:
         three_values[f"{dev}_vt"] = tk.StringVar(value=vt)
         three_values[f"{dev}_ids"] = tk.StringVar(value=ids)
     mode_var = tk.StringVar(value="3T Merged")
-    target_var = tk.StringVar(value="PG")
+    target_values: dict[str, tk.StringVar] = {}
+    for dev in ("pu", "pg", "pd"):
+        vt, ids = target_defaults[dev]
+        target_values[f"{dev}_vt"] = tk.StringVar(value=vt)
+        target_values[f"{dev}_ids"] = tk.StringVar(value=ids)
     manual_vmin_vars = {
-        "scan4n": tk.StringVar(value="0.490"),
-        "select_write": tk.StringVar(value="0.490"),
-        "select_read": tk.StringVar(value="0.430"),
+        "scan4n": tk.StringVar(value="0.630"),
+        "select_write": tk.StringVar(value="0.580"),
+        "select_read": tk.StringVar(value="0.610"),
     }
     numeric = {k: tk.StringVar(value=str(v)) for k, v in asdict(Config()).items() if k != "grid_points"}
+    judgment_values = {k: tk.StringVar(value=str(v)) for k, v in asdict(JudgmentTargets()).items()}
+    validation_values = {k: tk.StringVar(value=str(v))
+                         for k, v in asdict(TargetValidationSettings()).items()}
 
     shell = ttk.Frame(root, style="Root.TFrame", padding=(28, 22, 28, 24)); shell.pack(fill="both", expand=True)
     header = ttk.Frame(shell, style="Root.TFrame"); header.pack(fill="x", pady=(0, 18))
-    ttk.Label(header, text="28 nm 6T SRAM", style="Title.TLabel").pack(side="left")
+    ttk.Label(header, text="HV28 SRAM Analysis", style="Title.TLabel").pack(side="left")
     badge = tk.Label(header, text="  WAT STUDIO  ", bg="#E5F1FF", fg=BLUE,
-                     font=("Segoe UI Variable Text", 9, "bold"), padx=7, pady=4)
+                     font=("Calibri", 9, "bold"), padx=7, pady=4)
     badge.pack(side="left", padx=12, pady=(7, 0))
     ttk.Label(header, text="Object-oriented bitcell analysis · No SPICE", style="Subtitle.TLabel").pack(side="right", pady=(10, 0))
 
     content = ttk.Frame(shell, style="Root.TFrame"); content.pack(fill="both", expand=True)
     content.columnconfigure(0, weight=7); content.columnconfigure(1, weight=4); content.rowconfigure(0, weight=1)
     left = ttk.Frame(content, style="Card.TFrame", padding=18); left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-    right = ttk.Frame(content, style="Card.TFrame", padding=18); right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    right_card = ttk.Frame(content, style="Card.TFrame"); right_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    # Keep the primary action visible while the analysis inputs scroll independently.
+    right_footer = ttk.Frame(right_card, style="Card.TFrame", padding=(18, 8, 18, 18))
+    right_footer.pack(side="bottom", fill="x")
+    right_view = tk.Canvas(right_card, bg=CARD, highlightthickness=0, bd=0)
+    right_scroll = ttk.Scrollbar(right_card, orient="vertical", command=right_view.yview)
+    right_scroll.pack(side="right", fill="y", pady=(12, 6))
+    right_view.pack(side="left", fill="both", expand=True)
+    right_view.configure(yscrollcommand=right_scroll.set)
+    right = ttk.Frame(right_view, style="Card.TFrame", padding=(18, 18, 12, 8))
+    right_window = right_view.create_window((0, 0), window=right, anchor="nw")
+
+    def sync_right_scroll(_event=None) -> None:
+        right_view.configure(scrollregion=right_view.bbox("all"))
+
+    def fit_right_width(event) -> None:
+        right_view.itemconfigure(right_window, width=event.width)
+
+    def scroll_right(event) -> None:
+        if event.delta:
+            right_view.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def enable_right_scroll(_event) -> None:
+        root.bind_all("<MouseWheel>", scroll_right)
+
+    def disable_right_scroll(_event) -> None:
+        root.unbind_all("<MouseWheel>")
+
+    right.bind("<Configure>", sync_right_scroll)
+    right_view.bind("<Configure>", fit_right_width)
+    right_view.bind("<Enter>", enable_right_scroll)
+    right_view.bind("<Leave>", disable_right_scroll)
+    root.after_idle(sync_right_scroll)
 
     ttk.Label(left, text="Bitcell WAT", style="Section.TLabel").pack(anchor="w")
     ttk.Label(left, text="Enter Vt and Ids beside each physical MOS.", style="Meta.TLabel").pack(anchor="w", pady=(2, 8))
     top_fields = ttk.Frame(left, style="Card.TFrame"); top_fields.pack(fill="x", pady=(0, 4))
-    ttk.Label(top_fields, text="Corner / Lot", style="Body.TLabel").pack(side="left")
+    ttk.Label(top_fields, text="Lot / Wafer", style="Body.TLabel").pack(side="left")
     ttk.Entry(top_fields, textvariable=values["corner"], width=14, style="Apple.TEntry").pack(side="left", padx=10)
     mode_segment = tk.Frame(top_fields, bg="#E9E9ED", padx=2, pady=2)
     mode_segment.pack(side="right")
     for label in ("3T Merged", "6T Independent"):
         tk.Radiobutton(mode_segment, text=label, variable=mode_var, value=label, indicatoron=False,
                        bg="#E9E9ED", activebackground="#FFFFFF", selectcolor="#FFFFFF", fg=TEXT,
-                       font=("Segoe UI Variable Text", 9, "bold"), relief="flat", bd=0,
+                       font=("Calibri", 9, "bold"), relief="flat", bd=0,
                        padx=10, pady=5, command=lambda: update_mode()).pack(side="left")
 
-    schematic = tk.Canvas(left, bg=CARD, highlightthickness=0, height=465)
+    schematic = tk.Canvas(left, bg=CARD, highlightthickness=0, height=540)
     schematic.pack(fill="both", expand=True)
-    # Circuit skeleton: hierarchy is conveyed through restrained color and spatial mapping.
-    schematic.create_text(323, 18, text="VDD", fill=SECONDARY, font=("Segoe UI Variable Text", 9, "bold"))
-    schematic.create_line(170, 35, 476, 35, fill=BORDER, width=2)
-    schematic.create_line(170, 420, 476, 420, fill=BORDER, width=2)
-    schematic.create_text(323, 446, text="GND", fill=SECONDARY, font=("Segoe UI Variable Text", 9, "bold"))
-    schematic.create_line(60, 220, 180, 220, fill=GREEN, width=3)
-    schematic.create_line(466, 220, 586, 220, fill=GREEN, width=3)
-    schematic.create_text(34, 220, text="BL", fill=SECONDARY, font=("Segoe UI Variable Text", 9, "bold"))
-    schematic.create_text(612, 220, text="BLB", fill=SECONDARY, font=("Segoe UI Variable Text", 9, "bold"))
-    schematic.create_line(260, 160, 386, 285, fill="#AF52DE", width=2, dash=(5, 4))
-    schematic.create_line(386, 160, 260, 285, fill="#AF52DE", width=2, dash=(5, 4))
-    schematic.create_oval(250, 210, 270, 230, fill=TEXT, outline="")
-    schematic.create_oval(376, 210, 396, 230, fill=TEXT, outline="")
-    schematic.create_text(260, 198, text="Q", fill=TEXT, font=("Segoe UI Variable Text", 11, "bold"))
-    schematic.create_text(386, 198, text="QB", fill=TEXT, font=("Segoe UI Variable Text", 11, "bold"))
+    # Standard 6T arrangement: WL above, BLB/BL at the sides, cross-coupled Q/QB.
+    schematic.create_line(45, 48, 605, 48, fill=BORDER, width=2)
+    schematic.create_text(325, 30, text="WL", fill=TEXT, font=("Calibri", 12, "bold"))
+    schematic.create_line(68, 48, 68, 474, fill=BORDER, width=2)
+    schematic.create_line(582, 48, 582, 474, fill=BORDER, width=2)
+    schematic.create_text(68, 498, text="BLB", fill=SECONDARY, font=("Calibri", 10, "bold"))
+    schematic.create_text(582, 498, text="BL", fill=SECONDARY, font=("Calibri", 10, "bold"))
+    schematic.create_line(205, 105, 445, 105, fill=BORDER, width=2)
+    schematic.create_text(325, 91, text="VDD", fill=SECONDARY, font=("Calibri", 9, "bold"))
+    schematic.create_line(205, 442, 445, 442, fill=BORDER, width=2)
+    schematic.create_text(325, 463, text="GND", fill=SECONDARY, font=("Calibri", 9, "bold"))
+    schematic.create_line(265, 105, 265, 257, fill=BORDER, width=2)
+    schematic.create_line(385, 105, 385, 257, fill=BORDER, width=2)
+    schematic.create_line(265, 277, 265, 442, fill=BORDER, width=2)
+    schematic.create_line(385, 277, 385, 442, fill=BORDER, width=2)
+    schematic.create_line(68, 267, 202, 267, fill=GREEN, width=2)
+    schematic.create_line(448, 267, 582, 267, fill=GREEN, width=2)
+    schematic.create_line(265, 215, 385, 318, fill="#AF52DE", width=2, dash=(5, 4))
+    schematic.create_line(385, 215, 265, 318, fill="#AF52DE", width=2, dash=(5, 4))
+    schematic.create_oval(255, 257, 275, 277, fill=TEXT, outline="")
+    schematic.create_oval(375, 257, 395, 277, fill=TEXT, outline="")
+    schematic.create_text(265, 245, text="QB", fill=TEXT, font=("Calibri", 11, "bold"))
+    schematic.create_text(385, 245, text="Q", fill=TEXT, font=("Calibri", 11, "bold"))
 
     def mos_panel(name: str, accent: str, source: dict[str, tk.StringVar]) -> ttk.Frame:
-        panel = tk.Frame(schematic, bg="#FAFAFC", highlightbackground=BORDER, highlightthickness=1, padx=9, pady=7)
-        tk.Label(panel, text=name.upper(), bg="#FAFAFC", fg=accent,
-                 font=("Segoe UI Variable Text", 9, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
-        tk.Label(panel, text="Vt", bg="#FAFAFC", fg=SECONDARY, font=("Segoe UI Variable Text", 8)).grid(row=1, column=0)
-        ttk.Entry(panel, textvariable=source[f"{name}_vt"], width=7, style="Apple.TEntry").grid(row=1, column=1, padx=(3, 7), pady=(4, 0))
-        tk.Label(panel, text="Ids", bg="#FAFAFC", fg=SECONDARY, font=("Segoe UI Variable Text", 8)).grid(row=1, column=2)
-        ttk.Entry(panel, textvariable=source[f"{name}_ids"], width=7, style="Apple.TEntry").grid(row=1, column=3, padx=(3, 0), pady=(4, 0))
+        panel = tk.Frame(schematic, bg="#FAFAFC", highlightbackground=BORDER, highlightthickness=1, padx=7, pady=6)
+        display_name = DISPLAY_MOS_NAMES.get(name, name.upper())
+        tk.Label(panel, text=display_name, bg="#FAFAFC", fg=accent,
+                 font=("Calibri", 9, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+        tk.Label(panel, text="Vt", bg="#FAFAFC", fg=SECONDARY, font=("Calibri", 8)).grid(row=1, column=0)
+        ttk.Entry(panel, textvariable=source[f"{name}_vt"], width=6, style="Apple.TEntry").grid(row=1, column=1, padx=(3, 6), pady=(4, 0))
+        tk.Label(panel, text="Ids", bg="#FAFAFC", fg=SECONDARY, font=("Calibri", 8)).grid(row=1, column=2)
+        ttk.Entry(panel, textvariable=source[f"{name}_ids"], width=6, style="Apple.TEntry").grid(row=1, column=3, padx=(3, 0), pady=(4, 0))
         return panel
 
-    positions = {"pu1": (150, 52), "pu2": (370, 52), "pg1": (18, 177), "pg2": (502, 177),
-                 "pd1": (150, 310), "pd2": (370, 310)}
+    positions = {"pu1": (135, 120), "pu2": (350, 120), "pg1": (2, 230), "pg2": (475, 230),
+                 "pd1": (135, 335), "pd2": (350, 335)}
     six_window_ids = []
     for name, (x, y) in positions.items():
         accent = RED if name.startswith("pu") else GREEN if name.startswith("pg") else BLUE
         six_window_ids.append(schematic.create_window(x, y, anchor="nw", window=mos_panel(name, accent, wat_values)))
-    three_positions = {"pu": (260, 55), "pg": (260, 180), "pd": (260, 310)}
+    # Merged objects sit around the perimeter so Q/QB and feedback paths stay visible.
+    three_positions = {"pu": (88, 120), "pg": (420, 230), "pd": (88, 335)}
     three_window_ids = []
     for name, (x, y) in three_positions.items():
         accent = RED if name == "pu" else GREEN if name == "pg" else BLUE
         three_window_ids.append(schematic.create_window(x, y, anchor="nw", window=mos_panel(name, accent, three_values)))
+    three_guide_ids = [
+        schematic.create_line(250, 155, 300, 210, fill=RED, width=2, dash=(4, 4)),
+        schematic.create_line(420, 267, 397, 267, fill=GREEN, width=2, dash=(4, 4)),
+        schematic.create_line(250, 370, 300, 320, fill=BLUE, width=2, dash=(4, 4)),
+    ]
 
     def update_mode() -> None:
         merged = mode_var.get() == "3T Merged"
         for item in three_window_ids: schematic.itemconfigure(item, state="normal" if merged else "hidden")
+        for item in three_guide_ids: schematic.itemconfigure(item, state="normal" if merged else "hidden")
         for item in six_window_ids: schematic.itemconfigure(item, state="hidden" if merged else "normal")
 
     update_mode()
-    schematic.create_text(323, 390, text="Vt in V · Ids in µA", fill=SECONDARY, font=("Segoe UI Variable Text", 8))
+    schematic.create_text(325, 526, text="Vt in V · Isat / Ids in µA", fill=SECONDARY, font=("Calibri", 8))
 
     ttk.Label(right, text="Analysis", style="Section.TLabel").pack(anchor="w")
-    ttk.Label(right, text="Choose the WT target and enter measured Vmin.", style="Meta.TLabel").pack(anchor="w", pady=(2, 12))
+    ttk.Label(right, text="Compare datasheet targets with WAT, then record measured Vmin.", style="Meta.TLabel").pack(anchor="w", pady=(2, 12))
 
-    ttk.Label(right, text="Test target", style="Body.TLabel").pack(anchor="w")
-    target_segment = tk.Frame(right, bg="#E9E9ED", padx=2, pady=2)
-    target_segment.pack(fill="x", pady=(6, 12))
-    for name, color in (("PG", GREEN), ("PU", RED), ("PD", BLUE)):
-        tk.Radiobutton(target_segment, text=name, variable=target_var, value=name, indicatoron=False,
-                       bg="#E9E9ED", activebackground="#FFFFFF", selectcolor="#FFFFFF", fg=color,
-                       font=("Segoe UI Variable Text", 10, "bold"), relief="flat", bd=0,
-                       padx=18, pady=6).pack(side="left", fill="x", expand=True)
+    ttk.Label(right, text="Datasheet test targets", style="Body.TLabel").pack(anchor="w")
+    ttk.Label(right, text="Comparison reference only; the model remains calibrated from measured WAT.",
+              style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(2, 5))
+    target_grid = ttk.Frame(right, style="Card.TFrame"); target_grid.pack(fill="x", pady=(0, 12))
+    ttk.Label(target_grid, text="Type", style="Meta.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(target_grid, text="Vt (V)", style="Meta.TLabel").grid(row=0, column=1, sticky="w", padx=(8, 0))
+    ttk.Label(target_grid, text="Isat (µA)", style="Meta.TLabel").grid(row=0, column=2, sticky="w", padx=(8, 0))
+    for row, (name, color) in enumerate((("PU", RED), ("PG", GREEN), ("PD", BLUE)), 1):
+        tk.Label(target_grid, text=name, bg=CARD, fg=color,
+                 font=("Calibri", 10, "bold")).grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Entry(target_grid, textvariable=target_values[f"{name.lower()}_vt"], width=9,
+                  style="Apple.TEntry").grid(row=row, column=1, padx=(8, 0), pady=3)
+        ttk.Entry(target_grid, textvariable=target_values[f"{name.lower()}_ids"], width=10,
+                  style="Apple.TEntry").grid(row=row, column=2, padx=(8, 0), pady=3)
 
     ttk.Label(right, text="Measured WT Vmin", style="Body.TLabel").pack(anchor="w")
     ttk.Label(right, text="Enter values after the physical WT test. These are not model inputs.",
@@ -915,6 +1708,32 @@ def launch_gui() -> None:
                   style="Apple.TEntry").grid(row=row, column=1, sticky="e", padx=(10, 5))
         ttk.Label(measured_grid, text="V", style="Meta.TLabel").grid(row=row, column=2, sticky="w")
     measured_grid.columnconfigure(0, weight=1)
+
+    ttk.Label(right, text="WAT Target Validation", style="Body.TLabel").pack(anchor="w", pady=(2, 0))
+    ttk.Label(right, text="Use measured WT limits and optional lot/wafer history to test whether the datasheet WAT target is an effective screen.",
+              style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(2, 5))
+    validation_grid = ttk.Frame(right, style="Card.TFrame"); validation_grid.pack(fill="x", pady=(0, 8))
+    validation_labels = (("vt_tolerance_mv", "Vt target band", "mV"),
+                         ("idsat_tolerance_pct", "Isat target band", "%"),
+                         ("scan4n_vmin_max", "Scan4N Vmin max", "V"),
+                         ("select_write_vmin_max", "Select_Write Vmin max", "V"),
+                         ("select_read_vmin_max", "Select_Read Vmin max", "V"),
+                         ("minimum_statistical_n", "Minimum paired N", "rows"))
+    for row, (key, label, unit) in enumerate(validation_labels):
+        ttk.Label(validation_grid, text=label, style="Body.TLabel").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(validation_grid, textvariable=validation_values[key], width=10,
+                  style="Apple.TEntry").grid(row=row, column=1, sticky="e", padx=(10, 5))
+        ttk.Label(validation_grid, text=unit, style="Meta.TLabel").grid(row=row, column=2, sticky="w")
+    validation_grid.columnconfigure(0, weight=1)
+    history_row = ttk.Frame(right, style="Card.TFrame"); history_row.pack(fill="x", pady=(0, 12))
+    ttk.Entry(history_row, textvariable=values["history_csv"], style="Apple.TEntry").pack(side="left", fill="x", expand=True)
+    def pick_history() -> None:
+        selected = filedialog.askopenfilename(title="Select WAT + WT history CSV",
+                                              filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if selected: values["history_csv"].set(selected)
+    ttk.Button(history_row, text="History CSV…", style="Quiet.TButton", command=pick_history).pack(side="left", padx=(7, 0))
+    ttk.Label(right, text="CSV: lot_wafer, PU/PG/PD Vt/Idsat, and Scan4N/Select_Write/Select_Read Vmin. Blank WAT cells are allowed.",
+              style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(0, 12))
 
     ttk.Label(right, text="WT Sweep Setup", style="Body.TLabel").pack(anchor="w", pady=(2, 0))
     ttk.Label(right, text="Actual tester recipe used to obtain the measured Vmin.",
@@ -936,6 +1755,26 @@ def launch_gui() -> None:
         ttk.Entry(config_grid, textvariable=numeric[key], width=10, style="Apple.TEntry").grid(row=row, column=1, sticky="e", padx=(12, 5))
         ttk.Label(config_grid, text=unit, style="Meta.TLabel").grid(row=row, column=2, sticky="w")
     config_grid.columnconfigure(0, weight=1)
+    ttk.Label(right,
+              text="Derived report outputs: Cell Ratio, Pull-up Ratio, Hold SNM and Write SNM. No extra manual input is required.",
+              style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(7, 0))
+
+    ttk.Label(right, text="Judgment targets", style="Body.TLabel").pack(anchor="w", pady=(14, 0))
+    ttk.Label(right, text="Enter design/datasheet limits. Defaults are editable examples, not universal 28 nm criteria.",
+              style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(2, 5))
+    judgment_grid = ttk.Frame(right, style="Card.TFrame"); judgment_grid.pack(fill="x")
+    judgment_labels = (("cell_ratio_min", "Cell Ratio min", ""),
+                       ("pull_up_ratio_min", "Pull-up Ratio min", ""),
+                       ("hold_snm_min_mv", "Hold SNM min", "mV"),
+                       ("read_snm_min_mv", "Read SNM min", "mV"),
+                       ("write_snm_min_mv", "Write SNM min", "mV"),
+                       ("marginal_band_pct", "Marginal band", "%"))
+    for row, (key, label, unit) in enumerate(judgment_labels):
+        ttk.Label(judgment_grid, text=label, style="Body.TLabel").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(judgment_grid, textvariable=judgment_values[key], width=10,
+                  style="Apple.TEntry").grid(row=row, column=1, sticky="e", padx=(10, 5))
+        ttk.Label(judgment_grid, text=unit, style="Meta.TLabel").grid(row=row, column=2, sticky="w")
+    judgment_grid.columnconfigure(0, weight=1)
 
     ttk.Separator(right).pack(fill="x", pady=16)
     ttk.Label(right, text="Report destination", style="Body.TLabel").pack(anchor="w")
@@ -948,13 +1787,13 @@ def launch_gui() -> None:
 
     status = tk.StringVar(value="Ready to analyze")
     status_label = tk.Label(right, textvariable=status, bg=CARD, fg=SECONDARY,
-                            font=("Segoe UI Variable Text", 9), anchor="w", justify="left", wraplength=330)
+                            font=("Calibri", 9), anchor="w", justify="left", wraplength=330)
     status_label.pack(fill="x", pady=(0, 7))
     progress = ttk.Progressbar(right, mode="indeterminate", style="Apple.Horizontal.TProgressbar")
     progress.pack(fill="x", pady=(0, 12))
     result_queue: queue.Queue = queue.Queue()
 
-    def collect_inputs() -> tuple[SixTWatCell | ThreeTWatCell, Config, ManualVmin, str]:
+    def collect_inputs() -> tuple[SixTWatCell | ThreeTWatCell, Config, ManualVmin, DatasheetTargets, JudgmentTargets, TargetValidationSettings, list[dict]]:
         cfg = Config(**{k: float(v.get()) for k, v in numeric.items()})
         validate_config(cfg)
         corner = values["corner"].get().strip() or "Manual"
@@ -973,15 +1812,42 @@ def launch_gui() -> None:
             _positive(manual_vmin_vars["select_write"].get(), "Select_Write measured Vmin"),
             _positive(manual_vmin_vars["select_read"].get(), "Select_Read measured Vmin"),
         )
-        return cell, cfg, measured, target_var.get()
+        targets = DatasheetTargets(**{
+            name: MosWat(_positive(target_values[f"{name}_vt"].get(), f"{name} target Vt"),
+                         _positive(target_values[f"{name}_ids"].get(), f"{name} target Isat"))
+            for name in ("pu", "pg", "pd")
+        })
+        judgment_targets = JudgmentTargets(**{
+            key: _positive(value.get(), key) for key, value in judgment_values.items()})
+        if judgment_targets.marginal_band_pct >= 100:
+            raise ValueError("Marginal band must be below 100%")
+        validation_settings = TargetValidationSettings(
+            vt_tolerance_mv=_positive(validation_values["vt_tolerance_mv"].get(), "Vt target band"),
+            idsat_tolerance_pct=_positive(validation_values["idsat_tolerance_pct"].get(), "Isat target band"),
+            scan4n_vmin_max=_positive(validation_values["scan4n_vmin_max"].get(), "Scan4N Vmin max"),
+            select_write_vmin_max=_positive(validation_values["select_write_vmin_max"].get(), "Select_Write Vmin max"),
+            select_read_vmin_max=_positive(validation_values["select_read_vmin_max"].get(), "Select_Read Vmin max"),
+            minimum_statistical_n=int(_positive(validation_values["minimum_statistical_n"].get(), "Minimum paired N")),
+        )
+        if validation_settings.idsat_tolerance_pct >= 100:
+            raise ValueError("Isat target band must be below 100%")
+        if validation_settings.minimum_statistical_n < 6:
+            raise ValueError("Minimum paired N must be at least 6")
+        history_path = values["history_csv"].get().strip()
+        historical_rows = read_validation_csv(history_path) if history_path else []
+        return cell, cfg, measured, targets, judgment_targets, validation_settings, historical_rows
 
     def worker(cell: SixTWatCell | ThreeTWatCell, cfg: Config, measured: ManualVmin,
-               target: str, out_path: str) -> None:
+               targets: DatasheetTargets, judgment_targets: JudgmentTargets,
+               validation_settings: TargetValidationSettings, historical_rows: list[dict],
+               out_path: str) -> None:
         try:
             if isinstance(cell, ThreeTWatCell):
-                result = analyze_three_mos(cell, cfg, target, measured)
+                result = analyze_three_mos(cell, cfg, targets, measured, judgment_targets,
+                                           validation_settings, historical_rows)
             else:
-                result = analyze_six_mos(cell, cfg, target, measured)
+                result = analyze_six_mos(cell, cfg, targets, measured, judgment_targets,
+                                         validation_settings, historical_rows)
             report = write_outputs(result, out_path)
             result_queue.put((True, cell, report))
         except Exception as exc:
@@ -993,7 +1859,7 @@ def launch_gui() -> None:
             root.after(80, poll_result); return
         progress.stop(); analyze_button.state(["!disabled"])
         if ok:
-            status.set(f"Complete · {cell.corner} · Report opened")
+            status.set(f"Complete · {cell.corner} · HTML report opened")
             status_label.configure(fg=GREEN)
             webbrowser.open(Path(payload).resolve().as_uri())
         else:
@@ -1002,25 +1868,26 @@ def launch_gui() -> None:
             messagebox.showerror("Analysis error", str(payload))
 
     def execute() -> None:
-        try: cell, cfg, measured, target = collect_inputs()
+        try: cell, cfg, measured, targets, judgment_targets, validation_settings, historical_rows = collect_inputs()
         except Exception as exc:
             status.set("Check the highlighted input values")
             status_label.configure(fg=RED)
             messagebox.showerror("Invalid input", str(exc)); return
-        status.set(f"Analyzing {mode_var.get()} · target {target}…")
+        status.set(f"Analyzing {mode_var.get()} · datasheet vs WAT…")
         status_label.configure(fg=BLUE)
         analyze_button.state(["disabled"]); progress.start(10)
-        threading.Thread(target=worker, args=(cell, cfg, measured, target, values["out"].get()), daemon=True).start()
+        threading.Thread(target=worker, args=(cell, cfg, measured, targets, judgment_targets,
+                                             validation_settings, historical_rows, values["out"].get()), daemon=True).start()
         root.after(80, poll_result)
 
-    analyze_button = ttk.Button(right, text="Analyze & Open Report", style="Accent.TButton", command=execute)
-    analyze_button.pack(fill="x", side="bottom")
-    ttk.Label(right, text="Scan4N · Select_Write · Select_Read", style="Meta.TLabel").pack(side="bottom", pady=(0, 9))
+    ttk.Label(right_footer, text="Scan4N · Select_Write · Select_Read", style="Meta.TLabel").pack(pady=(0, 7))
+    analyze_button = ttk.Button(right_footer, text="Analyze & Open HTML", style="Accent.TButton", command=execute)
+    analyze_button.pack(fill="x")
     root.mainloop()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    p=argparse.ArgumentParser(description="6T SRAM / WAT PU-PG-PD sensitivity analyzer")
+    p=argparse.ArgumentParser(description="6T SRAM / WAT cell-level SNM analyzer")
     p.add_argument("--input",help="WAT CSV; omit to open GUI")
     p.add_argument("--output",default="output",help="output directory")
     p.add_argument("--corner",help="analyze only this corner")

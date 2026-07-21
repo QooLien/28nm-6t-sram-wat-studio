@@ -1,0 +1,3 @@
+lot_wafer,pu_vt,pu_idsat,pg_vt,pg_idsat,pd_vt,pd_idsat,scan4n_vmin,select_write_vmin,select_read_vmin
+EXAMPLE_WAT_WT,0.380,45,0.370,80,0.360,120,0.610,0.570,0.590
+EXAMPLE_WT_ONLY,,,,,,,0.620,0.580,0.600
