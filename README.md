@@ -6,7 +6,12 @@
 
 ## 快速使用
 
-Windows 直接雙擊 `open_sram_wat_analyzer.cmd`。介面依 6T 位置排列 PU1、PU2、PG1、PG2、PD1、PD2，每顆 MOS 都可手動輸入自己的 Vt、Ids；完成後按「產生並開啟分析報表」。不需要 SPICE，也不需要先準備 CSV。
+Windows 直接雙擊 `open_sram_wat_analyzer.cmd`。介面可切換兩種物件導向模式：
+
+- `3T Merged`：PU、PG、PD 三個共享物件，左右對稱映射到實體 6T bitcell。
+- `6T Independent`：PU1、PU2、PG1、PG2、PD1、PD2 六個獨立物件，可分析左右 mismatch。
+
+選擇 PG／PU／PD 作為當次 WT test target，再手動填入測試完成後的 Scan4N、Select_Write、Select_Read Vmin。這三個實測值不由 Python 模型產生；報表中的 model-estimated margin 會分開標示。完成後按「Analyze & Open Report」。不需要 SPICE，也不需要先準備 CSV。
 
 CSV 僅是多個 corner 批次分析的選用功能：
 
@@ -19,8 +24,10 @@ python sram_wat_analyzer.py --input sample_wat.csv --output output
 - `sram_wat_report.html`：PU／PG／PD 個別 read butterfly、SNM 與 R/W Vmin 圖表
 - `sram_wat_results.csv`：可匯入 Excel/JMP 的數值
 - `sram_mos_results.csv`：六顆實體 MOS 各自的 Vt/Ids sensitivity 與 worst-side 結果
-- `wt_test_0bit_vmin.csv`：Scan4N、Select_Write、Select_Read 的 WT 0-Bit Vmin
+- `wt_test_0bit_vmin.csv`：手動輸入的 Scan4N、Select_Write、Select_Read WT Vmin 與資料來源
 - `sram_wat_results.json`：完整機器可讀結果與 VTC 曲線
+- `images/`：架構圖、PU／PG／PD Butterfly、SNM、Model Read/Write Vmin 的獨立 SVG 圖片
+- `images/image_manifest.csv`：圖片檔名、對應元件與用途說明
 
 ## WAT CSV 格式
 
@@ -40,7 +47,7 @@ TT,0.42,45,0.40,80,0.39,120
 - Read Vmin：最低 VDD，需同時滿足 read SNM 下限（預設 30 mV）與 read 後節點保持 Q < 35% VDD、QB > 65% VDD。
 - Write Vmin：從 Q=1 寫入 Q=0，最低 VDD 需達到 Q < 20% VDD、QB > 80% VDD。
 - Sensitivity：PU、PG、PD 每次只改一個參數；預設 Vt ±30 mV、Ids ±10%。
-- WT 0-Bit：`Select_Write` 需 Write-0/1 都通過；`Select_Read` 需 Read-0/1 都通過；`Scan4N` 執行 W0 → R0/W1 → R1/W0 → R0，所有 phase 通過才記為 0-Bit pass。
+- WT target：PG／PU／PD 是測試時選定的 target。WT Vmin 是測試完成後手動輸入的量測結果，不使用 compact model 取代實測值。
 
 Vmin 範圍與步階、SNM 下限、Vt/Ids 調整量都可由 GUI 或 CLI 改動。
 

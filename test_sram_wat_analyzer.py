@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sram_wat_analyzer import Config, MosWat, SixTWatCell, Sram6T, WatPoint, WtZeroBitVminTest, analyze, analyze_six_mos, read_wat_csv, validate_config, write_outputs
+from sram_wat_analyzer import Config, ManualVmin, MosWat, SixTWatCell, ThreeTWatCell, Sram6T, WatPoint, WtZeroBitVminTest, analyze, analyze_six_mos, analyze_three_mos, read_wat_csv, validate_config, write_outputs
 
 
 class AnalyzerTests(unittest.TestCase):
@@ -29,6 +29,10 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual(read_wat_csv(source)[0].corner, "TT")
             report = write_outputs(analyze(self.wat, self.cfg), Path(td)/"out")
             self.assertTrue(report.exists())
+            image_dir = report.parent/"images"
+            self.assertTrue((image_dir/"00_28nm_6t_bitcell_architecture.svg").exists())
+            self.assertEqual(len(list(image_dir.glob("*.svg"))), 13)
+            self.assertTrue((image_dir/"image_manifest.csv").exists())
             with open(report.parent/"sram_wat_results.csv", encoding="utf-8-sig") as f:
                 self.assertEqual(len(list(csv.DictReader(f))), 15)
 
@@ -55,6 +59,16 @@ class AnalyzerTests(unittest.TestCase):
         results = WtZeroBitVminTest(cell, self.cfg).run()
         self.assertEqual([x["test"] for x in results], ["Scan4N","Select_Write","Select_Read"])
         self.assertTrue(all("vmin_v" in x for x in results))
+
+    def test_three_t_merged_mode_and_manual_vmin(self):
+        cell = ThreeTWatCell("3T", MosWat(.38,45), MosWat(.37,80), MosWat(.36,120))
+        measured = ManualVmin(.51, .50, .44)
+        result = analyze_three_mos(cell, self.cfg, "PD", measured)
+        self.assertEqual(result["object_mode"], "3T Merged")
+        self.assertEqual(result["analysis_target"], "PD")
+        self.assertEqual(len(result["cell"]["mos"]), 3)
+        self.assertEqual(result["wt_test_0bit"][0]["vmin_v"], .51)
+        self.assertEqual(result["vmin_source"], "manual")
 
 
 if __name__ == "__main__":
