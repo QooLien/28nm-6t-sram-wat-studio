@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Generated analysis reports
+output/
+output_*/
+
+# Local release artifacts are uploaded separately as GitHub Release assets
+release/
+
+# Local/editor settings
+.venv/
+venv/
+.idea/
+.vscode/
+*.log
+Thumbs.db
+.DS_Store
