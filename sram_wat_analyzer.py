@@ -9,6 +9,7 @@ Use a foundry BSIM deck for sign-off numbers.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 import csv
 import html
 import json
@@ -145,19 +146,25 @@ class Config:
     vmin_stop: float = 0.90
     vmin_step: float = 0.01
     read_snm_limit: float = 0.030
-    grid_points: int = 301
+    grid_points: int = 5001
 
 
 @dataclass(frozen=True)
 class Tech28nm:
-    """Fixed geometry used by the generic 28 nm 6T architecture model."""
+    """Transparent non-foundry defaults for the generic 28 nm SRAM model."""
     node_nm: int = 28
+    process_family: str = "generic planar bulk CMOS, LP-like"
     topology: str = "6T: 2×PU PMOS + 2×PG NMOS + 2×PD NMOS"
     channel_length_nm: float = 28.0
     pu_width_nm: float = 70.0
     pg_width_nm: float = 100.0
     pd_width_nm: float = 140.0
     nominal_temperature_c: float = 25.0
+    read_wordline_over_vdd: float = 1.0
+    read_bitline_over_vdd: float = 1.0
+    hold_wordline_over_vdd: float = 0.0
+    beta_policy: str = "WAT-calibrated: 2*Idsat/(WAT_VDD-|Vt|)^2"
+    common_vth_policy: str = "mean(|Vt_PU|, Vt_PG, Vt_PD) for Equation 3.36"
 
 
 TECH_28NM = Tech28nm()
@@ -287,7 +294,7 @@ class Sram6T:
         return (lo + hi) / 2
 
     def snm(self, vdd: float, mode: str = "read") -> float:
-        """Maximum-square SNM for a symmetric hold/read butterfly (V)."""
+        """Legacy metastable-centered SNM proxy (V); retained for traceability."""
         if vdd <= 0:
             return 0.0
         m = self.trip_point(vdd, mode)
@@ -308,6 +315,161 @@ class Sram6T:
             else:
                 hi = mid
         return lo
+
+    def butterfly_squares(self, vdd: float, mode: str = "read",
+                          points: int = 1201) -> dict:
+        """Numerically fit the largest axis-aligned square in each VTC lobe.
+
+        This implements the graphical definition illustrated by Figure 3.15(b):
+        determine the largest square in each butterfly eye and use the smaller
+        side as SNM.  The mirrored VTC is obtained by exchanging x and y.
+        """
+        if vdd <= 0 or points < 21:
+            return {"valid": False, "reason": "VDD must be positive and points >= 21",
+                    "snm_v": None, "snm_mv": None, "squares": []}
+        curve = self.vtc(vdd, mode, points)
+        xs = [point[0] for point in curve]
+        ys = [point[1] for point in curve]
+        reversed_ys = list(reversed(ys))
+
+        def inverse_y(x_value: float) -> float:
+            """Piecewise-linear inverse of a monotonic non-increasing VTC."""
+            index = bisect_left(reversed_ys, x_value)
+            if index <= 0:
+                return xs[-1]
+            if index >= len(reversed_ys):
+                return xs[0]
+            y0, y1 = reversed_ys[index - 1], reversed_ys[index]
+            x0, x1 = xs[-index], xs[-index - 1]
+            if abs(y1 - y0) < 1e-15:
+                return (x0 + x1) / 2.0
+            return x0 + (x_value - y0) * (x1 - x0) / (y1 - y0)
+
+        bounds = []
+        for x_value, direct_y in curve:
+            mirrored_y = inverse_y(x_value)
+            bounds.append((x_value, min(direct_y, mirrored_y),
+                           max(direct_y, mirrored_y)))
+
+        trip = self.trip_point(vdd, mode)
+        split = min(range(points), key=lambda index: abs(xs[index] - trip))
+        squares = []
+        for lobe, (start, stop) in enumerate(((0, split), (split, points - 1)), 1):
+            best_side = 0.0
+            best_position = None
+            for left_index in range(start, stop + 1):
+                minimum_upper = math.inf
+                maximum_lower = -math.inf
+                for right_index in range(left_index, stop + 1):
+                    minimum_upper = min(minimum_upper, bounds[right_index][2])
+                    maximum_lower = max(maximum_lower, bounds[right_index][1])
+                    side = xs[right_index] - xs[left_index]
+                    clearance = minimum_upper - maximum_lower
+                    if side <= clearance + 1e-12:
+                        if side > best_side:
+                            y0 = maximum_lower + max(0.0, clearance - side) / 2.0
+                            best_side = side
+                            best_position = (xs[left_index], y0)
+                    elif right_index > left_index:
+                        break
+            if best_position is None:
+                return {"valid": False, "reason": f"No square found in lobe {lobe}",
+                        "snm_v": None, "snm_mv": None, "squares": squares}
+            squares.append({"lobe": lobe, "x_v": best_position[0],
+                            "y_v": best_position[1], "side_v": best_side,
+                            "side_mv": 1000.0 * best_side})
+
+        snm_v = min(square["side_v"] for square in squares)
+        return {"valid": True, "reason": "Two-lobe maximum-square fit",
+                "definition": "Figure 3.15(b): smaller side of squares 1 and 2",
+                "mode": mode, "grid_points": points, "trip_v": trip,
+                "snm_v": snm_v, "snm_mv": 1000.0 * snm_v,
+                "squares": squares}
+
+    def analytical_read_snm_eq_3_36(self, vdd: float) -> dict:
+        """Evaluate the 6T read-SNM expression from Section 3.4.2, Eq. 3.36.
+
+        Reference: *High-Speed CMOS Circuit Technology*, Section 3.4.2,
+        "Analytical SNM Expression for a 6T SRAM Cell", printed page 51.
+
+        The source assumes one common threshold voltage for PU/PG/PD and
+        long-channel square-law devices.  WAT supplies three distinct values,
+        so this implementation explicitly maps them to their arithmetic mean.
+        Domain failures are reported instead of forcing a non-physical result.
+        """
+        q = self.pu.beta / self.pg.beta  # beta_p / beta_a
+        r = self.pd.beta / self.pg.beta  # beta_d / beta_a
+        vth_eff = (self.wat.pu_vt + self.wat.pg_vt + self.wat.pd_vt) / 3.0
+        result = {
+            "source": "High-Speed CMOS Circuit Technology, Section 3.4.2, Equation 3.36",
+            "mode": "read-accessed 6T SRAM",
+            "valid": False,
+            "reason": "",
+            "snm_v": None,
+            "snm_mv": None,
+            "vdd_v": vdd,
+            "vth_eff_v": vth_eff,
+            "vth_mapping": "arithmetic mean of |Vt_PU|, Vt_PG and Vt_PD",
+            "q_beta_p_over_beta_a": q,
+            "r_beta_d_over_beta_a": r,
+            "vs_v": None,
+            "vr_v": None,
+            "k": None,
+            "term_a_v": None,
+            "term_b_v": None,
+            "assumptions": [
+                "PU, PG and PD share one threshold voltage",
+                "long-channel square-law MOS model",
+                "Q1/Q4 saturated and Q2/Q5 linear as defined by the source",
+                "local linearity around the read operating point",
+                "short-channel effects are neglected",
+            ],
+        }
+
+        def invalid(reason: str) -> dict:
+            result["reason"] = reason
+            return result
+
+        if not all(math.isfinite(x) and x > 0 for x in (vdd, vth_eff, q, r)):
+            return invalid("VDD, effective VTH, q and r must be positive finite values")
+
+        vs = vdd - vth_eff
+        vr = vs - (r / (r + 1.0)) * vth_eff
+        result["vs_v"], result["vr_v"] = vs, vr
+        if vs <= 0:
+            return invalid("VDD must exceed the effective threshold voltage")
+        if abs(vr) < 1e-15:
+            return invalid("Vr is zero in Equation 3.32")
+
+        k_domain = (r + 1.0) - (vs * vs) / (vr * vr)
+        result["k_domain"] = k_domain
+        if k_domain <= 0:
+            return invalid("Equation 3.32 square-root domain is non-positive")
+
+        k = (r / (r + 1.0)) * (math.sqrt((r + 1.0) / k_domain) - 1.0)
+        result["k"] = k
+        if not math.isfinite(k) or abs(k) < 1e-15 or abs(k + 1.0) < 1e-15:
+            return invalid("Equation 3.32 produced an invalid k")
+
+        denom_a = 1.0 + r / (k * (r + 1.0))
+        root_arg = (r / q) * (1.0 + 2.0 * k + (r / q) * k * k)
+        result["root_argument"] = root_arg
+        if root_arg < 0 or abs(denom_a) < 1e-15:
+            return invalid("Equation 3.36 denominator or square-root domain is invalid")
+        denom_b = 1.0 + k * r / q + math.sqrt(root_arg)
+        if abs(denom_b) < 1e-15:
+            return invalid("Equation 3.36 second denominator is zero")
+
+        term_a = (vdd - ((2.0 * r + 1.0) / (r + 1.0)) * vth_eff) / denom_a
+        term_b = (vdd - 2.0 * vth_eff) / denom_b
+        snm_v = vth_eff - (term_a - term_b) / (k + 1.0)
+        result["term_a_v"], result["term_b_v"] = term_a, term_b
+        if not math.isfinite(snm_v) or snm_v < 0 or snm_v > vdd:
+            return invalid("Equation 3.36 result is outside the physical range 0 to VDD")
+
+        result.update({"valid": True, "reason": "Within the real-valued Equation 3.36 domain",
+                       "snm_v": snm_v, "snm_mv": 1000.0 * snm_v})
+        return result
 
     def strength_ratios(self) -> dict[str, float]:
         """Return Vt-aware model-beta ratios plus direct WAT-current proxies."""
@@ -468,10 +630,20 @@ def variants(wat: WatPoint, cfg: Config, device: str) -> list[tuple[str, WatPoin
     ]
 
 
-def metric(model: Sram6T, cfg: Config) -> dict[str, float | None]:
+def metric(model: Sram6T, cfg: Config, hold_butterfly: dict | None = None,
+           read_butterfly: dict | None = None) -> dict[str, float | None]:
+    square_points = max(1201, cfg.grid_points)
+    hold_butterfly = hold_butterfly or model.butterfly_squares(
+        cfg.nominal_vdd, "hold", square_points)
+    read_butterfly = read_butterfly or model.butterfly_squares(
+        cfg.nominal_vdd, "read", square_points)
+    analytical = model.analytical_read_snm_eq_3_36(cfg.nominal_vdd)
     return {
-        "hold_snm_mv": 1000 * model.snm(cfg.nominal_vdd, "hold"),
-        "read_snm_mv": 1000 * model.snm(cfg.nominal_vdd, "read"),
+        "hold_snm_mv": hold_butterfly["snm_mv"],
+        "read_snm_mv": read_butterfly["snm_mv"],
+        "hold_snm_trip_proxy_mv": 1000 * model.snm(cfg.nominal_vdd, "hold"),
+        "read_snm_trip_proxy_mv": 1000 * model.snm(cfg.nominal_vdd, "read"),
+        "analytical_read_snm_mv": analytical["snm_mv"],
         **model.strength_ratios(),
     }
 
@@ -534,7 +706,13 @@ def evaluate_judgment(metrics: dict[str, float | None],
 
 def analyze(wat: WatPoint, cfg: Config) -> dict:
     model = Sram6T(wat, cfg)
-    baseline = {"metrics": metric(model, cfg),
+    square_points = max(1201, cfg.grid_points)
+    hold_butterfly = model.butterfly_squares(cfg.nominal_vdd, "hold", square_points)
+    read_butterfly = model.butterfly_squares(cfg.nominal_vdd, "read", square_points)
+    baseline = {"metrics": metric(model, cfg, hold_butterfly, read_butterfly),
+                "analytical_read_snm_eq_3_36": model.analytical_read_snm_eq_3_36(cfg.nominal_vdd),
+                "hold_butterfly": hold_butterfly,
+                "read_butterfly": read_butterfly,
                 "hold_vtc": model.vtc(cfg.nominal_vdd, "hold", 201),
                 "read_vtc": model.vtc(cfg.nominal_vdd, "read", 201),
                 "hold_trip_v": model.trip_point(cfg.nominal_vdd, "hold"),
@@ -667,6 +845,14 @@ def _attach_target_model(result: dict, targets: DatasheetTargets | None, cfg: Co
     if targets is None:
         result["target_6t"] = result["baseline_6t"]
         result["snm_target_comparison"] = []
+        analytical = result["baseline_6t"]["analytical_read_snm_eq_3_36"]
+        result["analytical_read_snm_comparison"] = {
+            "method": "High-Speed CMOS Circuit Technology, Section 3.4.2, Equation 3.36",
+            "current": analytical, "target": analytical,
+            "current_snm_mv": analytical["snm_mv"], "target_snm_mv": analytical["snm_mv"],
+            "delta_mv": 0.0 if analytical["snm_mv"] is not None else None,
+            "delta_pct": 0.0 if analytical["snm_mv"] is not None else None,
+        }
         return
     target_wat = WatPoint(
         corner="Datasheet Target",
@@ -685,6 +871,20 @@ def _attach_target_model(result: dict, targets: DatasheetTargets | None, cfg: Co
                        if target["metrics"][key] else None)}
         for label, key in (("Hold SNM", "hold_snm_mv"), ("Read SNM", "read_snm_mv"))
     ]
+    current_analytical = result["baseline_6t"]["analytical_read_snm_eq_3_36"]
+    target_analytical = target["analytical_read_snm_eq_3_36"]
+    current_value, target_value = current_analytical["snm_mv"], target_analytical["snm_mv"]
+    result["analytical_read_snm_comparison"] = {
+        "method": "High-Speed CMOS Circuit Technology, Section 3.4.2, Equation 3.36",
+        "current": current_analytical,
+        "target": target_analytical,
+        "current_snm_mv": current_value,
+        "target_snm_mv": target_value,
+        "delta_mv": (current_value - target_value
+                     if current_value is not None and target_value is not None else None),
+        "delta_pct": ((current_value / target_value - 1.0) * 100.0
+                      if current_value is not None and target_value not in (None, 0) else None),
+    }
     return
     limits = {"scan4n_vmin": settings.scan4n_vmin_max,
               "select_write_vmin": settings.select_write_vmin_max,
@@ -832,7 +1032,7 @@ def analyze_three_mos(cell: ThreeTWatCell, cfg: Config,
         "corner": cell.corner,
         "mos": {name.upper(): asdict(getattr(cell, name)) for name in ("pu", "pg", "pd")},
         "method": "three shared objects mapped symmetrically to the physical 6T bitcell",
-        "baseline_metrics": cell_metric(cell.to_six_t(), cfg),
+        "baseline_metrics": result["baseline_6t"]["metrics"],
     }
     result["datasheet_targets"] = asdict(datasheet_targets) if datasheet_targets else None
     result["target_comparisons"] = _target_comparisons(cell, datasheet_targets)
@@ -909,6 +1109,7 @@ def snm_overview_svg(result: dict, width: int = 1440, height: int = 650) -> str:
     current, target, cfg = result["baseline_6t"], result.get("target_6t", result["baseline_6t"]), result["config"]
     vdd = cfg["nominal_vdd"]
     comparisons = {row["mode"]: row for row in result.get("snm_target_comparison", [])}
+    analytical = result.get("analytical_read_snm_comparison", {})
     panels = (("Hold SNM", "WL=0; cell retention", "hold_vtc"),
               ("Read SNM", "WL=1; BL/BLB precharged", "read_vtc"))
     margin_x, gap, panel_w = 54, 58, (width - 108 - 58) / 2
@@ -941,13 +1142,178 @@ def snm_overview_svg(result: dict, width: int = 1440, height: int = 650) -> str:
             parts += [f'<polyline points="{direct}" fill="none" stroke="{color}" stroke-width="4"/>',
                       f'<polyline points="{mirrored}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="10 7" opacity=".9"/>']
         label_x = plot_left + plot_w - 6
-        parts += [f'<text x="{label_x:.1f}" y="{plot_top+26}" text-anchor="end" fill="#007AFF" font-size="18" font-weight="700">Current {current_value:.1f} mV</text>',
-                  f'<text x="{label_x:.1f}" y="{plot_top+52}" text-anchor="end" fill="#C56A00" font-size="18" font-weight="700">Target {target_value:.1f} mV</text>',
+        parts += [f'<text x="{label_x:.1f}" y="{plot_top+26}" text-anchor="end" fill="#007AFF" font-size="18" font-weight="700">VTC proxy Current {current_value:.1f} mV</text>',
+                  f'<text x="{label_x:.1f}" y="{plot_top+52}" text-anchor="end" fill="#C56A00" font-size="18" font-weight="700">VTC proxy Target {target_value:.1f} mV</text>',
                   f'<text x="{label_x:.1f}" y="{plot_top+78}" text-anchor="end" fill="#1D1D1F" font-size="17" font-weight="700">Delta {delta:+.1f} mV</text>',
                   f'<text x="{plot_left+plot_w/2:.1f}" y="{height-42}" text-anchor="middle" fill="#6E6E73" font-size="17">VQ / VDD</text>',
                   f'<text x="{x0+16:.1f}" y="{plot_top+plot_h/2:.1f}" transform="rotate(-90 {x0+16:.1f} {plot_top+plot_h/2:.1f})" text-anchor="middle" fill="#6E6E73" font-size="17">VQB / VDD</text>']
-    parts.append('<text x="720" y="632" text-anchor="middle" fill="#6E6E73" font-size="15">SNM values are calculated numerically; limiting squares are intentionally not drawn.</text></svg>')
+        if index == 1:
+            analytical_current = analytical.get("current_snm_mv")
+            analytical_target = analytical.get("target_snm_mv")
+            analytical_delta = analytical.get("delta_mv")
+            if analytical_current is not None and analytical_target is not None:
+                analytical_label = (f'Eq. 3.36: Current {analytical_current:.1f} mV · '
+                                    f'Target {analytical_target:.1f} mV · Δ {analytical_delta:+.1f} mV')
+                analytical_color = "#5856D6"
+            else:
+                analytical_label = "Eq. 3.36: N/A - outside real-valued analytical domain"
+                analytical_color = "#8E8E93"
+            parts += [f'<rect x="{plot_left+plot_w-405:.1f}" y="{plot_top+92}" width="405" height="38" rx="10" fill="#F2F2F7"/>',
+                      f'<text x="{label_x:.1f}" y="{plot_top+117}" text-anchor="end" fill="{analytical_color}" font-size="15" font-weight="700">{html.escape(analytical_label)}</text>']
+    parts.append('<text x="720" y="632" text-anchor="middle" fill="#6E6E73" font-size="15">VTC proxy values and PDF Section 3.4.2 Equation 3.36 are reported separately; limiting squares are not drawn.</text></svg>')
     return "".join(parts)
+
+
+def fig_3_15_style_svg(result: dict, width: int = 1440, height: int = 720) -> str:
+    """Read butterfly plots with squares 1/2 following Figure 3.15(b)."""
+    current = result["baseline_6t"]
+    target = result.get("target_6t", current)
+    analytical = result.get("analytical_read_snm_comparison", {})
+    vdd = result["config"]["nominal_vdd"]
+    panels = (
+        ("Current WAT", current, "#007AFF", analytical.get("current_snm_mv")),
+        ("Datasheet Target", target, "#FF9500", analytical.get("target_snm_mv")),
+    )
+    margin_x, gap = 60, 64
+    panel_w = (width - 2 * margin_x - gap) / 2
+    plot_top, plot_h = 158, 465
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Figure 3.15 style Read SNM butterfly squares" style="font-family:Calibri,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Read SNM - Figure 3.15(b) style</text>',
+        '<path d="M54 82 h34" stroke="#3A3A3C" stroke-width="4"/><text x="98" y="88" fill="#3A3A3C" font-size="17">Inverter VTC</text>',
+        '<path d="M260 82 h34" stroke="#3A3A3C" stroke-width="4" stroke-dasharray="10 7"/><text x="304" y="88" fill="#3A3A3C" font-size="17">Mirrored VTC</text>',
+        '<rect x="506" y="68" width="24" height="24" fill="none" stroke="#34C759" stroke-width="3"/><text x="542" y="88" fill="#3A3A3C" font-size="17">Maximum squares 1 and 2</text>',
+        '<text x="888" y="88" fill="#5856D6" font-size="17">PDF Eq. 3.36 shown as an independent analytical value</text>',
+    ]
+    for index, (title, data, color, analytical_value) in enumerate(panels):
+        x0 = margin_x + index * (panel_w + gap)
+        plot_left, plot_w = x0 + 62, panel_w - 82
+
+        def xy(x_value: float, y_value: float) -> tuple[float, float]:
+            return (plot_left + x_value / vdd * plot_w,
+                    plot_top + (1.0 - y_value / vdd) * plot_h)
+
+        parts += [f'<text x="{x0:.1f}" y="126" fill="#1D1D1F" font-size="25" font-weight="700">{html.escape(title)}</text>',
+                  f'<text x="{x0+panel_w:.1f}" y="126" text-anchor="end" fill="{color}" font-size="18" font-weight="700">Geometric RSNM {data["read_butterfly"]["snm_mv"]:.1f} mV</text>']
+        for tick in (0.0, 0.5, 1.0):
+            px, py = xy(tick * vdd, tick * vdd)
+            parts += [f'<path d="M{px:.1f} {plot_top} V{plot_top+plot_h} M{plot_left} {py:.1f} H{plot_left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
+                      f'<text x="{px:.1f}" y="{plot_top+plot_h+26}" text-anchor="middle" fill="#6E6E73" font-size="15">{tick:.1f}</text>',
+                      f'<text x="{plot_left-10}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{tick:.1f}</text>']
+        curve = data["read_vtc"]
+        direct = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in curve)
+        mirrored = " ".join(f'{xy(y,x)[0]:.1f},{xy(y,x)[1]:.1f}' for x, y in curve)
+        parts += [f'<polyline points="{direct}" fill="none" stroke="{color}" stroke-width="4"/>',
+                  f'<polyline points="{mirrored}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="10 7"/>']
+
+        squares = data["read_butterfly"]["squares"]
+        limiting = min(square["side_v"] for square in squares)
+        for square in squares:
+            left, top = xy(square["x_v"], square["y_v"] + square["side_v"])
+            side_px_x = square["side_v"] / vdd * plot_w
+            side_px_y = square["side_v"] / vdd * plot_h
+            stroke_width = 4 if abs(square["side_v"] - limiting) < 1e-12 else 3
+            parts += [f'<rect x="{left:.1f}" y="{top:.1f}" width="{side_px_x:.1f}" height="{side_px_y:.1f}" fill="#EFFAF2" stroke="#34C759" stroke-width="{stroke_width}"/>',
+                      f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2+7:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">{square["lobe"]}</text>']
+            arrow_x = min(left + side_px_x + 16, plot_left + plot_w - 8)
+            parts += [f'<path d="M{arrow_x:.1f} {top+3:.1f} V{top+side_px_y-3:.1f} M{arrow_x-5:.1f} {top+3:.1f} H{arrow_x+5:.1f} M{arrow_x-5:.1f} {top+side_px_y-3:.1f} H{arrow_x+5:.1f}" stroke="#34C759" stroke-width="2"/>']
+
+        eq_text = f'Eq. 3.36 {analytical_value:.1f} mV' if analytical_value is not None else 'Eq. 3.36 N/A (outside domain)'
+        parts += [f'<text x="{x0+panel_w:.1f}" y="{plot_top+plot_h+58}" text-anchor="end" fill="#5856D6" font-size="17" font-weight="700">{eq_text}</text>',
+                  f'<text x="{plot_left+plot_w/2:.1f}" y="{height-35}" text-anchor="middle" fill="#6E6E73" font-size="17">Vnode A / VDD</text>',
+                  f'<text x="{x0+17:.1f}" y="{plot_top+plot_h/2:.1f}" transform="rotate(-90 {x0+17:.1f} {plot_top+plot_h/2:.1f})" text-anchor="middle" fill="#6E6E73" font-size="17">Vnode B / VDD</text>']
+    parts.append('<text x="720" y="704" text-anchor="middle" fill="#6E6E73" font-size="15">SNM is the smaller side of squares 1 and 2. Read condition: WL=BL=BLB=VDD.</text></svg>')
+    return "".join(parts)
+
+
+def wat_electrical_snm_rows(result: dict) -> list[dict]:
+    """Flatten WAT-measurable electrical inputs and derived SNM outputs."""
+    cfg = result["config"]
+    current_wat = result["wat"]
+    datasets = [("Current WAT", {
+        "pu_vt": current_wat["pu_vt"], "pu_ids": current_wat["pu_ids"],
+        "pg_vt": current_wat["pg_vt"], "pg_ids": current_wat["pg_ids"],
+        "pd_vt": current_wat["pd_vt"], "pd_ids": current_wat["pd_ids"],
+    }, result["baseline_6t"],
+                 result.get("analytical_read_snm_comparison", {}).get("current", {}))]
+    targets = result.get("datasheet_targets")
+    if targets:
+        datasets.append(("Datasheet Target", {
+            "pu_vt": targets["pu"]["vt"], "pu_ids": targets["pu"]["ids"],
+            "pg_vt": targets["pg"]["vt"], "pg_ids": targets["pg"]["ids"],
+            "pd_vt": targets["pd"]["vt"], "pd_ids": targets["pd"]["ids"],
+        }, result["target_6t"],
+                         result.get("analytical_read_snm_comparison", {}).get("target", {})))
+
+    def beta_proxy(vt: float, ids: float) -> float:
+        overdrive = max(cfg["wat_vdd"] - abs(vt), 0.05)
+        return 2.0 * ids / (overdrive * overdrive)
+
+    rows = []
+    for dataset, values, modeled, analytical in datasets:
+        beta_pu = beta_proxy(values["pu_vt"], values["pu_ids"])
+        beta_pg = beta_proxy(values["pg_vt"], values["pg_ids"])
+        beta_pd = beta_proxy(values["pd_vt"], values["pd_ids"])
+        rows.append({
+            "dataset": dataset,
+            "wat_vdd_v": cfg["wat_vdd"],
+            "sram_vdd_v": cfg["nominal_vdd"],
+            "pu_vt_v": values["pu_vt"], "pu_idsat_ua": values["pu_ids"],
+            "pg_vt_v": values["pg_vt"], "pg_idsat_ua": values["pg_ids"],
+            "pd_vt_v": values["pd_vt"], "pd_idsat_ua": values["pd_ids"],
+            "beta_pu_proxy_ua_per_v2": beta_pu,
+            "beta_pg_proxy_ua_per_v2": beta_pg,
+            "beta_pd_proxy_ua_per_v2": beta_pd,
+            "q_beta_pu_over_pg": beta_pu / beta_pg,
+            "r_beta_pd_over_pg": beta_pd / beta_pg,
+            "idsat_pd_over_pg": values["pd_ids"] / values["pg_ids"],
+            "idsat_pg_over_pu": values["pg_ids"] / values["pu_ids"],
+            "hold_snm_geometric_mv": modeled["metrics"]["hold_snm_mv"],
+            "read_snm_geometric_mv": modeled["metrics"]["read_snm_mv"],
+            "read_snm_eq_3_36_mv": analytical.get("snm_mv"),
+            "eq_3_36_status": "VALID" if analytical.get("valid") else "N/A",
+            "eq_3_36_reason": analytical.get("reason", ""),
+            "evidence_scope": "WAT Vt + Idsat; no PDK/model-card-only parameters",
+        })
+    return rows
+
+
+def generic_28nm_assumption_rows(result: dict) -> list[dict]:
+    """Describe every non-WAT default and whether it affects active SNM math."""
+    cfg, tech = result["config"], result["technology"]
+    return [
+        {"parameter": "Technology node", "value": tech["node_nm"], "unit": "nm",
+         "source": "Generic 28 nm default", "used_by": "Model identity", "active": "YES"},
+        {"parameter": "Process family", "value": tech["process_family"], "unit": "-",
+         "source": "Generic engineering assumption", "used_by": "Scope label", "active": "YES"},
+        {"parameter": "SRAM VDD", "value": cfg["nominal_vdd"], "unit": "V",
+         "source": "Model setting; default 0.90 V", "used_by": "Hold/Read VTC and Eq. 3.36", "active": "YES"},
+        {"parameter": "WAT calibration VDD", "value": cfg["wat_vdd"], "unit": "V",
+         "source": "Model setting; default 0.90 V", "used_by": "Beta proxy calibration", "active": "YES"},
+        {"parameter": "Channel length L", "value": tech["channel_length_nm"], "unit": "nm",
+         "source": "Generic 28 nm fallback", "used_by": "Architecture reference only", "active": "NO"},
+        {"parameter": "PU width", "value": tech["pu_width_nm"], "unit": "nm",
+         "source": "Generic SRAM sizing fallback", "used_by": "Architecture reference only", "active": "NO"},
+        {"parameter": "PG width", "value": tech["pg_width_nm"], "unit": "nm",
+         "source": "Generic SRAM sizing fallback", "used_by": "Architecture reference only", "active": "NO"},
+        {"parameter": "PD width", "value": tech["pd_width_nm"], "unit": "nm",
+         "source": "Generic SRAM sizing fallback", "used_by": "Architecture reference only", "active": "NO"},
+        {"parameter": "Nominal temperature", "value": tech["nominal_temperature_c"], "unit": "°C",
+         "source": "Room-temperature default", "used_by": "Reference; no temperature coefficients", "active": "NO"},
+        {"parameter": "Read WL", "value": tech["read_wordline_over_vdd"], "unit": "×VDD",
+         "source": "6T read-bias assumption", "used_by": "Read VTC", "active": "YES"},
+        {"parameter": "Read BL / BLB precharge", "value": tech["read_bitline_over_vdd"], "unit": "×VDD",
+         "source": "6T read-bias assumption", "used_by": "Read VTC", "active": "YES"},
+        {"parameter": "Hold WL", "value": tech["hold_wordline_over_vdd"], "unit": "×VDD",
+         "source": "6T hold-bias assumption", "used_by": "Hold VTC", "active": "YES"},
+        {"parameter": "Beta", "value": tech["beta_policy"], "unit": "µA/V²",
+         "source": "Derived from WAT Vt and Idsat", "used_by": "All compact VTC equations", "active": "YES"},
+        {"parameter": "Common VTH", "value": tech["common_vth_policy"], "unit": "V",
+         "source": "Mapped from three measured WAT Vt values", "used_by": "Equation 3.36 only", "active": "YES"},
+        {"parameter": "Cox / mobility / tox / lambda", "value": "Not required", "unit": "-",
+         "source": "Intentionally not guessed", "used_by": "Replaced by WAT beta calibration", "active": "NO"},
+    ]
 
 
 def architecture_svg(width: int = 1080, height: int = 445) -> str:
@@ -1407,12 +1773,21 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
 
     svg_name = "01_hold_read_snm_target_comparison.svg"
     png_name = "01_hold_read_snm_target_comparison.png"
+    fig315_svg_name = "02_read_snm_fig_3_15_style.svg"
+    fig315_png_name = "02_read_snm_fig_3_15_style.png"
     svg_path = image_dir / svg_name
     svg_path.write_text(snm_overview_svg(result), encoding="utf-8")
     drawing = svg2rlg(str(svg_path))
     if drawing is None:
         raise RuntimeError("Could not render Hold/Read SNM target comparison")
     renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
+    fig315_svg_path = image_dir / fig315_svg_name
+    fig315_svg_path.write_text(fig_3_15_style_svg(result), encoding="utf-8")
+    fig315_drawing = svg2rlg(str(fig315_svg_path))
+    if fig315_drawing is None:
+        raise RuntimeError("Could not render Figure 3.15-style Read SNM chart")
+    renderPM.drawToFile(fig315_drawing, str(image_dir / fig315_png_name),
+                        fmt="PNG", dpi=180, backend="rlPyCairo")
 
     comparison_rows = result.get("snm_target_comparison", [])
     if not comparison_rows:
@@ -1425,6 +1800,39 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     with open(out / "snm_target_comparison.csv", "w", newline="", encoding="utf-8-sig") as target_file:
         writer = csv.DictWriter(target_file, fieldnames=list(comparison_rows[0]))
         writer.writeheader(); writer.writerows(comparison_rows)
+
+    analytical = result.get("analytical_read_snm_comparison", {})
+    analytical_rows = []
+    for dataset in ("current", "target"):
+        values = analytical.get(dataset, {})
+        analytical_rows.append({
+            "dataset": dataset.title(),
+            "valid": values.get("valid"),
+            "reason": values.get("reason"),
+            "snm_mv": values.get("snm_mv"),
+            "vdd_v": values.get("vdd_v"),
+            "vth_eff_v": values.get("vth_eff_v"),
+            "q_beta_p_over_beta_a": values.get("q_beta_p_over_beta_a"),
+            "r_beta_d_over_beta_a": values.get("r_beta_d_over_beta_a"),
+            "vs_v": values.get("vs_v"),
+            "vr_v": values.get("vr_v"),
+            "k": values.get("k"),
+            "term_a_v": values.get("term_a_v"),
+            "term_b_v": values.get("term_b_v"),
+        })
+    with open(out / "analytical_read_snm_eq_3_36.csv", "w", newline="", encoding="utf-8-sig") as analytical_file:
+        writer = csv.DictWriter(analytical_file, fieldnames=list(analytical_rows[0]))
+        writer.writeheader(); writer.writerows(analytical_rows)
+
+    electrical_snm_rows = wat_electrical_snm_rows(result)
+    with open(out / "wat_electrical_snm_table.csv", "w", newline="", encoding="utf-8-sig") as electrical_file:
+        writer = csv.DictWriter(electrical_file, fieldnames=list(electrical_snm_rows[0]))
+        writer.writeheader(); writer.writerows(electrical_snm_rows)
+
+    assumption_rows = generic_28nm_assumption_rows(result)
+    with open(out / "generic_28nm_assumptions.csv", "w", newline="", encoding="utf-8-sig") as assumption_file:
+        writer = csv.DictWriter(assumption_file, fieldnames=list(assumption_rows[0]))
+        writer.writeheader(); writer.writerows(assumption_rows)
 
     comparisons = result.get("target_comparisons", [])
     if comparisons:
@@ -1439,6 +1847,10 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
          "description": "Hold and Read SNM current WAT versus datasheet target curves"},
         {"filename": svg_name, "format": "SVG", "role": "Scalable chart source", "device": "6T CELL",
          "description": "Hold and Read SNM current WAT versus datasheet target curves"},
+        {"filename": fig315_png_name, "format": "PNG", "role": "Figure 3.15-style butterfly", "device": "6T CELL",
+         "description": "Read VTC with maximum squares 1 and 2 for Current and Target"},
+        {"filename": fig315_svg_name, "format": "SVG", "role": "Scalable Figure 3.15-style source", "device": "6T CELL",
+         "description": "Read VTC with maximum squares 1 and 2 for Current and Target"},
     ]
     with open(image_dir / "image_manifest.csv", "w", newline="", encoding="utf-8-sig") as manifest:
         writer = csv.DictWriter(manifest, fieldnames=list(manifest_rows[0]))
@@ -1459,6 +1871,40 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         f'<tr><td>{row["mode"]}</td><td>{row["current_snm_mv"]:.2f}</td>'
         f'<td>{row["target_snm_mv"]:.2f}</td><td>{row["delta_mv"]:+.2f}</td>'
         f'<td>{_fmt(row["delta_pct"], 2)}%</td></tr>' for row in comparison_rows)
+    analytical_table_rows = "".join(
+        f'<tr><td>{row["dataset"]}</td><td>{"VALID" if row["valid"] else "N/A"}</td>'
+        f'<td>{_fmt(row["snm_mv"], 2)}</td><td>{_fmt(row["vth_eff_v"], 4)}</td>'
+        f'<td>{_fmt(row["q_beta_p_over_beta_a"], 4)}</td><td>{_fmt(row["r_beta_d_over_beta_a"], 4)}</td>'
+        f'<td>{_fmt(row["k"], 4)}</td><td>{html.escape(str(row["reason"] or ""))}</td></tr>'
+        for row in analytical_rows)
+    analytical_section = f'''<section><h2>PDF Equation 3.36 Analytical Read SNM</h2>
+    <p><b>Source:</b> <i>High-Speed CMOS Circuit Technology</i>, Section 3.4.2, Equation 3.36 (printed page 51; PDF page 66). This read-accessed 6T expression uses <code>q = βp/βa</code>, <code>r = βd/βa</code> and one common threshold voltage. Because WAT supplies separate PU/PG/PD Vt values, this tool explicitly uses <code>VTH,eff = mean(|VtPU|, VtPG, VtPD)</code>.</p>
+    <div class="formula"><code>Vs = VDD − VTH,eff</code><br><code>Vr = Vs − [r/(r+1)]VTH,eff</code><br><code>k = [r/(r+1)] × (sqrt[(r+1)/(r+1−Vs²/Vr²)] − 1)</code><br><code>SNM6T = VTH,eff − (Term A − Term B)/(k+1)</code></div>
+    <table><thead><tr><th>Dataset</th><th>Eq. 3.36 status</th><th>Analytical RSNM (mV)</th><th>VTH,eff (V)</th><th>q = βp/βa</th><th>r = βd/βa</th><th>k</th><th>Applicability</th></tr></thead><tbody>{analytical_table_rows}</tbody></table>
+    <p>This equation does not calculate Hold SNM and does not generate the plotted VTC. It is reported beside the WAT-calibrated VTC result. If the Equation 3.32 square-root domain is non-positive, the analytical result is shown as N/A rather than forcing a complex value.</p></section>'''
+    electrical_snm_table_rows = "".join(
+        f'<tr><td>{html.escape(row["dataset"])}</td>'
+        f'<td>{row["pu_vt_v"]:.3f}</td><td>{row["pu_idsat_ua"]:.2f}</td>'
+        f'<td>{row["pg_vt_v"]:.3f}</td><td>{row["pg_idsat_ua"]:.2f}</td>'
+        f'<td>{row["pd_vt_v"]:.3f}</td><td>{row["pd_idsat_ua"]:.2f}</td>'
+        f'<td>{row["q_beta_pu_over_pg"]:.4f}</td><td>{row["r_beta_pd_over_pg"]:.4f}</td>'
+        f'<td>{row["idsat_pd_over_pg"]:.4f}</td><td>{row["idsat_pg_over_pu"]:.4f}</td>'
+        f'<td>{row["hold_snm_geometric_mv"]:.2f}</td><td>{row["read_snm_geometric_mv"]:.2f}</td>'
+        f'<td>{_fmt(row["read_snm_eq_3_36_mv"], 2)}</td><td>{row["eq_3_36_status"]}</td></tr>'
+        for row in electrical_snm_rows)
+    electrical_snm_section = f'''<section><h2>WAT Electrical Parameters → SNM Table</h2>
+    <p>This table uses only electrical values that can be entered from WAT measurement: PU/PG/PD Vt and Idsat at the stated WAT VDD. The β values, q/r and current ratios are mathematical proxies derived from those measurements. No W/L, Cox, mobility, BSIM coefficients, parasitics or other PDK/model-card-only parameters are required.</p>
+    <div class="table-scroll"><table><thead><tr><th>Dataset</th><th>PU Vt<br>(V)</th><th>PU Idsat<br>(µA)</th><th>PG Vt<br>(V)</th><th>PG Idsat<br>(µA)</th><th>PD Vt<br>(V)</th><th>PD Idsat<br>(µA)</th><th>q<br>βPU/βPG</th><th>r<br>βPD/βPG</th><th>Idsat<br>PD/PG</th><th>Idsat<br>PG/PU</th><th>Hold SNM<br>(mV)</th><th>Read SNM<br>(mV)</th><th>Eq. 3.36<br>RSNM (mV)</th><th>Eq. 3.36<br>Status</th></tr></thead><tbody>{electrical_snm_table_rows}</tbody></table></div>
+    <p><b>Interpretation:</b> geometric Hold/Read SNM comes from the WAT-calibrated butterfly curves; Equation 3.36 is an independent long-channel analytical reference. These are correlation and trend metrics, not foundry sign-off values.</p></section>'''
+    assumption_table_rows = "".join(
+        f'<tr><td>{html.escape(str(row["parameter"]))}</td>'
+        f'<td>{html.escape(str(row["value"]))}</td><td>{html.escape(str(row["unit"]))}</td>'
+        f'<td>{html.escape(str(row["source"]))}</td><td>{html.escape(str(row["used_by"]))}</td>'
+        f'<td>{row["active"]}</td></tr>' for row in assumption_rows)
+    assumption_section = f'''<section><h2>Generic 28 nm Default Assumptions</h2>
+    <p>Measured WAT Vt and Idsat always take priority. Parameters unavailable from WAT are filled only when the present formula needs them. Geometry and temperature are shown as generic references but are not silently used to replace WAT calibration.</p>
+    <table><thead><tr><th>Parameter</th><th>Default / policy</th><th>Unit</th><th>Source class</th><th>Used by</th><th>Active in SNM</th></tr></thead><tbody>{assumption_table_rows}</tbody></table>
+    <p><b>Important:</b> Cox, carrier mobility, oxide thickness and channel-length modulation are not guessed because the active compact model obtains effective beta directly from WAT Vt/Idsat. Adding arbitrary values for them would double-count device strength and make the result less defensible.</p></section>'''
     object_section = ""
     if "cell" in result:
         mos_rows = "".join(
@@ -1474,19 +1920,24 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     *{{box-sizing:border-box}} body{{margin:0;padding:clamp(1.25rem,4vw,3rem);background:radial-gradient(circle at 85% 0,#e8f2ff 0,transparent 28rem),#f5f5f7}}
     main{{max-width:1760px;margin:auto}} h1{{font-size:clamp(2.2rem,4vw,4rem);line-height:1.05;letter-spacing:-.035em;margin:.5rem 0 .35rem}} h2{{font-size:1.7rem;letter-spacing:-.018em;margin-top:0}}
     .summary,section{{background:rgba(255,255,255,.84);backdrop-filter:blur(22px) saturate(160%);border:1px solid rgba(255,255,255,.78);border-radius:1.25rem;box-shadow:0 1px 2px #0000000a,0 12px 36px #0000000d;padding:clamp(1rem,2.4vw,1.65rem);margin:1rem 0}}
-    .summary{{color:#3a3a3c;font-size:1.05rem;border-left:4px solid #007aff}} img{{display:block;width:100%;height:auto;border:1px solid #e5e5ea;border-radius:1rem}}
+    .summary{{color:#3a3a3c;font-size:1.05rem;border-left:4px solid #007aff}} img{{display:block;width:100%;height:auto;border:1px solid #e5e5ea;border-radius:1rem}} .formula{{background:#f2f2f7;border-radius:.8rem;padding:1rem;line-height:1.8;overflow:auto}} .table-scroll{{overflow-x:auto}}
     table{{border-collapse:separate;border-spacing:0;width:100%;margin-top:1rem;font-size:1rem;line-height:1.55}} th,td{{padding:.9rem .8rem;border-bottom:1px solid #e5e5ea;text-align:right;font-variant-numeric:tabular-nums}} th{{color:#6e6e73;font-size:.9rem;font-weight:680}} th:first-child,td:first-child{{text-align:left}} tbody tr:last-child td{{border-bottom:0}} code{{background:#f2f2f7;padding:.18rem .38rem;border-radius:.35rem}}
     @media(prefers-reduced-transparency:reduce){{.summary,section{{background:#fff;backdrop-filter:none;border-color:#d2d2d7}}}} @media(prefers-contrast:more){{.summary,section{{background:#fff;border:2px solid #1d1d1f}}}}
     </style></head><body><main>
     <h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode", "Grouped"))}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
     <div class="summary"><b>Analysis scope:</b> Hold SNM and Read SNM only. Blue curves use the current measured WAT inputs; orange curves use the entered PU/PG/PD datasheet targets.</div>
-    <section><h2>Hold / Read SNM Target Comparison</h2><p>SNM values are calculated from the two VTC butterfly lobes. The limiting squares are not drawn so the current and target curve displacement remains clear.</p>
+    <section><h2>Hold / Read SNM Target Comparison</h2><p>The plotted curves use the WAT-calibrated compact VTC model. The Read panel additionally reports the independent PDF Equation 3.36 analytical value. Limiting squares are not drawn.</p>
     <img src="images/{png_name}" alt="Hold and Read SNM current WAT versus datasheet target comparison">
     <table><thead><tr><th>Mode</th><th>Current SNM (mV)</th><th>Target SNM (mV)</th><th>Current − Target (mV)</th><th>Difference (%)</th></tr></thead><tbody>{snm_rows}</tbody></table></section>
+    <section><h2>Read SNM Butterfly - Figure 3.15(b) Style</h2><p>Squares 1 and 2 are fitted independently into the two read-accessed butterfly lobes. The reported geometric RSNM is the smaller square side. Current WAT and Datasheet Target are separated into two panels so their squares remain readable.</p>
+    <img src="images/{fig315_png_name}" alt="Figure 3.15 style Read SNM butterfly with two maximum squares"></section>
+    {electrical_snm_section}
+    {assumption_section}
+    {analytical_section}
     {target_section}
     <section><h2>Model Settings</h2><table><tbody><tr><td>Technology node</td><td>28 nm generic compact model</td></tr><tr><td>SRAM analysis VDD</td><td>{cfg["nominal_vdd"]:.3f} V</td></tr><tr><td>WAT calibration VDD</td><td>{cfg["wat_vdd"]:.3f} V</td></tr></tbody></table></section>
     {object_section}
-    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone chart: <code>images/{png_name}</code>.</p>
+    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>generic_28nm_assumptions.csv</code>, <code>analytical_read_snm_eq_3_36.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/{png_name}</code> and <code>images/{fig315_png_name}</code>.</p>
     </main></body></html>'''
     report = out / "sram_wat_report.html"
     report.write_text(document, encoding="utf-8")
