@@ -29,7 +29,115 @@ Target 會建立第二組完整 6T compact model，與目前 WAT 模型使用相
 - 橘色實線：Datasheet Target VTC
 - 橘色虛線：Datasheet Target mirrored VTC
 
-SNM數值仍由兩個 butterfly lobes 的 maximum-square 數值演算法取得，但圖中不再繪製SNM square，讓 Current 與 Target 曲線位移更容易比較。
+圖中不再繪製 SNM square，讓 Current 與 Target 曲線位移更容易比較。現行 `snm()` 是以 metastable trip point 為中心的數值 proxy，並不是掃描兩個 butterfly lobes 所有位置的完整 maximum-square 萃取；詳細公式與限制如下。
+
+## 現行程式計算公式
+
+### 1. 由 WAT 校準 MOS β
+
+輸入的 `Vt`、`Idsat` 與 WAT 測試電壓用來校準 square-law MOS：
+
+$$
+V_{OV,WAT}=\max(V_{WAT}-|V_T|,\ 0.05)
+$$
+
+$$
+\beta=\frac{2I_{DSAT}}{V_{OV,WAT}^{2}}
+$$
+
+截止區：
+
+$$
+V_{GS}-V_T\leq0 \Rightarrow I_D=0
+$$
+
+線性區：
+
+$$
+I_D=\beta\left[(V_{GS}-V_T)V_{DS}-\frac{V_{DS}^{2}}{2}\right]
+$$
+
+飽和區：
+
+$$
+I_D=\frac{1}{2}\beta(V_{GS}-V_T)^2
+$$
+
+### 2. Hold／Read VTC
+
+令 $V_{in}=V_Q$、$V_{out}=V_{QB}$。每一個輸入電壓都以二分搜尋求解電流平衡，得到 $V_{out}=VTC(V_{in})$。
+
+Hold 模式：
+
+$$
+I_{PU}(VDD-V_{in},VDD-V_{out})=I_{PD}(V_{in},V_{out})
+$$
+
+Read 模式設定 `WL = BL = VDD`，加入 access transistor PG 的 read-disturb 電流：
+
+$$
+I_{PU}+I_{PG}=I_{PD}
+$$
+
+其中：
+
+$$
+I_{PG}=I_{PG}(VDD-V_{out},VDD-V_{out})
+$$
+
+Mirrored VTC 由原始 VTC 交換座標取得：
+
+$$
+(x,y)\rightarrow(y,x)
+$$
+
+### 3. Trip point 與現行 SNM proxy
+
+先求 metastable trip point $V_M$：
+
+$$
+VTC(V_M)=V_M
+$$
+
+再以二分搜尋尋找最大的 $s$，使：
+
+$$
+VTC(V_M-s)\geq V_M+s
+$$
+
+且：
+
+$$
+VTC(V_M+s)\leq V_M-s
+$$
+
+搜尋範圍：
+
+$$
+0\leq s\leq\min(V_M,VDD-V_M)
+$$
+
+現行報告輸出：
+
+$$
+SNM_{proxy}=s,\qquad SNM_{mV}=1000s
+$$
+
+### 4. 圖表座標
+
+圖表的 0～1 座標是節點電壓對 VDD 的正規化比例：
+
+$$
+X=\frac{V_Q}{VDD},\qquad Y=\frac{V_{QB}}{VDD}
+$$
+
+例如 VDD = 0.9 V 時，座標 0.5 代表實際電壓 0.45 V。座標使用 ratio 顯示，但 SNM 數值仍以實際電壓計算並輸出為 mV；這與 `Cell Ratio` 或 PU／PG／PD 強度比不同。
+
+### 5. SNM 方法限制
+
+標準 butterfly SNM 應搜尋兩個 lobes 各自可容納的最大正方形，並取較小的正方形邊長。現行公式強制候選位置相對於 $V_M$ 對稱，沒有掃描正方形的所有可能位置，因此可能高估絕對 SNM。請將目前數值視為 `WAT-calibrated metastable-centered SNM proxy`，適合 Current／Target 趨勢比較，不適合作為 foundry 或 silicon sign-off 數值。
+
+對應實作位於 [`Device.current()` 與 `Sram6T.snm()`](sram_wat_analyzer.py#L199-L310)。
 
 報表直接列出：
 
