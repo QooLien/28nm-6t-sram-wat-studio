@@ -6,6 +6,7 @@ __pycache__/
 # Generated analysis reports
 output/
 output_*/
+work/
 
 # Local release artifacts are uploaded separately as GitHub Release assets
 release/

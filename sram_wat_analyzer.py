@@ -42,7 +42,7 @@ class MosWat:
 
 @dataclass(frozen=True)
 class DatasheetTargets:
-    """PU/PG/PD datasheet targets used only for WAT comparison."""
+    """PU/PG/PD WAT targets used only for measured-WAT comparison."""
     pu: MosWat
     pg: MosWat
     pd: MosWat
@@ -147,6 +147,17 @@ class Config:
     vmin_step: float = 0.01
     read_snm_limit: float = 0.030
     grid_points: int = 5001
+    technology_node_nm: float = 28.0
+    channel_length_nm: float = 28.0
+    pu_width_nm: float = 70.0
+    pg_width_nm: float = 100.0
+    pd_width_nm: float = 140.0
+    nominal_temperature_c: float = 25.0
+    read_wordline_over_vdd: float = 1.0
+    read_bitline_over_vdd: float = 1.0
+    write_wordline_over_vdd: float = 1.0
+    write_low_bitline_over_vdd: float = 0.0
+    write_high_bitline_over_vdd: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -162,12 +173,33 @@ class Tech28nm:
     nominal_temperature_c: float = 25.0
     read_wordline_over_vdd: float = 1.0
     read_bitline_over_vdd: float = 1.0
+    write_wordline_over_vdd: float = 1.0
+    write_low_bitline_over_vdd: float = 0.0
+    write_high_bitline_over_vdd: float = 1.0
     hold_wordline_over_vdd: float = 0.0
     beta_policy: str = "WAT-calibrated: 2*Idsat/(WAT_VDD-|Vt|)^2"
-    common_vth_policy: str = "mean(|Vt_PU|, Vt_PG, Vt_PD) for Equation 3.36"
+    common_vth_policy: str = "mean(|Vt_PU|, Vt_PG, Vt_PD) for analytical Read SNM"
 
 
 TECH_28NM = Tech28nm()
+
+
+def tech_from_config(cfg: Config) -> Tech28nm:
+    """Resolve editable GUI assumptions, falling back to generic defaults."""
+    return replace(
+        TECH_28NM,
+        node_nm=int(round(cfg.technology_node_nm)),
+        channel_length_nm=cfg.channel_length_nm,
+        pu_width_nm=cfg.pu_width_nm,
+        pg_width_nm=cfg.pg_width_nm,
+        pd_width_nm=cfg.pd_width_nm,
+        nominal_temperature_c=cfg.nominal_temperature_c,
+        read_wordline_over_vdd=cfg.read_wordline_over_vdd,
+        read_bitline_over_vdd=cfg.read_bitline_over_vdd,
+        write_wordline_over_vdd=cfg.write_wordline_over_vdd,
+        write_low_bitline_over_vdd=cfg.write_low_bitline_over_vdd,
+        write_high_bitline_over_vdd=cfg.write_high_bitline_over_vdd,
+    )
 
 
 def _positive(value: str | float, label: str) -> float:
@@ -233,7 +265,9 @@ class Sram6T:
         up = self.pu.current(vdd - vin, vdd - vout)
         down = self.pd.current(vin, vout)
         if mode == "read":
-            up += self.pg.current(vdd - vout, vdd - vout)  # WL=BL=VDD
+            wl = self.cfg.read_wordline_over_vdd * vdd
+            bitline = self.cfg.read_bitline_over_vdd * vdd
+            up += self._access_current(self.pg, vout, bitline, wl)
         return up - down
 
     def transfer(self, vin: float, vdd: float, mode: str = "hold") -> float:
@@ -252,11 +286,13 @@ class Sram6T:
                 hi = mid
         return (lo + hi) / 2
 
-    def transfer_with_bitline(self, vin: float, vdd: float, bitline: float) -> float:
+    def transfer_with_bitline(self, vin: float, vdd: float, bitline: float,
+                              wordline: float | None = None) -> float:
         """Inverter transfer with WL high and the access device tied to bitline."""
+        wl = vdd if wordline is None else wordline
         def balance(vout: float) -> float:
             return (self.pu.current(vdd - vin, vdd - vout) - self.pd.current(vin, vout) +
-                    self._access_current(self.pg, vout, bitline, vdd))
+                    self._access_current(self.pg, vout, bitline, wl))
         lo, hi = 0.0, vdd
         if balance(lo) <= 0:
             return 0.0
@@ -271,12 +307,15 @@ class Sram6T:
         return (lo + hi) / 2
 
     def write_vtc_pair(self, vdd: float, points: int = 201) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-        """Write-condition VTC pair for BL=0 and BLB=VDD."""
+        """Write-condition VTC pair for low BL and high BLB at the configured WL."""
         low, high = [], []
+        wl = self.cfg.write_wordline_over_vdd * vdd
+        low_bl = self.cfg.write_low_bitline_over_vdd * vdd
+        high_bl = self.cfg.write_high_bitline_over_vdd * vdd
         for i in range(points):
             vin = vdd * i / (points - 1)
-            low.append((vin, self.transfer_with_bitline(vin, vdd, 0.0)))
-            high.append((vin, self.transfer_with_bitline(vin, vdd, vdd)))
+            low.append((vin, self.transfer_with_bitline(vin, vdd, low_bl, wl)))
+            high.append((vin, self.transfer_with_bitline(vin, vdd, high_bl, wl)))
         return low, high
 
     def vtc(self, vdd: float, mode: str = "hold", points: int | None = None) -> list[tuple[float, float]]:
@@ -439,35 +478,35 @@ class Sram6T:
         if vs <= 0:
             return invalid("VDD must exceed the effective threshold voltage")
         if abs(vr) < 1e-15:
-            return invalid("Vr is zero in Equation 3.32")
+            return invalid("Vr is zero in the analytical model")
 
         k_domain = (r + 1.0) - (vs * vs) / (vr * vr)
         result["k_domain"] = k_domain
         if k_domain <= 0:
-            return invalid("Equation 3.32 square-root domain is non-positive")
+            return invalid("Analytical square-root domain is non-positive")
 
         k = (r / (r + 1.0)) * (math.sqrt((r + 1.0) / k_domain) - 1.0)
         result["k"] = k
         if not math.isfinite(k) or abs(k) < 1e-15 or abs(k + 1.0) < 1e-15:
-            return invalid("Equation 3.32 produced an invalid k")
+            return invalid("Analytical model produced an invalid k")
 
         denom_a = 1.0 + r / (k * (r + 1.0))
         root_arg = (r / q) * (1.0 + 2.0 * k + (r / q) * k * k)
         result["root_argument"] = root_arg
         if root_arg < 0 or abs(denom_a) < 1e-15:
-            return invalid("Equation 3.36 denominator or square-root domain is invalid")
+            return invalid("Analytical denominator or square-root domain is invalid")
         denom_b = 1.0 + k * r / q + math.sqrt(root_arg)
         if abs(denom_b) < 1e-15:
-            return invalid("Equation 3.36 second denominator is zero")
+            return invalid("Analytical second denominator is zero")
 
         term_a = (vdd - ((2.0 * r + 1.0) / (r + 1.0)) * vth_eff) / denom_a
         term_b = (vdd - 2.0 * vth_eff) / denom_b
         snm_v = vth_eff - (term_a - term_b) / (k + 1.0)
         result["term_a_v"], result["term_b_v"] = term_a, term_b
         if not math.isfinite(snm_v) or snm_v < 0 or snm_v > vdd:
-            return invalid("Equation 3.36 result is outside the physical range 0 to VDD")
+            return invalid("Analytical result is outside the physical range 0 to VDD")
 
-        result.update({"valid": True, "reason": "Within the real-valued Equation 3.36 domain",
+        result.update({"valid": True, "reason": "Within the real-valued analytical domain",
                        "snm_v": snm_v, "snm_mv": 1000.0 * snm_v})
         return result
 
@@ -490,24 +529,26 @@ class Sram6T:
         if vdd <= 0:
             return 0.0
         trip = self.trip_point(vdd, "hold")
+        wl = self.cfg.write_wordline_over_vdd * vdd
+        nominal_low = self.cfg.write_low_bitline_over_vdd * vdd
         pull_up = self.pu.current(vdd, vdd - trip)
 
         def writable(low_bitline: float) -> bool:
             if low_bitline >= trip:
                 return False
-            access = self.pg.current(vdd - low_bitline, trip - low_bitline)
+            access = self.pg.current(wl - low_bitline, trip - low_bitline)
             return access >= pull_up
 
-        if not writable(0.0):
+        if not writable(nominal_low):
             return 0.0
-        lo, hi = 0.0, trip
+        lo, hi = nominal_low, trip
         for _ in range(42):
             mid = (lo + hi) / 2
             if writable(mid):
                 lo = mid
             else:
                 hi = mid
-        return lo
+        return lo - nominal_low
 
     @staticmethod
     def _access_current(pg: Device, node: float, bitline: float, wl: float) -> float:
@@ -630,18 +671,15 @@ def variants(wat: WatPoint, cfg: Config, device: str) -> list[tuple[str, WatPoin
     ]
 
 
-def metric(model: Sram6T, cfg: Config, hold_butterfly: dict | None = None,
+def metric(model: Sram6T, cfg: Config,
            read_butterfly: dict | None = None) -> dict[str, float | None]:
     square_points = max(1201, cfg.grid_points)
-    hold_butterfly = hold_butterfly or model.butterfly_squares(
-        cfg.nominal_vdd, "hold", square_points)
     read_butterfly = read_butterfly or model.butterfly_squares(
         cfg.nominal_vdd, "read", square_points)
     analytical = model.analytical_read_snm_eq_3_36(cfg.nominal_vdd)
     return {
-        "hold_snm_mv": hold_butterfly["snm_mv"],
         "read_snm_mv": read_butterfly["snm_mv"],
-        "hold_snm_trip_proxy_mv": 1000 * model.snm(cfg.nominal_vdd, "hold"),
+        "write_snm_proxy_mv": 1000 * model.write_snm(cfg.nominal_vdd),
         "read_snm_trip_proxy_mv": 1000 * model.snm(cfg.nominal_vdd, "read"),
         "analytical_read_snm_mv": analytical["snm_mv"],
         **model.strength_ratios(),
@@ -649,11 +687,11 @@ def metric(model: Sram6T, cfg: Config, hold_butterfly: dict | None = None,
 
 
 def cell_metric(cell: SixTWatCell, cfg: Config) -> dict[str, float | None]:
-    """Conservative half-cell mismatch metric: the lower Hold/Read SNM wins."""
+    """Conservative half-cell mismatch metric: the lower Read SNM wins."""
     sides = [metric(Sram6T(cell.side(i), cfg), cfg) for i in (1, 2)]
     return {
-        "hold_snm_mv": min(s["hold_snm_mv"] for s in sides),
         "read_snm_mv": min(s["read_snm_mv"] for s in sides),
+        "write_snm_proxy_mv": min(s["write_snm_proxy_mv"] for s in sides),
         "cell_ratio_beta": min(s["cell_ratio_beta"] for s in sides),
         "pull_up_ratio_beta": min(s["pull_up_ratio_beta"] for s in sides),
         "cell_ratio_ids_proxy": min(s["cell_ratio_ids_proxy"] for s in sides),
@@ -707,19 +745,30 @@ def evaluate_judgment(metrics: dict[str, float | None],
 def analyze(wat: WatPoint, cfg: Config) -> dict:
     model = Sram6T(wat, cfg)
     square_points = max(1201, cfg.grid_points)
-    hold_butterfly = model.butterfly_squares(cfg.nominal_vdd, "hold", square_points)
     read_butterfly = model.butterfly_squares(cfg.nominal_vdd, "read", square_points)
-    baseline = {"metrics": metric(model, cfg, hold_butterfly, read_butterfly),
+    write_low_vtc, write_high_vtc = model.write_vtc_pair(cfg.nominal_vdd, 201)
+    baseline = {"metrics": metric(model, cfg, read_butterfly),
                 "analytical_read_snm_eq_3_36": model.analytical_read_snm_eq_3_36(cfg.nominal_vdd),
-                "hold_butterfly": hold_butterfly,
                 "read_butterfly": read_butterfly,
-                "hold_vtc": model.vtc(cfg.nominal_vdd, "hold", 201),
                 "read_vtc": model.vtc(cfg.nominal_vdd, "read", 201),
-                "hold_trip_v": model.trip_point(cfg.nominal_vdd, "hold"),
+                "write_vtc_low": write_low_vtc,
+                "write_vtc_high": write_high_vtc,
                 "read_trip_v": model.trip_point(cfg.nominal_vdd, "read")}
-    report_config = {"wat_vdd": cfg.wat_vdd, "nominal_vdd": cfg.nominal_vdd,
-                     "grid_points": cfg.grid_points}
-    return {"technology": asdict(TECH_28NM), "wat": asdict(wat), "config": report_config,
+    report_config = {
+        "wat_vdd": cfg.wat_vdd, "nominal_vdd": cfg.nominal_vdd,
+        "grid_points": cfg.grid_points,
+        "technology_node_nm": cfg.technology_node_nm,
+        "channel_length_nm": cfg.channel_length_nm,
+        "pu_width_nm": cfg.pu_width_nm, "pg_width_nm": cfg.pg_width_nm,
+        "pd_width_nm": cfg.pd_width_nm,
+        "nominal_temperature_c": cfg.nominal_temperature_c,
+        "read_wordline_over_vdd": cfg.read_wordline_over_vdd,
+        "read_bitline_over_vdd": cfg.read_bitline_over_vdd,
+        "write_wordline_over_vdd": cfg.write_wordline_over_vdd,
+        "write_low_bitline_over_vdd": cfg.write_low_bitline_over_vdd,
+        "write_high_bitline_over_vdd": cfg.write_high_bitline_over_vdd,
+    }
+    return {"technology": asdict(tech_from_config(cfg)), "wat": asdict(wat), "config": report_config,
             "strength_ratios": model.strength_ratios(), "baseline_6t": baseline, "groups": {}}
 
 
@@ -855,7 +904,7 @@ def _attach_target_model(result: dict, targets: DatasheetTargets | None, cfg: Co
         }
         return
     target_wat = WatPoint(
-        corner="Datasheet Target",
+        corner="WAT Target",
         pu_vt=targets.pu.vt, pu_ids=targets.pu.ids,
         pg_vt=targets.pg.vt, pg_ids=targets.pg.ids,
         pd_vt=targets.pd.vt, pd_ids=targets.pd.ids,
@@ -869,7 +918,8 @@ def _attach_target_model(result: dict, targets: DatasheetTargets | None, cfg: Co
          "delta_mv": current_metrics[key] - target["metrics"][key],
          "delta_pct": ((current_metrics[key] / target["metrics"][key] - 1) * 100
                        if target["metrics"][key] else None)}
-        for label, key in (("Hold SNM", "hold_snm_mv"), ("Read SNM", "read_snm_mv"))
+        for label, key in (("Read SNM", "read_snm_mv"),
+                           ("Write SNM Proxy", "write_snm_proxy_mv"))
     ]
     current_analytical = result["baseline_6t"]["analytical_read_snm_eq_3_36"]
     target_analytical = target["analytical_read_snm_eq_3_36"]
@@ -989,7 +1039,7 @@ def _attach_target_model(result: dict, targets: DatasheetTargets | None, cfg: Co
                                    "verdict": feature_verdict})
 
     return {
-        "objective": "Validate datasheet WAT targets using measured WT Vmin outcomes",
+        "objective": "Validate WAT targets using measured WT Vmin outcomes",
         "verdict": verdict, "explanation": explanation, "settings": asdict(settings),
         "counts": {"all_rows": len(analyzed), "wt_complete": sum(row["wt_complete"] for row in analyzed),
                    "paired_wat_wt": len(paired), "inside_target_band": len(inside),
@@ -1013,7 +1063,7 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
         "corner": cell.corner,
         "mos": {DISPLAY_MOS_NAMES[name]: asdict(getattr(cell, name))
                 for name in ("pu1","pu2","pg1","pg2","pd1","pd2")},
-        "method": "two half-cell compact models; report uses the lower Hold/Read SNM",
+        "method": "two half-cell compact models; report uses the lower Read SNM",
     }
     baseline = cell_metric(cell, cfg)
     result["cell"]["baseline_metrics"] = baseline
@@ -1041,13 +1091,24 @@ def analyze_three_mos(cell: ThreeTWatCell, cfg: Config,
 
 
 def validate_config(cfg: Config) -> None:
-    positive = ("wat_vdd", "nominal_vdd", "vt_step", "ids_step_pct", "vmin_step", "read_snm_limit")
+    positive = ("wat_vdd", "nominal_vdd", "vt_step", "ids_step_pct", "vmin_step",
+                "read_snm_limit", "technology_node_nm", "channel_length_nm",
+                "pu_width_nm", "pg_width_nm", "pd_width_nm",
+                "read_wordline_over_vdd", "read_bitline_over_vdd",
+                "write_wordline_over_vdd", "write_high_bitline_over_vdd")
     for name in positive:
         value = getattr(cfg, name)
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be greater than zero")
     if cfg.ids_step_pct >= 100:
         raise ValueError("ids_step_pct must be below 100")
+    if not math.isfinite(cfg.nominal_temperature_c) or not -100 <= cfg.nominal_temperature_c <= 200:
+        raise ValueError("nominal_temperature_c must be between -100 and 200")
+    if (cfg.read_wordline_over_vdd > 1.5 or cfg.read_bitline_over_vdd > 1.5 or
+            cfg.write_wordline_over_vdd > 1.5 or cfg.write_high_bitline_over_vdd > 1.5):
+        raise ValueError("Read/write WL and BL ratios must not exceed 1.5")
+    if not math.isfinite(cfg.write_low_bitline_over_vdd) or not 0 <= cfg.write_low_bitline_over_vdd <= 1.5:
+        raise ValueError("write_low_bitline_over_vdd must be between 0 and 1.5")
     if cfg.vmin_start <= 0 or cfg.vmin_stop < cfg.vmin_start:
         raise ValueError("Vmin range must satisfy 0 < start <= stop")
 
@@ -1104,91 +1165,134 @@ def bar_svg(items: list[dict], key: str, title: str, unit: str, width: int = 900
     return "".join(p)
 
 
-def snm_overview_svg(result: dict, width: int = 1440, height: int = 650) -> str:
-    """Hold/Read VTC comparison between current WAT and datasheet target models."""
-    current, target, cfg = result["baseline_6t"], result.get("target_6t", result["baseline_6t"]), result["config"]
-    vdd = cfg["nominal_vdd"]
-    comparisons = {row["mode"]: row for row in result.get("snm_target_comparison", [])}
+def snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
+    """Read VTC comparison using Vin on X and Vout on Y, both in volts."""
+    current = result["baseline_6t"]
+    target = result.get("target_6t", current)
+    vdd = result["config"]["nominal_vdd"]
+    lot_label_raw = str(result["wat"]["corner"])
+    lot_label = html.escape(lot_label_raw)
     analytical = result.get("analytical_read_snm_comparison", {})
-    panels = (("Hold SNM", "WL=0; cell retention", "hold_vtc"),
-              ("Read SNM", "WL=1; BL/BLB precharged", "read_vtc"))
-    margin_x, gap, panel_w = 54, 58, (width - 108 - 58) / 2
-    plot_top, plot_h = 142, 420
-    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Hold and Read SNM current versus target VTC comparison" style="font-family:Calibri,Arial,sans-serif">',
-             '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-             '<path d="M42 38 h32" stroke="#007AFF" stroke-width="4"/><text x="84" y="44" fill="#3A3A3C" font-size="18">Current WAT VTC</text>',
-             '<path d="M260 38 h32" stroke="#007AFF" stroke-width="4" stroke-dasharray="10 7"/><text x="302" y="44" fill="#3A3A3C" font-size="18">Current mirrored VTC</text>',
-             '<path d="M548 38 h32" stroke="#FF9500" stroke-width="4"/><text x="590" y="44" fill="#3A3A3C" font-size="18">Datasheet target VTC</text>',
-             '<path d="M810 38 h32" stroke="#FF9500" stroke-width="4" stroke-dasharray="10 7"/><text x="852" y="44" fill="#3A3A3C" font-size="18">Target mirrored VTC</text>']
-    for index, (title, subtitle, curve_key) in enumerate(panels):
-        x0 = margin_x + index * (panel_w + gap)
-        plot_left, plot_w = x0 + 60, panel_w - 78
-        def xy(x: float, y: float) -> tuple[float, float]:
-            return plot_left + x / vdd * plot_w, plot_top + (1 - y / vdd) * plot_h
-        comparison = comparisons.get(title)
-        current_value = current["metrics"]["hold_snm_mv" if index == 0 else "read_snm_mv"]
-        target_value = target["metrics"]["hold_snm_mv" if index == 0 else "read_snm_mv"]
-        delta = current_value - target_value
-        parts += [f'<text x="{x0:.1f}" y="92" fill="#1D1D1F" font-size="28" font-weight="700">{index+1}. {title}</text>',
-                  f'<text x="{x0:.1f}" y="120" fill="#6E6E73" font-size="17">{html.escape(subtitle)}</text>']
-        for tick in (0, .5, 1):
-            px, py = xy(tick*vdd, tick*vdd)
-            parts.append(f'<path d="M{px:.1f} {plot_top} V{plot_top+plot_h} M{plot_left} {py:.1f} H{plot_left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>')
-            parts.append(f'<text x="{px:.1f}" y="{plot_top+plot_h+25}" text-anchor="middle" fill="#6E6E73" font-size="15">{tick:.1f}</text>')
-            parts.append(f'<text x="{plot_left-10}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{tick:.1f}</text>')
-        for curve, color in ((current[curve_key], "#007AFF"), (target[curve_key], "#FF9500")):
-            direct = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x,y in curve)
-            mirrored = " ".join(f'{xy(y,x)[0]:.1f},{xy(y,x)[1]:.1f}' for x,y in curve)
-            parts += [f'<polyline points="{direct}" fill="none" stroke="{color}" stroke-width="4"/>',
-                      f'<polyline points="{mirrored}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="10 7" opacity=".9"/>']
-        label_x = plot_left + plot_w - 6
-        parts += [f'<text x="{label_x:.1f}" y="{plot_top+26}" text-anchor="end" fill="#007AFF" font-size="18" font-weight="700">VTC proxy Current {current_value:.1f} mV</text>',
-                  f'<text x="{label_x:.1f}" y="{plot_top+52}" text-anchor="end" fill="#C56A00" font-size="18" font-weight="700">VTC proxy Target {target_value:.1f} mV</text>',
-                  f'<text x="{label_x:.1f}" y="{plot_top+78}" text-anchor="end" fill="#1D1D1F" font-size="17" font-weight="700">Delta {delta:+.1f} mV</text>',
-                  f'<text x="{plot_left+plot_w/2:.1f}" y="{height-42}" text-anchor="middle" fill="#6E6E73" font-size="17">VQ / VDD</text>',
-                  f'<text x="{x0+16:.1f}" y="{plot_top+plot_h/2:.1f}" transform="rotate(-90 {x0+16:.1f} {plot_top+plot_h/2:.1f})" text-anchor="middle" fill="#6E6E73" font-size="17">VQB / VDD</text>']
-        if index == 1:
-            analytical_current = analytical.get("current_snm_mv")
-            analytical_target = analytical.get("target_snm_mv")
-            analytical_delta = analytical.get("delta_mv")
-            if analytical_current is not None and analytical_target is not None:
-                analytical_label = (f'Eq. 3.36: Current {analytical_current:.1f} mV · '
-                                    f'Target {analytical_target:.1f} mV · Δ {analytical_delta:+.1f} mV')
-                analytical_color = "#5856D6"
-            else:
-                analytical_label = "Eq. 3.36: N/A - outside real-valued analytical domain"
-                analytical_color = "#8E8E93"
-            parts += [f'<rect x="{plot_left+plot_w-405:.1f}" y="{plot_top+92}" width="405" height="38" rx="10" fill="#F2F2F7"/>',
-                      f'<text x="{label_x:.1f}" y="{plot_top+117}" text-anchor="end" fill="{analytical_color}" font-size="15" font-weight="700">{html.escape(analytical_label)}</text>']
-    parts.append('<text x="720" y="632" text-anchor="middle" fill="#6E6E73" font-size="15">VTC proxy values and PDF Section 3.4.2 Equation 3.36 are reported separately; limiting squares are not drawn.</text></svg>')
+    plot_left, plot_top, plot_w, plot_h = 145, 145, 1140, 455
+
+    def xy(vin: float, vout: float) -> tuple[float, float]:
+        return (plot_left + vin / vdd * plot_w,
+                plot_top + (1.0 - vout / vdd) * plot_h)
+
+    current_value = current["metrics"]["read_snm_mv"]
+    target_value = target["metrics"]["read_snm_mv"]
+    delta = current_value - target_value
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Read SNM Lot/Wafer versus target VTC comparison" style="font-family:Calibri,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Read SNM Target Comparison</text>',
+        f'<path d="M54 82 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="88" fill="#3A3A3C" font-size="17">{lot_label} WAT VTC</text>',
+        f'<path d="M270 82 h34" stroke="#007AFF" stroke-width="4" stroke-dasharray="10 7"/><text x="314" y="88" fill="#3A3A3C" font-size="17">{lot_label} mirrored VTC</text>',
+        '<path d="M570 82 h34" stroke="#FF9500" stroke-width="4"/><text x="614" y="88" fill="#3A3A3C" font-size="17">WAT Target VTC</text>',
+        '<path d="M842 82 h34" stroke="#FF9500" stroke-width="4" stroke-dasharray="10 7"/><text x="886" y="88" fill="#3A3A3C" font-size="17">WAT Target mirrored VTC</text>',
+    ]
+    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+        voltage = fraction * vdd
+        px, py = xy(voltage, voltage)
+        parts += [
+            f'<path d="M{px:.1f} {plot_top} V{plot_top+plot_h} M{plot_left} {py:.1f} H{plot_left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
+            f'<text x="{px:.1f}" y="{plot_top+plot_h+27}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
+            f'<text x="{plot_left-12}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
+        ]
+    for data, color in ((current, "#007AFF"), (target, "#FF9500")):
+        curve = data["read_vtc"]
+        direct = " ".join(f'{xy(vin,vout)[0]:.1f},{xy(vin,vout)[1]:.1f}' for vin, vout in curve)
+        mirrored = " ".join(f'{xy(vout,vin)[0]:.1f},{xy(vout,vin)[1]:.1f}' for vin, vout in curve)
+        parts += [f'<polyline points="{direct}" fill="none" stroke="{color}" stroke-width="4"/>',
+                  f'<polyline points="{mirrored}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="10 7" opacity=".9"/>']
+    analytical_current = analytical.get("current_snm_mv")
+    analytical_target = analytical.get("target_snm_mv")
+    analytical_text = (f'Analytical RSNM: {lot_label_raw} {analytical_current:.1f} mV · WAT Target {analytical_target:.1f} mV'
+                       if analytical_current is not None and analytical_target is not None
+                       else 'Analytical RSNM: N/A for this input set')
+    parts += [
+        f'<text x="{plot_left+plot_w-8}" y="{plot_top+30}" text-anchor="end" fill="#007AFF" font-size="18" font-weight="700">{lot_label} {current_value:.1f} mV</text>',
+        f'<text x="{plot_left+plot_w-8}" y="{plot_top+58}" text-anchor="end" fill="#C56A00" font-size="18" font-weight="700">WAT Target {target_value:.1f} mV</text>',
+        f'<text x="{plot_left+plot_w-8}" y="{plot_top+86}" text-anchor="end" fill="#1D1D1F" font-size="17" font-weight="700">Delta {delta:+.1f} mV</text>',
+        f'<text x="{plot_left+plot_w-8}" y="{plot_top+114}" text-anchor="end" fill="#5856D6" font-size="16" font-weight="700">{html.escape(analytical_text)}</text>',
+        f'<text x="{plot_left+plot_w/2}" y="{height-50}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
+        f'<text x="48" y="{plot_top+plot_h/2}" transform="rotate(-90 48 {plot_top+plot_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>',
+        '<text x="720" y="700" text-anchor="middle" fill="#6E6E73" font-size="15">Read bias uses the configured WL and BL/BLB levels. Axis values are actual volts.</text></svg>',
+    ]
     return "".join(parts)
 
 
-def fig_3_15_style_svg(result: dict, width: int = 1440, height: int = 720) -> str:
-    """Read butterfly plots with squares 1/2 following Figure 3.15(b)."""
+def write_snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
+    """Write-condition VTC comparison: BL low side versus mirrored BLB high side."""
+    current = result["baseline_6t"]
+    target = result.get("target_6t", current)
+    cfg, wat = result["config"], result["wat"]
+    vdd, lot_raw = cfg["nominal_vdd"], str(wat["corner"])
+    lot_label = html.escape(lot_raw)
+    left, top, pw, ph = 145, 145, 1140, 455
+
+    def xy(vin: float, vout: float) -> tuple[float, float]:
+        return left + vin / vdd * pw, top + (1.0 - vout / vdd) * ph
+
+    current_value = current["metrics"]["write_snm_proxy_mv"]
+    target_value = target["metrics"]["write_snm_proxy_mv"]
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Write SNM target comparison" style="font-family:Calibri,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Write SNM Target Comparison</text>',
+        f'<path d="M54 82 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="88" fill="#3A3A3C" font-size="17">{lot_label} BL-low VTC</text>',
+        f'<path d="M270 82 h34" stroke="#007AFF" stroke-width="4" stroke-dasharray="10 7"/><text x="314" y="88" fill="#3A3A3C" font-size="17">{lot_label} mirrored BLB-high VTC</text>',
+        '<path d="M650 82 h34" stroke="#FF9500" stroke-width="4"/><text x="694" y="88" fill="#3A3A3C" font-size="17">WAT Target write VTC pair</text>',
+    ]
+    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+        voltage = fraction * vdd; px, py = xy(voltage, voltage)
+        parts += [f'<path d="M{px:.1f} {top} V{top+ph} M{left} {py:.1f} H{left+pw}" stroke="#E5E5EA" stroke-width="1"/>',
+                  f'<text x="{px:.1f}" y="{top+ph+27}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
+                  f'<text x="{left-12}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>']
+    for data, color in ((current, "#007AFF"), (target, "#FF9500")):
+        low = " ".join(f'{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}' for x, y in data["write_vtc_low"])
+        high = " ".join(f'{xy(y, x)[0]:.1f},{xy(y, x)[1]:.1f}' for x, y in data["write_vtc_high"])
+        parts += [f'<polyline points="{low}" fill="none" stroke="{color}" stroke-width="4"/>',
+                  f'<polyline points="{high}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="10 7" opacity=".9"/>']
+    parts += [
+        f'<text x="{left+pw-8}" y="{top+30}" text-anchor="end" fill="#007AFF" font-size="18" font-weight="700">{lot_label} WSNM proxy {current_value:.1f} mV</text>',
+        f'<text x="{left+pw-8}" y="{top+58}" text-anchor="end" fill="#C56A00" font-size="18" font-weight="700">WAT Target {target_value:.1f} mV</text>',
+        f'<text x="{left+pw-8}" y="{top+86}" text-anchor="end" fill="#1D1D1F" font-size="17" font-weight="700">Delta {current_value-target_value:+.1f} mV</text>',
+        f'<text x="{left+pw/2}" y="{height-50}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
+        f'<text x="48" y="{top+ph/2}" transform="rotate(-90 48 {top+ph/2})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>',
+        f'<text x="720" y="700" text-anchor="middle" fill="#6E6E73" font-size="15">Write bias: WL={cfg["write_wordline_over_vdd"]:.2f}×VDD, BL={cfg["write_low_bitline_over_vdd"]:.2f}×VDD, BLB={cfg["write_high_bitline_over_vdd"]:.2f}×VDD. WSNM is a WAT-calibrated bitline-noise proxy.</text>',
+        '</svg>',
+    ]
+    return "".join(parts)
+
+
+def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -> str:
+    """Read butterfly plots with independently fitted maximum squares."""
     current = result["baseline_6t"]
     target = result.get("target_6t", current)
     analytical = result.get("analytical_read_snm_comparison", {})
+    lot_label = str(result["wat"]["corner"])
     vdd = result["config"]["nominal_vdd"]
     panels = (
-        ("Current WAT", current, "#007AFF", analytical.get("current_snm_mv")),
-        ("Datasheet Target", target, "#FF9500", analytical.get("target_snm_mv")),
+        (lot_label, current, "#007AFF", analytical.get("current_snm_mv")),
+        ("WAT Target", target, "#FF9500", analytical.get("target_snm_mv")),
     )
     margin_x, gap = 60, 64
     panel_w = (width - 2 * margin_x - gap) / 2
-    plot_top, plot_h = 158, 465
+    plot_top, plot_h = 158, 480
     parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Figure 3.15 style Read SNM butterfly squares" style="font-family:Calibri,Arial,sans-serif">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Read SNM butterfly maximum squares" style="font-family:Calibri,Arial,sans-serif">',
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-        '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Read SNM - Figure 3.15(b) style</text>',
+        '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Read SNM Butterfly Analysis</text>',
         '<path d="M54 82 h34" stroke="#3A3A3C" stroke-width="4"/><text x="98" y="88" fill="#3A3A3C" font-size="17">Inverter VTC</text>',
         '<path d="M260 82 h34" stroke="#3A3A3C" stroke-width="4" stroke-dasharray="10 7"/><text x="304" y="88" fill="#3A3A3C" font-size="17">Mirrored VTC</text>',
         '<rect x="506" y="68" width="24" height="24" fill="none" stroke="#34C759" stroke-width="3"/><text x="542" y="88" fill="#3A3A3C" font-size="17">Maximum squares 1 and 2</text>',
-        '<text x="888" y="88" fill="#5856D6" font-size="17">PDF Eq. 3.36 shown as an independent analytical value</text>',
+        '<text x="888" y="88" fill="#5856D6" font-size="17">Analytical RSNM shown as an independent reference</text>',
     ]
     for index, (title, data, color, analytical_value) in enumerate(panels):
         x0 = margin_x + index * (panel_w + gap)
-        plot_left, plot_w = x0 + 62, panel_w - 82
+        # Equal X/Y pixel scale keeps a voltage square visually square.
+        plot_left, plot_w = x0 + 95, 480
 
         def xy(x_value: float, y_value: float) -> tuple[float, float]:
             return (plot_left + x_value / vdd * plot_w,
@@ -1196,11 +1300,12 @@ def fig_3_15_style_svg(result: dict, width: int = 1440, height: int = 720) -> st
 
         parts += [f'<text x="{x0:.1f}" y="126" fill="#1D1D1F" font-size="25" font-weight="700">{html.escape(title)}</text>',
                   f'<text x="{x0+panel_w:.1f}" y="126" text-anchor="end" fill="{color}" font-size="18" font-weight="700">Geometric RSNM {data["read_butterfly"]["snm_mv"]:.1f} mV</text>']
-        for tick in (0.0, 0.5, 1.0):
-            px, py = xy(tick * vdd, tick * vdd)
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            voltage = fraction * vdd
+            px, py = xy(voltage, voltage)
             parts += [f'<path d="M{px:.1f} {plot_top} V{plot_top+plot_h} M{plot_left} {py:.1f} H{plot_left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
-                      f'<text x="{px:.1f}" y="{plot_top+plot_h+26}" text-anchor="middle" fill="#6E6E73" font-size="15">{tick:.1f}</text>',
-                      f'<text x="{plot_left-10}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{tick:.1f}</text>']
+                      f'<text x="{px:.1f}" y="{plot_top+plot_h+26}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
+                      f'<text x="{plot_left-10}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>']
         curve = data["read_vtc"]
         direct = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in curve)
         mirrored = " ".join(f'{xy(y,x)[0]:.1f},{xy(y,x)[1]:.1f}' for x, y in curve)
@@ -1219,11 +1324,11 @@ def fig_3_15_style_svg(result: dict, width: int = 1440, height: int = 720) -> st
             arrow_x = min(left + side_px_x + 16, plot_left + plot_w - 8)
             parts += [f'<path d="M{arrow_x:.1f} {top+3:.1f} V{top+side_px_y-3:.1f} M{arrow_x-5:.1f} {top+3:.1f} H{arrow_x+5:.1f} M{arrow_x-5:.1f} {top+side_px_y-3:.1f} H{arrow_x+5:.1f}" stroke="#34C759" stroke-width="2"/>']
 
-        eq_text = f'Eq. 3.36 {analytical_value:.1f} mV' if analytical_value is not None else 'Eq. 3.36 N/A (outside domain)'
-        parts += [f'<text x="{x0+panel_w:.1f}" y="{plot_top+plot_h+58}" text-anchor="end" fill="#5856D6" font-size="17" font-weight="700">{eq_text}</text>',
-                  f'<text x="{plot_left+plot_w/2:.1f}" y="{height-35}" text-anchor="middle" fill="#6E6E73" font-size="17">Vnode A / VDD</text>',
-                  f'<text x="{x0+17:.1f}" y="{plot_top+plot_h/2:.1f}" transform="rotate(-90 {x0+17:.1f} {plot_top+plot_h/2:.1f})" text-anchor="middle" fill="#6E6E73" font-size="17">Vnode B / VDD</text>']
-    parts.append('<text x="720" y="704" text-anchor="middle" fill="#6E6E73" font-size="15">SNM is the smaller side of squares 1 and 2. Read condition: WL=BL=BLB=VDD.</text></svg>')
+        eq_text = f'Analytical RSNM {analytical_value:.1f} mV' if analytical_value is not None else 'Analytical RSNM N/A'
+        parts += [f'<text x="{x0+panel_w:.1f}" y="{plot_top+plot_h+60}" text-anchor="end" fill="#5856D6" font-size="17" font-weight="700">{eq_text}</text>',
+                  f'<text x="{plot_left+plot_w/2:.1f}" y="{height-62}" text-anchor="middle" fill="#1D1D1F" font-size="18">Vin (V)</text>',
+                  f'<text x="{x0+45:.1f}" y="{plot_top+plot_h/2:.1f}" transform="rotate(-90 {x0+45:.1f} {plot_top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="18">Vout (V)</text>']
+    parts.append(f'<text x="720" y="{height-14}" text-anchor="middle" fill="#6E6E73" font-size="15">RSNM is the smaller side of squares 1 and 2. Read bias uses the configured WL and BL/BLB levels.</text></svg>')
     return "".join(parts)
 
 
@@ -1231,7 +1336,7 @@ def wat_electrical_snm_rows(result: dict) -> list[dict]:
     """Flatten WAT-measurable electrical inputs and derived SNM outputs."""
     cfg = result["config"]
     current_wat = result["wat"]
-    datasets = [("Current WAT", {
+    datasets = [("Lot/Wafer", {
         "pu_vt": current_wat["pu_vt"], "pu_ids": current_wat["pu_ids"],
         "pg_vt": current_wat["pg_vt"], "pg_ids": current_wat["pg_ids"],
         "pd_vt": current_wat["pd_vt"], "pd_ids": current_wat["pd_ids"],
@@ -1239,7 +1344,7 @@ def wat_electrical_snm_rows(result: dict) -> list[dict]:
                  result.get("analytical_read_snm_comparison", {}).get("current", {}))]
     targets = result.get("datasheet_targets")
     if targets:
-        datasets.append(("Datasheet Target", {
+        datasets.append(("WAT Target", {
             "pu_vt": targets["pu"]["vt"], "pu_ids": targets["pu"]["ids"],
             "pg_vt": targets["pg"]["vt"], "pg_ids": targets["pg"]["ids"],
             "pd_vt": targets["pd"]["vt"], "pd_ids": targets["pd"]["ids"],
@@ -1269,8 +1374,8 @@ def wat_electrical_snm_rows(result: dict) -> list[dict]:
             "r_beta_pd_over_pg": beta_pd / beta_pg,
             "idsat_pd_over_pg": values["pd_ids"] / values["pg_ids"],
             "idsat_pg_over_pu": values["pg_ids"] / values["pu_ids"],
-            "hold_snm_geometric_mv": modeled["metrics"]["hold_snm_mv"],
             "read_snm_geometric_mv": modeled["metrics"]["read_snm_mv"],
+            "write_snm_proxy_mv": modeled["metrics"]["write_snm_proxy_mv"],
             "read_snm_eq_3_36_mv": analytical.get("snm_mv"),
             "eq_3_36_status": "VALID" if analytical.get("valid") else "N/A",
             "eq_3_36_reason": analytical.get("reason", ""),
@@ -1284,33 +1389,37 @@ def generic_28nm_assumption_rows(result: dict) -> list[dict]:
     cfg, tech = result["config"], result["technology"]
     return [
         {"parameter": "Technology node", "value": tech["node_nm"], "unit": "nm",
-         "source": "Generic 28 nm default", "used_by": "Model identity", "active": "YES"},
+         "source": "Editable model parameter; generic default 28 nm", "used_by": "Model identity", "active": "YES"},
         {"parameter": "Process family", "value": tech["process_family"], "unit": "-",
          "source": "Generic engineering assumption", "used_by": "Scope label", "active": "YES"},
         {"parameter": "SRAM VDD", "value": cfg["nominal_vdd"], "unit": "V",
-         "source": "Model setting; default 0.90 V", "used_by": "Hold/Read VTC and Eq. 3.36", "active": "YES"},
+         "source": "Model setting; default 0.90 V", "used_by": "Read VTC and analytical RSNM", "active": "YES"},
         {"parameter": "WAT calibration VDD", "value": cfg["wat_vdd"], "unit": "V",
          "source": "Model setting; default 0.90 V", "used_by": "Beta proxy calibration", "active": "YES"},
         {"parameter": "Channel length L", "value": tech["channel_length_nm"], "unit": "nm",
-         "source": "Generic 28 nm fallback", "used_by": "Architecture reference only", "active": "NO"},
+         "source": "Editable model parameter; generic default 28 nm", "used_by": "Architecture reference only", "active": "NO"},
         {"parameter": "PU width", "value": tech["pu_width_nm"], "unit": "nm",
-         "source": "Generic SRAM sizing fallback", "used_by": "Architecture reference only", "active": "NO"},
+         "source": "Editable model parameter; generic default 70 nm", "used_by": "Architecture reference only", "active": "NO"},
         {"parameter": "PG width", "value": tech["pg_width_nm"], "unit": "nm",
-         "source": "Generic SRAM sizing fallback", "used_by": "Architecture reference only", "active": "NO"},
+         "source": "Editable model parameter; generic default 100 nm", "used_by": "Architecture reference only", "active": "NO"},
         {"parameter": "PD width", "value": tech["pd_width_nm"], "unit": "nm",
-         "source": "Generic SRAM sizing fallback", "used_by": "Architecture reference only", "active": "NO"},
+         "source": "Editable model parameter; generic default 140 nm", "used_by": "Architecture reference only", "active": "NO"},
         {"parameter": "Nominal temperature", "value": tech["nominal_temperature_c"], "unit": "°C",
-         "source": "Room-temperature default", "used_by": "Reference; no temperature coefficients", "active": "NO"},
+         "source": "Editable model parameter; generic default 25 °C", "used_by": "Reference; no temperature coefficients", "active": "NO"},
         {"parameter": "Read WL", "value": tech["read_wordline_over_vdd"], "unit": "×VDD",
-         "source": "6T read-bias assumption", "used_by": "Read VTC", "active": "YES"},
+         "source": "Editable read-bias parameter; generic default 1.0", "used_by": "Read VTC", "active": "YES"},
         {"parameter": "Read BL / BLB precharge", "value": tech["read_bitline_over_vdd"], "unit": "×VDD",
-         "source": "6T read-bias assumption", "used_by": "Read VTC", "active": "YES"},
-        {"parameter": "Hold WL", "value": tech["hold_wordline_over_vdd"], "unit": "×VDD",
-         "source": "6T hold-bias assumption", "used_by": "Hold VTC", "active": "YES"},
+         "source": "Editable read-bias parameter; generic default 1.0", "used_by": "Read VTC", "active": "YES"},
+        {"parameter": "Write WL", "value": tech["write_wordline_over_vdd"], "unit": "×VDD",
+         "source": "Editable write-bias parameter; generic default 1.0", "used_by": "Write VTC and WSNM proxy", "active": "YES"},
+        {"parameter": "Write BL", "value": tech["write_low_bitline_over_vdd"], "unit": "×VDD",
+         "source": "Editable write-bias parameter; generic default 0.0", "used_by": "Write VTC and WSNM proxy", "active": "YES"},
+        {"parameter": "Write BLB", "value": tech["write_high_bitline_over_vdd"], "unit": "×VDD",
+         "source": "Editable write-bias parameter; generic default 1.0", "used_by": "Write VTC", "active": "YES"},
         {"parameter": "Beta", "value": tech["beta_policy"], "unit": "µA/V²",
          "source": "Derived from WAT Vt and Idsat", "used_by": "All compact VTC equations", "active": "YES"},
         {"parameter": "Common VTH", "value": tech["common_vth_policy"], "unit": "V",
-         "source": "Mapped from three measured WAT Vt values", "used_by": "Equation 3.36 only", "active": "YES"},
+         "source": "Mapped from three measured WAT Vt values", "used_by": "Analytical Read SNM only", "active": "YES"},
         {"parameter": "Cox / mobility / tox / lambda", "value": "Not required", "unit": "-",
          "source": "Intentionally not guessed", "used_by": "Replaced by WAT beta calibration", "active": "NO"},
     ]
@@ -1423,11 +1532,11 @@ def export_pdf_report(result: dict, out: Path, image_dir: Path) -> Path:
     story = [Paragraph("HV28 SRAM Analysis", title),
              Paragraph(f'Lot/Wafer: <b>{html.escape(wat["corner"])}</b> &nbsp;&nbsp; Object mode: <b>{html.escape(result.get("object_mode", "Grouped"))}</b> &nbsp;&nbsp; SRAM VDD: <b>{cfg["nominal_vdd"]:.3f} V</b>', body),
              Spacer(1, 4*mm), svg_drawing("00_28nm_6t_bitcell_architecture.svg", 250*mm, 116*mm),
-             Spacer(1, 3*mm), Paragraph("Generic 28 nm 6T compact model. Datasheet targets are comparison references; model estimates remain calibrated from measured WAT inputs.", small)]
+             Spacer(1, 3*mm), Paragraph("Generic 28 nm 6T compact model. WAT targets are comparison references; model estimates remain calibrated from measured WAT inputs.", small)]
 
     comparisons = result.get("target_comparisons", [])
     if comparisons:
-        story += [PageBreak(), Paragraph("Datasheet Target vs WAT Measured", h1)]
+        story += [PageBreak(), Paragraph("WAT Target vs WAT Measured", h1)]
         rows = [["Object", "Type", "Target Vt (V)", "WAT Vt (V)", "Delta Vt (mV)",
                  "Target Isat (uA)", "WAT Isat (uA)", "Delta Isat (uA)", "Delta Isat (%)"]]
         rows += [[x["object"], x["device"], f'{x["target_vt_v"]:.3f}', f'{x["measured_vt_v"]:.3f}',
@@ -1636,7 +1745,7 @@ def _legacy_write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path
             f'<td>{x["target_isat_ua"]:.2f}</td><td>{x["measured_isat_ua"]:.2f}</td>'
             f'<td>{x["delta_isat_ua"]:+.2f}</td><td>{x["delta_isat_pct"]:+.2f}%</td></tr>'
             for x in comparisons)
-        target_section = f'''<section><h2>Datasheet Target vs WAT Measured</h2>
+        target_section = f'''<section><h2>WAT Target vs WAT Measured</h2>
         <p>Target values are comparison references only. The compact model remains calibrated from the measured WAT values.</p>
         <table><thead><tr><th>MOS object</th><th>Type</th><th>Target Vt (V)</th><th>WAT Vt (V)</th><th>ΔVt (mV)</th><th>Target Isat (µA)</th><th>WAT Isat (µA)</th><th>ΔIsat (µA)</th><th>ΔIsat (%)</th></tr></thead><tbody>{target_rows}</tbody></table></section>'''
     wt_section = ""
@@ -1685,7 +1794,7 @@ def _legacy_write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path
             for item in validation["parameter_evidence"])
         settings = validation["settings"]
         verdict_class = "ok" if validation["verdict"] == "SUPPORTED" else ("bad" if validation["verdict"] == "CONTRADICTED" else "warn")
-        validation_section = f'''<section class="validation"><div class="section-heading"><div><h2>Datasheet WAT Target Validation</h2><p>Primary decision: do lots near the WAT target actually achieve acceptable measured WT Vmin?</p></div><span class="verdict {verdict_class}">{validation["verdict"]}</span></div>
+        validation_section = f'''<section class="validation"><div class="section-heading"><div><h2>WAT Target Validation</h2><p>Primary decision: do lots near the WAT target actually achieve acceptable measured WT Vmin?</p></div><span class="verdict {verdict_class}">{validation["verdict"]}</span></div>
         <div class="validation-cards"><div><span>Current Lot/Wafer</span><b>{html.escape(str(current["lot_wafer"]))}</b></div><div><span>WAT band result</span><b>{"IN BAND" if current["target_band_pass"] else "OUT OF BAND"}</b></div><div><span>WT result</span><b>{"PASS" if current["wt_pass"] else "FAIL"}</b></div><div><span>Screen outcome</span><b>{current["consistency"]}</b></div></div>
         <p><b>Conclusion:</b> {html.escape(validation["explanation"])}</p>
         <p>Target band: Vt ±{settings["vt_tolerance_mv"]:.1f} mV and Isat ±{settings["idsat_tolerance_pct"]:.1f}%. WT pass limits: Scan4N ≤ {settings["scan4n_vmin_max"]:.3f} V, Select_Write ≤ {settings["select_write_vmin_max"]:.3f} V, Select_Read ≤ {settings["select_read_vmin_max"]:.3f} V.</p>
@@ -1735,7 +1844,7 @@ def _legacy_write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path
     }}
     </style></head><body><main>
     <h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode","Grouped"))}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
-    <div class="summary"><b>Data meaning:</b> Datasheet PU / PG / PD Vt and Isat are target references compared with measured WAT values. Scan4N, Select_Write and Select_Read Vmin are manually entered measured values. Model Read/Write Vmin is kept separate.</div>
+    <div class="summary"><b>Data meaning:</b> PU / PG / PD WAT Target Vt and Isat are references compared with measured WAT values. Scan4N, Select_Write and Select_Read Vmin are manually entered measured values. Model Read/Write Vmin is kept separate.</div>
     <div class="summary"><b>WT sweep setup:</b> Start={cfg["vmin_start"]:.3f} V · Stop={cfg["vmin_stop"]:.3f} V · Step={cfg["vmin_step"]:.3f} V. These are actual tester recipe inputs and also define the model search range and resolution.</div>
     {target_section}
     {wt_section}
@@ -1750,14 +1859,14 @@ def _legacy_write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path
 
 
 def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
-    """Write the focused Hold/Read SNM current-versus-target HTML report."""
+    """Write the focused Read SNM current-versus-target HTML report."""
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
 
     # These files belonged to the removed WT/Vmin workflow; do not leave stale results behind.
     for name in ("sram_wat_results.csv", "wt_test_0bit_vmin.csv", "parameter_judgment.csv",
                  "wat_target_validation_rows.csv", "wat_target_validation_summary.csv",
-                 "wat_target_parameter_evidence.csv"):
+                 "wat_target_parameter_evidence.csv", "analytical_read_snm_eq_3_36.csv"):
         path = out / name
         if path.exists():
             path.unlink()
@@ -1771,23 +1880,32 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     except ImportError as exc:
         raise RuntimeError("PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
 
-    svg_name = "01_hold_read_snm_target_comparison.svg"
-    png_name = "01_hold_read_snm_target_comparison.png"
-    fig315_svg_name = "02_read_snm_fig_3_15_style.svg"
-    fig315_png_name = "02_read_snm_fig_3_15_style.png"
+    svg_name = "01_read_snm_target_comparison.svg"
+    png_name = "01_read_snm_target_comparison.png"
+    butterfly_svg_name = "02_read_snm_butterfly.svg"
+    butterfly_png_name = "02_read_snm_butterfly.png"
+    write_svg_name = "03_write_snm_target_comparison.svg"
+    write_png_name = "03_write_snm_target_comparison.png"
     svg_path = image_dir / svg_name
     svg_path.write_text(snm_overview_svg(result), encoding="utf-8")
     drawing = svg2rlg(str(svg_path))
     if drawing is None:
-        raise RuntimeError("Could not render Hold/Read SNM target comparison")
+        raise RuntimeError("Could not render Read SNM target comparison")
     renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
-    fig315_svg_path = image_dir / fig315_svg_name
-    fig315_svg_path.write_text(fig_3_15_style_svg(result), encoding="utf-8")
-    fig315_drawing = svg2rlg(str(fig315_svg_path))
-    if fig315_drawing is None:
-        raise RuntimeError("Could not render Figure 3.15-style Read SNM chart")
-    renderPM.drawToFile(fig315_drawing, str(image_dir / fig315_png_name),
+    butterfly_svg_path = image_dir / butterfly_svg_name
+    butterfly_svg_path.write_text(read_snm_butterfly_svg(result), encoding="utf-8")
+    butterfly_drawing = svg2rlg(str(butterfly_svg_path))
+    if butterfly_drawing is None:
+        raise RuntimeError("Could not render Read SNM butterfly chart")
+    renderPM.drawToFile(butterfly_drawing, str(image_dir / butterfly_png_name),
                         fmt="PNG", dpi=180, backend="rlPyCairo")
+    write_svg_path = image_dir / write_svg_name
+    write_svg_path.write_text(write_snm_overview_svg(result), encoding="utf-8")
+    write_drawing = svg2rlg(str(write_svg_path))
+    if write_drawing is None:
+        raise RuntimeError("Could not render Write SNM target comparison")
+    renderPM.drawToFile(write_drawing, str(image_dir / write_png_name), fmt="PNG", dpi=180,
+                        backend="rlPyCairo")
 
     comparison_rows = result.get("snm_target_comparison", [])
     if not comparison_rows:
@@ -1795,18 +1913,26 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         comparison_rows = [
             {"mode": label, "current_snm_mv": metrics[key], "target_snm_mv": metrics[key],
              "delta_mv": 0.0, "delta_pct": 0.0}
-            for label, key in (("Hold SNM", "hold_snm_mv"), ("Read SNM", "read_snm_mv"))
+            for label, key in (("Read SNM", "read_snm_mv"),
+                               ("Write SNM Proxy", "write_snm_proxy_mv"))
         ]
+    comparison_export_rows = [{
+        "mode": row["mode"],
+        "lot_wafer_snm_mv": row["current_snm_mv"],
+        "target_snm_mv": row["target_snm_mv"],
+        "lot_wafer_minus_target_mv": row["delta_mv"],
+        "difference_pct": row["delta_pct"],
+    } for row in comparison_rows]
     with open(out / "snm_target_comparison.csv", "w", newline="", encoding="utf-8-sig") as target_file:
-        writer = csv.DictWriter(target_file, fieldnames=list(comparison_rows[0]))
-        writer.writeheader(); writer.writerows(comparison_rows)
+        writer = csv.DictWriter(target_file, fieldnames=list(comparison_export_rows[0]))
+        writer.writeheader(); writer.writerows(comparison_export_rows)
 
     analytical = result.get("analytical_read_snm_comparison", {})
     analytical_rows = []
     for dataset in ("current", "target"):
         values = analytical.get(dataset, {})
         analytical_rows.append({
-            "dataset": dataset.title(),
+            "dataset": "Lot/Wafer" if dataset == "current" else "WAT Target",
             "valid": values.get("valid"),
             "reason": values.get("reason"),
             "snm_mv": values.get("snm_mv"),
@@ -1820,7 +1946,7 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
             "term_a_v": values.get("term_a_v"),
             "term_b_v": values.get("term_b_v"),
         })
-    with open(out / "analytical_read_snm_eq_3_36.csv", "w", newline="", encoding="utf-8-sig") as analytical_file:
+    with open(out / "analytical_read_snm.csv", "w", newline="", encoding="utf-8-sig") as analytical_file:
         writer = csv.DictWriter(analytical_file, fieldnames=list(analytical_rows[0]))
         writer.writeheader(); writer.writerows(analytical_rows)
 
@@ -1844,13 +1970,17 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
 
     manifest_rows = [
         {"filename": png_name, "format": "PNG", "role": "Primary image", "device": "6T CELL",
-         "description": "Hold and Read SNM current WAT versus datasheet target curves"},
+         "description": "Read SNM Lot/Wafer WAT versus WAT Target curves"},
         {"filename": svg_name, "format": "SVG", "role": "Scalable chart source", "device": "6T CELL",
-         "description": "Hold and Read SNM current WAT versus datasheet target curves"},
-        {"filename": fig315_png_name, "format": "PNG", "role": "Figure 3.15-style butterfly", "device": "6T CELL",
-         "description": "Read VTC with maximum squares 1 and 2 for Current and Target"},
-        {"filename": fig315_svg_name, "format": "SVG", "role": "Scalable Figure 3.15-style source", "device": "6T CELL",
-         "description": "Read VTC with maximum squares 1 and 2 for Current and Target"},
+         "description": "Read SNM Lot/Wafer WAT versus WAT Target curves"},
+        {"filename": butterfly_png_name, "format": "PNG", "role": "Read SNM butterfly", "device": "6T CELL",
+         "description": "Read VTC with maximum squares 1 and 2 for Lot/Wafer and Target"},
+        {"filename": butterfly_svg_name, "format": "SVG", "role": "Scalable Read SNM butterfly source", "device": "6T CELL",
+         "description": "Read VTC with maximum squares 1 and 2 for Lot/Wafer and Target"},
+        {"filename": write_png_name, "format": "PNG", "role": "Write SNM comparison", "device": "6T CELL",
+         "description": "Write VTC pair and bitline-noise WSNM proxy for Lot/Wafer and WAT Target"},
+        {"filename": write_svg_name, "format": "SVG", "role": "Scalable Write SNM comparison source", "device": "6T CELL",
+         "description": "Write VTC pair and bitline-noise WSNM proxy for Lot/Wafer and WAT Target"},
     ]
     with open(image_dir / "image_manifest.csv", "w", newline="", encoding="utf-8-sig") as manifest:
         writer = csv.DictWriter(manifest, fieldnames=list(manifest_rows[0]))
@@ -1862,9 +1992,9 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         f'<td>{x["measured_isat_ua"]:.2f}</td><td>{x["target_isat_ua"]:.2f}</td>'
         f'<td>{x["delta_isat_ua"]:+.2f}</td><td>{x["delta_isat_pct"]:+.2f}%</td></tr>'
         for x in comparisons)
-    target_section = (f'''<section><h2>PU / PG / PD WAT vs Datasheet Target</h2>
-    <p>The target values build a separate 6T model at the same SRAM VDD and WAT bias; they are not substituted into the current WAT model.</p>
-    <table><thead><tr><th>MOS object</th><th>Type</th><th>Current Vt (V)</th><th>Target Vt (V)</th><th>ΔVt (mV)</th><th>Current Isat (µA)</th><th>Target Isat (µA)</th><th>ΔIsat (µA)</th><th>ΔIsat (%)</th></tr></thead><tbody>{target_rows}</tbody></table></section>'''
+    target_section = (f'''<section><h2>PU / PG / PD WAT vs WAT Target</h2>
+    <p>The target values build a separate 6T model at the same SRAM VDD and WAT bias; they are not substituted into the Lot/Wafer WAT model.</p>
+    <table><thead><tr><th>MOS object</th><th>Type</th><th>Lot/Wafer Vt (V)</th><th>WAT Target Vt (V)</th><th>ΔVt (mV)</th><th>Lot/Wafer Isat (µA)</th><th>WAT Target Isat (µA)</th><th>ΔIsat (µA)</th><th>ΔIsat (%)</th></tr></thead><tbody>{target_rows}</tbody></table></section>'''
                       if comparisons else "")
 
     snm_rows = "".join(
@@ -1877,11 +2007,10 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         f'<td>{_fmt(row["q_beta_p_over_beta_a"], 4)}</td><td>{_fmt(row["r_beta_d_over_beta_a"], 4)}</td>'
         f'<td>{_fmt(row["k"], 4)}</td><td>{html.escape(str(row["reason"] or ""))}</td></tr>'
         for row in analytical_rows)
-    analytical_section = f'''<section><h2>PDF Equation 3.36 Analytical Read SNM</h2>
-    <p><b>Source:</b> <i>High-Speed CMOS Circuit Technology</i>, Section 3.4.2, Equation 3.36 (printed page 51; PDF page 66). This read-accessed 6T expression uses <code>q = βp/βa</code>, <code>r = βd/βa</code> and one common threshold voltage. Because WAT supplies separate PU/PG/PD Vt values, this tool explicitly uses <code>VTH,eff = mean(|VtPU|, VtPG, VtPD)</code>.</p>
-    <div class="formula"><code>Vs = VDD − VTH,eff</code><br><code>Vr = Vs − [r/(r+1)]VTH,eff</code><br><code>k = [r/(r+1)] × (sqrt[(r+1)/(r+1−Vs²/Vr²)] − 1)</code><br><code>SNM6T = VTH,eff − (Term A − Term B)/(k+1)</code></div>
-    <table><thead><tr><th>Dataset</th><th>Eq. 3.36 status</th><th>Analytical RSNM (mV)</th><th>VTH,eff (V)</th><th>q = βp/βa</th><th>r = βd/βa</th><th>k</th><th>Applicability</th></tr></thead><tbody>{analytical_table_rows}</tbody></table>
-    <p>This equation does not calculate Hold SNM and does not generate the plotted VTC. It is reported beside the WAT-calibrated VTC result. If the Equation 3.32 square-root domain is non-positive, the analytical result is shown as N/A rather than forcing a complex value.</p></section>'''
+    analytical_section = f'''<section><h2>Analytical Read SNM Reference</h2>
+    <p>This independent analytical estimate uses WAT-derived strength ratios and a common effective threshold mapped from PU/PG/PD Vt. It is reported separately from the geometric butterfly result.</p>
+    <table><thead><tr><th>Dataset</th><th>Status</th><th>Analytical RSNM (mV)</th><th>VTH,eff (V)</th><th>q = βPU/βPG</th><th>r = βPD/βPG</th><th>k</th><th>Applicability</th></tr></thead><tbody>{analytical_table_rows}</tbody></table>
+    <p>If the analytical square-root domain is non-positive, the result is shown as N/A instead of forcing a complex value.</p></section>'''
     electrical_snm_table_rows = "".join(
         f'<tr><td>{html.escape(row["dataset"])}</td>'
         f'<td>{row["pu_vt_v"]:.3f}</td><td>{row["pu_idsat_ua"]:.2f}</td>'
@@ -1889,13 +2018,14 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         f'<td>{row["pd_vt_v"]:.3f}</td><td>{row["pd_idsat_ua"]:.2f}</td>'
         f'<td>{row["q_beta_pu_over_pg"]:.4f}</td><td>{row["r_beta_pd_over_pg"]:.4f}</td>'
         f'<td>{row["idsat_pd_over_pg"]:.4f}</td><td>{row["idsat_pg_over_pu"]:.4f}</td>'
-        f'<td>{row["hold_snm_geometric_mv"]:.2f}</td><td>{row["read_snm_geometric_mv"]:.2f}</td>'
+        f'<td>{row["read_snm_geometric_mv"]:.2f}</td>'
+        f'<td>{row["write_snm_proxy_mv"]:.2f}</td>'
         f'<td>{_fmt(row["read_snm_eq_3_36_mv"], 2)}</td><td>{row["eq_3_36_status"]}</td></tr>'
         for row in electrical_snm_rows)
     electrical_snm_section = f'''<section><h2>WAT Electrical Parameters → SNM Table</h2>
     <p>This table uses only electrical values that can be entered from WAT measurement: PU/PG/PD Vt and Idsat at the stated WAT VDD. The β values, q/r and current ratios are mathematical proxies derived from those measurements. No W/L, Cox, mobility, BSIM coefficients, parasitics or other PDK/model-card-only parameters are required.</p>
-    <div class="table-scroll"><table><thead><tr><th>Dataset</th><th>PU Vt<br>(V)</th><th>PU Idsat<br>(µA)</th><th>PG Vt<br>(V)</th><th>PG Idsat<br>(µA)</th><th>PD Vt<br>(V)</th><th>PD Idsat<br>(µA)</th><th>q<br>βPU/βPG</th><th>r<br>βPD/βPG</th><th>Idsat<br>PD/PG</th><th>Idsat<br>PG/PU</th><th>Hold SNM<br>(mV)</th><th>Read SNM<br>(mV)</th><th>Eq. 3.36<br>RSNM (mV)</th><th>Eq. 3.36<br>Status</th></tr></thead><tbody>{electrical_snm_table_rows}</tbody></table></div>
-    <p><b>Interpretation:</b> geometric Hold/Read SNM comes from the WAT-calibrated butterfly curves; Equation 3.36 is an independent long-channel analytical reference. These are correlation and trend metrics, not foundry sign-off values.</p></section>'''
+    <div class="table-scroll"><table><thead><tr><th>Dataset</th><th>PU Vt<br>(V)</th><th>PU Idsat<br>(µA)</th><th>PG Vt<br>(V)</th><th>PG Idsat<br>(µA)</th><th>PD Vt<br>(V)</th><th>PD Idsat<br>(µA)</th><th>q<br>βPU/βPG</th><th>r<br>βPD/βPG</th><th>Idsat<br>PD/PG</th><th>Idsat<br>PG/PU</th><th>Read SNM<br>(mV)</th><th>Write SNM<br>Proxy (mV)</th><th>Analytical<br>RSNM (mV)</th><th>Analytical<br>Status</th></tr></thead><tbody>{electrical_snm_table_rows}</tbody></table></div>
+    <p><b>Interpretation:</b> geometric Read SNM comes from the WAT-calibrated butterfly curves; the analytical RSNM is an independent long-channel reference. These are correlation and trend metrics, not foundry sign-off values.</p></section>'''
     assumption_table_rows = "".join(
         f'<tr><td>{html.escape(str(row["parameter"]))}</td>'
         f'<td>{html.escape(str(row["value"]))}</td><td>{html.escape(str(row["unit"]))}</td>'
@@ -1925,19 +2055,21 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     @media(prefers-reduced-transparency:reduce){{.summary,section{{background:#fff;backdrop-filter:none;border-color:#d2d2d7}}}} @media(prefers-contrast:more){{.summary,section{{background:#fff;border:2px solid #1d1d1f}}}}
     </style></head><body><main>
     <h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode", "Grouped"))}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
-    <div class="summary"><b>Analysis scope:</b> Hold SNM and Read SNM only. Blue curves use the current measured WAT inputs; orange curves use the entered PU/PG/PD datasheet targets.</div>
-    <section><h2>Hold / Read SNM Target Comparison</h2><p>The plotted curves use the WAT-calibrated compact VTC model. The Read panel additionally reports the independent PDF Equation 3.36 analytical value. Limiting squares are not drawn.</p>
-    <img src="images/{png_name}" alt="Hold and Read SNM current WAT versus datasheet target comparison">
-    <table><thead><tr><th>Mode</th><th>Current SNM (mV)</th><th>Target SNM (mV)</th><th>Current − Target (mV)</th><th>Difference (%)</th></tr></thead><tbody>{snm_rows}</tbody></table></section>
-    <section><h2>Read SNM Butterfly - Figure 3.15(b) Style</h2><p>Squares 1 and 2 are fitted independently into the two read-accessed butterfly lobes. The reported geometric RSNM is the smaller square side. Current WAT and Datasheet Target are separated into two panels so their squares remain readable.</p>
-    <img src="images/{fig315_png_name}" alt="Figure 3.15 style Read SNM butterfly with two maximum squares"></section>
+    <div class="summary"><b>Analysis scope:</b> Read SNM plus write-condition SNM proxy. Blue curves use the measured Lot/Wafer WAT inputs; orange curves use the entered PU/PG/PD WAT targets.</div>
+    <section><h2>Read SNM Target Comparison</h2><p>The plotted curves use the WAT-calibrated compact VTC model. X-axis is Vin and Y-axis is Vout, both expressed in volts. Limiting squares are not drawn in this comparison view.</p>
+    <img src="images/{png_name}" alt="Read SNM Lot/Wafer WAT versus WAT Target comparison">
+    <table><thead><tr><th>Mode</th><th>Lot/Wafer SNM (mV)</th><th>WAT Target SNM (mV)</th><th>Lot/Wafer − WAT Target (mV)</th><th>Difference (%)</th></tr></thead><tbody>{snm_rows}</tbody></table></section>
+    <section><h2>Read SNM Butterfly Analysis</h2><p>Squares 1 and 2 are fitted independently into the two read-accessed butterfly lobes. The reported geometric RSNM is the smaller square side. X-axis is Vin and Y-axis is Vout, both expressed in volts.</p>
+    <img src="images/{butterfly_png_name}" alt="Read SNM butterfly with two maximum squares"></section>
+    <section><h2>Write SNM Target Comparison</h2><p>Write condition uses the configured WL, a low write bitline and a high complementary bitline. The two VTCs are intentionally asymmetric. Write SNM is reported as the maximum tolerated rise on the nominally-low write bitline while the access device can still overcome the pull-up device; it is a WAT-calibrated write-margin proxy, not a geometric butterfly-square or sign-off WSNM.</p>
+    <img src="images/{write_png_name}" alt="Write SNM target comparison"></section>
     {electrical_snm_section}
     {assumption_section}
     {analytical_section}
     {target_section}
     <section><h2>Model Settings</h2><table><tbody><tr><td>Technology node</td><td>28 nm generic compact model</td></tr><tr><td>SRAM analysis VDD</td><td>{cfg["nominal_vdd"]:.3f} V</td></tr><tr><td>WAT calibration VDD</td><td>{cfg["wat_vdd"]:.3f} V</td></tr></tbody></table></section>
     {object_section}
-    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>generic_28nm_assumptions.csv</code>, <code>analytical_read_snm_eq_3_36.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/{png_name}</code> and <code>images/{fig315_png_name}</code>.</p>
+    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>generic_28nm_assumptions.csv</code>, <code>analytical_read_snm.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/{png_name}</code>, <code>images/{butterfly_png_name}</code> and <code>images/{write_png_name}</code>.</p>
     </main></body></html>'''
     report = out / "sram_wat_report.html"
     report.write_text(document, encoding="utf-8")
@@ -2089,18 +2221,33 @@ def launch_gui() -> None:
         vt, ids = defaults[dev[:2]]
         wat_values[f"{dev}_vt"] = tk.StringVar(value=vt)
         wat_values[f"{dev}_ids"] = tk.StringVar(value=ids)
-    three_values: dict[str, tk.StringVar] = {}
-    for dev in ("pu", "pg", "pd"):
-        vt, ids = defaults[dev]
-        three_values[f"{dev}_vt"] = tk.StringVar(value=vt)
-        three_values[f"{dev}_ids"] = tk.StringVar(value=ids)
-    mode_var = tk.StringVar(value="3T Merged")
     target_values: dict[str, tk.StringVar] = {}
     for dev in ("pu", "pg", "pd"):
         vt, ids = target_defaults[dev]
         target_values[f"{dev}_vt"] = tk.StringVar(value=vt)
         target_values[f"{dev}_ids"] = tk.StringVar(value=ids)
-    numeric = {k: tk.StringVar(value=str(v)) for k, v in asdict(Config()).items() if k != "grid_points"}
+    config_defaults = Config()
+    numeric = {
+        "nominal_vdd": tk.StringVar(value=str(config_defaults.nominal_vdd)),
+        "wat_vdd": tk.StringVar(value=str(config_defaults.wat_vdd)),
+    }
+    assumption_specs = (
+        ("technology_node_nm", "Technology node", "nm"),
+        ("channel_length_nm", "Channel length L", "nm"),
+        ("pu_width_nm", "PU width", "nm"),
+        ("pg_width_nm", "PG width", "nm"),
+        ("pd_width_nm", "PD width", "nm"),
+        ("nominal_temperature_c", "Nominal temperature", "°C"),
+        ("read_wordline_over_vdd", "Read WL / VDD", "×VDD"),
+        ("read_bitline_over_vdd", "Read BL / VDD", "×VDD"),
+        ("write_wordline_over_vdd", "Write WL / VDD", "×VDD"),
+        ("write_low_bitline_over_vdd", "Write BL / VDD", "×VDD"),
+        ("write_high_bitline_over_vdd", "Write BLB / VDD", "×VDD"),
+    )
+    assumption_values = {
+        key: tk.StringVar(value=str(getattr(config_defaults, key)))
+        for key, _label, _unit in assumption_specs
+    }
 
     shell = ttk.Frame(root, style="Root.TFrame", padding=(28, 22, 28, 24)); shell.pack(fill="both", expand=True)
     header = ttk.Frame(shell, style="Root.TFrame"); header.pack(fill="x", pady=(0, 18))
@@ -2108,7 +2255,7 @@ def launch_gui() -> None:
     badge = tk.Label(header, text="  WAT STUDIO  ", bg="#E5F1FF", fg=BLUE,
                      font=("Calibri", 9, "bold"), padx=7, pady=4)
     badge.pack(side="left", padx=12, pady=(7, 0))
-    ttk.Label(header, text="Object-oriented bitcell analysis · No SPICE", style="Subtitle.TLabel").pack(side="right", pady=(10, 0))
+    ttk.Label(header, text="Object-oriented 6T bitcell analysis", style="Subtitle.TLabel").pack(side="right", pady=(10, 0))
 
     content = ttk.Frame(shell, style="Root.TFrame"); content.pack(fill="both", expand=True)
     content.columnconfigure(0, weight=7); content.columnconfigure(1, weight=4); content.rowconfigure(0, weight=1)
@@ -2152,13 +2299,8 @@ def launch_gui() -> None:
     top_fields = ttk.Frame(left, style="Card.TFrame"); top_fields.pack(fill="x", pady=(0, 4))
     ttk.Label(top_fields, text="Lot / Wafer", style="Body.TLabel").pack(side="left")
     ttk.Entry(top_fields, textvariable=values["corner"], width=14, style="Apple.TEntry").pack(side="left", padx=10)
-    mode_segment = tk.Frame(top_fields, bg="#E9E9ED", padx=2, pady=2)
-    mode_segment.pack(side="right")
-    for label in ("3T Merged", "6T Independent"):
-        tk.Radiobutton(mode_segment, text=label, variable=mode_var, value=label, indicatoron=False,
-                       bg="#E9E9ED", activebackground="#FFFFFF", selectcolor="#FFFFFF", fg=TEXT,
-                       font=("Calibri", 9, "bold"), relief="flat", bd=0,
-                       padx=10, pady=5, command=lambda: update_mode()).pack(side="left")
+    tk.Label(top_fields, text="  6T INDEPENDENT  ", bg="#EEF6FF", fg=BLUE,
+             font=("Calibri", 9, "bold"), padx=8, pady=5).pack(side="right")
 
     schematic = tk.Canvas(left, bg=CARD, highlightthickness=0, height=540)
     schematic.pack(fill="both", expand=True)
@@ -2199,35 +2341,15 @@ def launch_gui() -> None:
 
     positions = {"pu1": (135, 120), "pu2": (350, 120), "pg1": (2, 230), "pg2": (475, 230),
                  "pd1": (135, 335), "pd2": (350, 335)}
-    six_window_ids = []
     for name, (x, y) in positions.items():
         accent = RED if name.startswith("pu") else GREEN if name.startswith("pg") else BLUE
-        six_window_ids.append(schematic.create_window(x, y, anchor="nw", window=mos_panel(name, accent, wat_values)))
-    # Merged objects sit around the perimeter so Q/QB and feedback paths stay visible.
-    three_positions = {"pu": (88, 120), "pg": (420, 230), "pd": (88, 335)}
-    three_window_ids = []
-    for name, (x, y) in three_positions.items():
-        accent = RED if name == "pu" else GREEN if name == "pg" else BLUE
-        three_window_ids.append(schematic.create_window(x, y, anchor="nw", window=mos_panel(name, accent, three_values)))
-    three_guide_ids = [
-        schematic.create_line(250, 155, 300, 210, fill=RED, width=2, dash=(4, 4)),
-        schematic.create_line(420, 267, 397, 267, fill=GREEN, width=2, dash=(4, 4)),
-        schematic.create_line(250, 370, 300, 320, fill=BLUE, width=2, dash=(4, 4)),
-    ]
-
-    def update_mode() -> None:
-        merged = mode_var.get() == "3T Merged"
-        for item in three_window_ids: schematic.itemconfigure(item, state="normal" if merged else "hidden")
-        for item in three_guide_ids: schematic.itemconfigure(item, state="normal" if merged else "hidden")
-        for item in six_window_ids: schematic.itemconfigure(item, state="hidden" if merged else "normal")
-
-    update_mode()
+        schematic.create_window(x, y, anchor="nw", window=mos_panel(name, accent, wat_values))
     schematic.create_text(325, 526, text="Vt in V · Isat / Ids in µA", fill=SECONDARY, font=("Calibri", 8))
 
     ttk.Label(right, text="Analysis", style="Section.TLabel").pack(anchor="w")
-    ttk.Label(right, text="Compare current WAT and datasheet-target Hold / Read SNM curves.", style="Meta.TLabel").pack(anchor="w", pady=(2, 12))
+    ttk.Label(right, text="Compare the entered Lot/Wafer WAT with WAT Target Read SNM curves.", style="Meta.TLabel").pack(anchor="w", pady=(2, 12))
 
-    ttk.Label(right, text="Datasheet test targets", style="Body.TLabel").pack(anchor="w")
+    ttk.Label(right, text="WAT Target", style="Body.TLabel").pack(anchor="w")
     ttk.Label(right, text="Comparison reference only; the model remains calibrated from measured WAT.",
               style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(2, 5))
     target_grid = ttk.Frame(right, style="Card.TFrame"); target_grid.pack(fill="x", pady=(0, 12))
@@ -2250,8 +2372,31 @@ def launch_gui() -> None:
         ttk.Entry(config_grid, textvariable=numeric[key], width=10, style="Apple.TEntry").grid(row=row, column=1, sticky="e", padx=(12, 5))
         ttk.Label(config_grid, text=unit, style="Meta.TLabel").grid(row=row, column=2, sticky="w")
     config_grid.columnconfigure(0, weight=1)
+
+    assumption_header = ttk.Frame(right, style="Card.TFrame")
+    assumption_header.pack(fill="x", pady=(15, 0))
+    ttk.Label(assumption_header, text="Generic 28 nm Default Assumptions",
+              style="Body.TLabel").pack(side="left")
+
+    def restore_assumption_defaults() -> None:
+        for key, _label, _unit in assumption_specs:
+            assumption_values[key].set(str(getattr(config_defaults, key)))
+
+    ttk.Button(assumption_header, text="Restore Defaults", style="Quiet.TButton",
+               command=restore_assumption_defaults).pack(side="right")
     ttk.Label(right,
-              text="Output: Hold SNM and Read SNM curves, target values, and current-minus-target difference. SNM squares are hidden.",
+              text="Replace a value when verified process information is available. A blank field uses the displayed generic default.",
+              style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(3, 5))
+    assumption_grid = ttk.Frame(right, style="Card.TFrame")
+    assumption_grid.pack(fill="x")
+    for row, (key, label, unit) in enumerate(assumption_specs):
+        ttk.Label(assumption_grid, text=label, style="Body.TLabel").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(assumption_grid, textvariable=assumption_values[key], width=10,
+                  style="Apple.TEntry").grid(row=row, column=1, sticky="e", padx=(12, 5), pady=2)
+        ttk.Label(assumption_grid, text=unit, style="Meta.TLabel").grid(row=row, column=2, sticky="w")
+    assumption_grid.columnconfigure(0, weight=1)
+    ttk.Label(right,
+              text="Output: Read SNM butterfly plus write-condition VTC and WSNM proxy comparisons against WAT Target.",
               style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(7, 0))
 
     ttk.Separator(right).pack(fill="x", pady=16)
@@ -2271,20 +2416,22 @@ def launch_gui() -> None:
     progress.pack(fill="x", pady=(0, 12))
     result_queue: queue.Queue = queue.Queue()
 
-    def collect_inputs() -> tuple[SixTWatCell | ThreeTWatCell, Config, DatasheetTargets]:
-        cfg = Config(**{k: float(v.get()) for k, v in numeric.items()})
+    def collect_inputs() -> tuple[SixTWatCell, Config, DatasheetTargets]:
+        resolved_assumptions: dict[str, float] = {}
+        for key, _label, _unit in assumption_specs:
+            raw = assumption_values[key].get().strip()
+            resolved_assumptions[key] = getattr(config_defaults, key) if not raw else float(raw)
+        cfg = Config(
+            nominal_vdd=float(numeric["nominal_vdd"].get()),
+            wat_vdd=float(numeric["wat_vdd"].get()),
+            **resolved_assumptions,
+        )
         validate_config(cfg)
         corner = values["corner"].get().strip() or "Manual"
-        if mode_var.get() == "3T Merged":
-            mos3 = {name: MosWat(_positive(three_values[f"{name}_vt"].get(), f"{name}_vt"),
-                                 _positive(three_values[f"{name}_ids"].get(), f"{name}_ids"))
-                    for name in ("pu", "pg", "pd")}
-            cell: SixTWatCell | ThreeTWatCell = ThreeTWatCell(corner, **mos3)
-        else:
-            mos6 = {name: MosWat(_positive(wat_values[f"{name}_vt"].get(), f"{name}_vt"),
-                                 _positive(wat_values[f"{name}_ids"].get(), f"{name}_ids"))
-                    for name in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2")}
-            cell = SixTWatCell(corner, **mos6)
+        mos6 = {name: MosWat(_positive(wat_values[f"{name}_vt"].get(), f"{name}_vt"),
+                             _positive(wat_values[f"{name}_ids"].get(), f"{name}_ids"))
+                for name in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2")}
+        cell = SixTWatCell(corner, **mos6)
         targets = DatasheetTargets(**{
             name: MosWat(_positive(target_values[f"{name}_vt"].get(), f"{name} target Vt"),
                          _positive(target_values[f"{name}_ids"].get(), f"{name} target Isat"))
@@ -2292,13 +2439,10 @@ def launch_gui() -> None:
         })
         return cell, cfg, targets
 
-    def worker(cell: SixTWatCell | ThreeTWatCell, cfg: Config,
+    def worker(cell: SixTWatCell, cfg: Config,
                targets: DatasheetTargets, out_path: str) -> None:
         try:
-            if isinstance(cell, ThreeTWatCell):
-                result = analyze_three_mos(cell, cfg, targets)
-            else:
-                result = analyze_six_mos(cell, cfg, targets)
+            result = analyze_six_mos(cell, cfg, targets)
             report = write_outputs(result, out_path)
             result_queue.put((True, cell, report))
         except Exception as exc:
@@ -2324,13 +2468,13 @@ def launch_gui() -> None:
             status.set("Check the highlighted input values")
             status_label.configure(fg=RED)
             messagebox.showerror("Invalid input", str(exc)); return
-        status.set(f"Analyzing {mode_var.get()} · Hold / Read SNM target curves…")
+        status.set("Analyzing 6T Independent · Read/Write SNM target curves…")
         status_label.configure(fg=BLUE)
         analyze_button.state(["disabled"]); progress.start(10)
         threading.Thread(target=worker, args=(cell, cfg, targets, values["out"].get()), daemon=True).start()
         root.after(80, poll_result)
 
-    ttk.Label(right_footer, text="Hold SNM · Read SNM · Current vs Target", style="Meta.TLabel").pack(pady=(0, 7))
+    ttk.Label(right_footer, text="Read / Write SNM · Lot/Wafer vs WAT Target", style="Meta.TLabel").pack(pady=(0, 7))
     analyze_button = ttk.Button(right_footer, text="Analyze & Open HTML", style="Accent.TButton", command=execute)
     analyze_button.pack(fill="x")
     root.mainloop()
