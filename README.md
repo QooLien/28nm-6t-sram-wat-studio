@@ -110,6 +110,10 @@ Geometry and temperature are documented reference values. They do not override b
 - `images/03_write_snm_target_comparison.svg`: scalable chart source
 - `images/image_manifest.csv`: image manifest
 
+## Formula guide
+
+The current WAT-calibrated device, Read SNM, analytical RSNM, and Write SNM proxy equations are collected in the [HV28 SRAM Analysis Formula Guide (PDF)](https://github.com/QooLien/28nm-6t-sram-wat-studio/releases/download/v1.5.0/HV28_SRAM_Analysis_Formula_Guide.pdf).
+
 ## WAT CSV
 
 ```csv
