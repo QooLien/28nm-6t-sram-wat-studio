@@ -271,6 +271,24 @@ class AnalyzerTests(unittest.TestCase):
         self.assertAlmostEqual(stats.vt_mean, 0.3065)
         self.assertAlmostEqual(sample.cell.pu1.ids, 46.5)
 
+    def test_distributed_excel_template_uses_compatible_filtered_ranges(self):
+        from openpyxl import load_workbook
+
+        template = Path(__file__).with_name(
+            "HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx"
+        )
+        workbook = load_workbook(template, read_only=False, data_only=False)
+        self.assertEqual(workbook.sheetnames, ["PU", "PG", "PD", "Instructions"])
+        for sheet_name in ("PU", "PG", "PD"):
+            sheet = workbook[sheet_name]
+            self.assertEqual(len(sheet.tables), 0)
+            self.assertEqual(sheet.auto_filter.ref, "A1:I145")
+            self.assertEqual(
+                [cell.value for cell in sheet[1]],
+                ["Lot/Wafer", "Site", "Model VDD", "MOS", "Vt", "Vt Unit",
+                 "Idsat", "Idsat Unit", "Notes"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
