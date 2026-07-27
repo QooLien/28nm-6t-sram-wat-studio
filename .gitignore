@@ -7,6 +7,9 @@ __pycache__/
 output/
 output_*/
 work/
+tmp/
+.hv28_sram_analysis_state.json
+wheelhouse/
 
 # Local release artifacts are uploaded separately as GitHub Release assets
 release/

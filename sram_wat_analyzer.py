@@ -15,6 +15,8 @@ import html
 import json
 import math
 import os
+import re
+import statistics as statlib
 import sys
 import webbrowser
 from dataclasses import asdict, dataclass, replace
@@ -102,6 +104,32 @@ class SixTWatCell:
 
     def replace_mos(self, name: str, **changes: float) -> "SixTWatCell":
         return replace(self, **{name: replace(getattr(self, name), **changes)})
+
+
+@dataclass(frozen=True)
+class ExcelMosStatistics:
+    """Wafer-site statistics used to collapse repeated WAT rows into one MOS model input."""
+    valid_count: int
+    total_count: int
+    vt_mean: float
+    vt_median: float
+    vt_stdev: float
+    vt_min: float
+    vt_max: float
+    ids_mean: float
+    ids_median: float
+    ids_stdev: float
+    ids_min: float
+    ids_max: float
+
+
+@dataclass(frozen=True)
+class ExcelWatSweepPoint:
+    """One 6T WAT sample measured/evaluated at one model supply voltage."""
+    lot_wafer: str
+    model_vdd_v: float
+    cell: SixTWatCell
+    statistics: dict[str, ExcelMosStatistics]
 
 
 @dataclass(frozen=True)
@@ -799,6 +827,262 @@ def _target_comparisons(cell: SixTWatCell | ThreeTWatCell,
     return rows
 
 
+_MOS_EXCEL_ALIASES = {
+    "pul": "pu1", "pu1": "pu1", "m2": "pu1",
+    "pur": "pu2", "pu2": "pu2", "m4": "pu2",
+    "pgl": "pg1", "pg1": "pg1", "m5": "pg1",
+    "pgr": "pg2", "pg2": "pg2", "m6": "pg2",
+    "pdl": "pd1", "pd1": "pd1", "m1": "pd1",
+    "pdr": "pd2", "pd2": "pd2", "m3": "pd2",
+}
+_VOLTAGE_UNITS = {"v": 1.0, "mv": 1e-3, "uv": 1e-6, "nv": 1e-9}
+_CURRENT_TO_UA = {"a": 1e6, "ma": 1e3, "ua": 1.0, "na": 1e-3, "pa": 1e-6}
+GUI_STATE_FILENAME = ".hv28_sram_analysis_state.json"
+
+
+def _normalized_excel_key(value: object) -> str:
+    raw = "" if value is None else str(value).strip().lower()
+    raw = raw.replace("μ", "u").replace("µ", "u")
+    raw = re.sub(r"\([^)]*\)|\[[^]]*\]", "", raw)
+    return re.sub(r"[^a-z0-9]", "", raw)
+
+
+def _unit_text(value: object, default: str) -> str:
+    unit = default if value is None or str(value).strip() == "" else str(value)
+    return _normalized_excel_key(unit)
+
+
+def _excel_number(value: object, unit: object, unit_map: dict[str, float], default_unit: str,
+                  label: str) -> float:
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([A-Za-zμµ]*)\s*", value)
+        if not match:
+            raise ValueError(f"{label} must be numeric")
+        magnitude, embedded_unit = float(match.group(1)), match.group(2)
+        unit = embedded_unit or unit
+    else:
+        magnitude = float(value)
+    if not math.isfinite(magnitude):
+        raise ValueError(f"{label} must be finite")
+    normalized_unit = _unit_text(unit, default_unit)
+    if normalized_unit not in unit_map:
+        raise ValueError(f"{label} unit '{unit}' is unsupported; use {', '.join(unit_map)}")
+    return magnitude * unit_map[normalized_unit]
+
+
+def _excel_header_map(headers: list[object]) -> tuple[dict[str, int], dict[str, str]]:
+    keys, header_units = {}, {}
+    for index, header in enumerate(headers):
+        key = _normalized_excel_key(header)
+        if key:
+            keys[key] = index
+            unit_match = re.search(r"[\[(]\s*([^\])]+)\s*[\])]", str(header)) if header else None
+            if unit_match:
+                header_units[key] = unit_match.group(1)
+    return keys, header_units
+
+
+def _first_header(header_map: dict[str, int], *names: str) -> str | None:
+    return next((name for name in names if name in header_map), None)
+
+
+def _cell(row: list[object], headers: dict[str, int], key: str | None) -> object | None:
+    return None if key is None or key not in headers or headers[key] >= len(row) else row[headers[key]]
+
+
+def _read_wat_excel_rows(headers_raw: list[object], data_rows: list[list[object]],
+                         default_model_vdd_v: float) -> list[ExcelWatSweepPoint]:
+    """Parse either a long or a wide six-MOS WAT worksheet into SI-normalized values.
+
+    Long form: Lot/Wafer, Model VDD, MOS, Vt, Idsat, plus optional *_Unit columns.
+    Wide form: Lot/Wafer, Model VDD, PUL_Vt, PUL_Idsat ... PDR_Vt, PDR_Idsat.
+    Blank unit cells default to V for Vt/VDD and uA for Idsat.
+    """
+    headers, header_units = _excel_header_map(headers_raw)
+    lot_key = _first_header(headers, "lotwafer", "lot", "wafer", "waferid", "corner")
+    vdd_key = _first_header(headers, "modelvdd", "modelvoltage", "vdd", "supplyvoltage", "testvoltage")
+    vdd_unit_key = _first_header(headers, "modelvddunit", "modelvoltageunit", "vddunit", "voltageunit")
+    mos_key = _first_header(headers, "mos", "mosname", "device", "transistor")
+    vt_key = _first_header(headers, "vt", "vth", "thresholdvoltage")
+    ids_key = _first_header(headers, "idsat", "isat", "ids", "ion")
+    vt_unit_key = _first_header(headers, "vtunit", "vthunit", "voltageunit")
+    ids_unit_key = _first_header(headers, "idsatunit", "isatunit", "idsunit", "ionunit", "currentunit")
+    if not lot_key:
+        raise ValueError("Excel requires a Lot/Wafer (or Corner) column")
+
+    def vdd_from(row: list[object], row_number: int) -> float:
+        raw_vdd = _cell(row, headers, vdd_key)
+        if raw_vdd is None or str(raw_vdd).strip() == "":
+            return default_model_vdd_v
+        unit = _cell(row, headers, vdd_unit_key) or header_units.get(vdd_key or "", "V")
+        return _excel_number(raw_vdd, unit, _VOLTAGE_UNITS, "V", f"Excel row {row_number} Model VDD")
+
+    measurements: dict[tuple[str, float], dict[str, list[MosWat]]] = {}
+    total_rows: dict[tuple[str, float], dict[str, int]] = {}
+
+    def register(lot: str, vdd: float, mos_name: str, mos: MosWat | None) -> None:
+        key = (lot, vdd)
+        total_rows.setdefault(key, {})[mos_name] = total_rows.setdefault(key, {}).get(mos_name, 0) + 1
+        if mos is not None:
+            measurements.setdefault(key, {}).setdefault(mos_name, []).append(mos)
+
+    if mos_key and vt_key and ids_key:  # Long form
+        for row_number, row in enumerate(data_rows, 2):
+            if not any(value is not None and str(value).strip() for value in row):
+                continue
+            alias = _normalized_excel_key(_cell(row, headers, mos_key))
+            if alias not in _MOS_EXCEL_ALIASES:
+                raise ValueError(f"Excel row {row_number}: unknown MOS '{_cell(row, headers, mos_key)}'")
+            vdd = vdd_from(row, row_number)
+            if vdd <= 0:
+                continue  # SNM has no physical definition at zero supply.
+            lot = str(_cell(row, headers, lot_key) or f"row_{row_number}").strip()
+            mos_name = _MOS_EXCEL_ALIASES[alias]
+            raw_vt = _cell(row, headers, vt_key)
+            raw_ids = _cell(row, headers, ids_key)
+            vt_blank = raw_vt is None or str(raw_vt).strip() == ""
+            ids_blank = raw_ids is None or str(raw_ids).strip() == ""
+            if vt_blank and ids_blank:
+                register(lot, vdd, mos_name, None)
+                continue
+            if vt_blank != ids_blank:
+                raise ValueError(f"Excel row {row_number}: Vt and Idsat must both be filled or both be blank")
+            vt_unit = _cell(row, headers, vt_unit_key) or header_units.get(vt_key, "V")
+            ids_unit = _cell(row, headers, ids_unit_key) or header_units.get(ids_key, "uA")
+            mos = MosWat(
+                _positive(_excel_number(raw_vt, vt_unit, _VOLTAGE_UNITS, "V", f"Excel row {row_number} Vt"), "Vt"),
+                _positive(_excel_number(raw_ids, ids_unit, _CURRENT_TO_UA, "uA", f"Excel row {row_number} Idsat"), "Idsat"),
+            )
+            register(lot, vdd, mos_name, mos)
+    else:  # Wide form
+        for row_number, row in enumerate(data_rows, 2):
+            if not any(value is not None and str(value).strip() for value in row):
+                continue
+            vdd = vdd_from(row, row_number)
+            if vdd <= 0:
+                continue
+            lot = str(_cell(row, headers, lot_key) or f"row_{row_number}").strip()
+            for mos_name in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2"):
+                aliases = [alias for alias, mapped in _MOS_EXCEL_ALIASES.items() if mapped == mos_name]
+                vt_header = _first_header(headers, *(f"{alias}vt" for alias in aliases),
+                                          *(f"{alias}vth" for alias in aliases))
+                ids_header = _first_header(headers, *(f"{alias}idsat" for alias in aliases),
+                                           *(f"{alias}isat" for alias in aliases),
+                                           *(f"{alias}ids" for alias in aliases),
+                                           *(f"{alias}ion" for alias in aliases))
+                if not vt_header or not ids_header:
+                    continue
+                raw_vt = _cell(row, headers, vt_header)
+                raw_ids = _cell(row, headers, ids_header)
+                vt_blank = raw_vt is None or str(raw_vt).strip() == ""
+                ids_blank = raw_ids is None or str(raw_ids).strip() == ""
+                if vt_blank and ids_blank:
+                    register(lot, vdd, mos_name, None)
+                    continue
+                if vt_blank != ids_blank:
+                    raise ValueError(f"Excel row {row_number}: {mos_name} Vt and Idsat must both be filled or both be blank")
+                vt_unit = _cell(row, headers, f"{vt_header}unit") or header_units.get(vt_header, "V")
+                ids_unit = _cell(row, headers, f"{ids_header}unit") or header_units.get(ids_header, "uA")
+                mos = MosWat(
+                    _positive(_excel_number(raw_vt, vt_unit, _VOLTAGE_UNITS, "V", f"Excel row {row_number} {mos_name} Vt"), "Vt"),
+                    _positive(_excel_number(raw_ids, ids_unit, _CURRENT_TO_UA, "uA", f"Excel row {row_number} {mos_name} Idsat"), "Idsat"),
+                )
+                register(lot, vdd, mos_name, mos)
+
+    parsed: list[ExcelWatSweepPoint] = []
+    required = {"pu1", "pu2", "pg1", "pg2", "pd1", "pd2"}
+    for (lot, vdd), mos_measurements in sorted(measurements.items(), key=lambda item: (item[0][0], item[0][1])):
+        missing = required - {name for name, values in mos_measurements.items() if values}
+        if missing:
+            raise ValueError(f"Excel {lot} at {vdd:.3f} V is missing: {', '.join(sorted(missing))}")
+        devices: dict[str, MosWat] = {}
+        statistics: dict[str, ExcelMosStatistics] = {}
+        for mos_name in sorted(required):
+            values = mos_measurements[mos_name]
+            vt_values = [item.vt for item in values]
+            ids_values = [item.ids for item in values]
+            devices[mos_name] = MosWat(statlib.fmean(vt_values), statlib.fmean(ids_values))
+            statistics[mos_name] = ExcelMosStatistics(
+                valid_count=len(values),
+                total_count=total_rows[(lot, vdd)].get(mos_name, len(values)),
+                vt_mean=statlib.fmean(vt_values),
+                vt_median=statlib.median(vt_values),
+                vt_stdev=statlib.stdev(vt_values) if len(vt_values) > 1 else 0.0,
+                vt_min=min(vt_values),
+                vt_max=max(vt_values),
+                ids_mean=statlib.fmean(ids_values),
+                ids_median=statlib.median(ids_values),
+                ids_stdev=statlib.stdev(ids_values) if len(ids_values) > 1 else 0.0,
+                ids_min=min(ids_values),
+                ids_max=max(ids_values),
+            )
+        parsed.append(ExcelWatSweepPoint(lot, vdd, SixTWatCell(lot, **devices), statistics))
+    if not parsed:
+        raise ValueError("Excel contains no analyzable model VDD above 0 V")
+    return parsed
+
+
+def read_wat_excel(path: str | os.PathLike[str], default_model_vdd_v: float = 0.90,
+                   sheet_name: str | None = None) -> list[ExcelWatSweepPoint]:
+    """Read a six-MOS WAT Excel workbook (.xlsx) and normalize all units."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("Excel import requires openpyxl. Run: python -m pip install -r requirements.txt") from exc
+    workbook = load_workbook(path, data_only=True, read_only=True)
+    try:
+        if sheet_name:
+            worksheets = [workbook[sheet_name]]
+        else:
+            grouped = {
+                _normalized_excel_key(sheet.title): sheet
+                for sheet in workbook.worksheets
+                if _normalized_excel_key(sheet.title) in {"pu", "pg", "pd", "puwat", "pgwat", "pdwat"}
+            }
+            selected = []
+            for family in ("pu", "pg", "pd"):
+                sheet = grouped.get(family) or grouped.get(f"{family}wat")
+                if sheet is not None:
+                    selected.append(sheet)
+            worksheets = selected if len(selected) == 3 else [workbook.active]
+
+        headers_raw: list[object] | None = None
+        data_rows: list[list[object]] = []
+        normalized_headers: list[str] | None = None
+        for worksheet in worksheets:
+            rows = list(worksheet.iter_rows(values_only=True))
+            if not rows:
+                raise ValueError(f"Excel worksheet '{worksheet.title}' is empty")
+            current_headers = list(rows[0])
+            current_normalized = [_normalized_excel_key(value) for value in current_headers]
+            if normalized_headers is not None and current_normalized != normalized_headers:
+                raise ValueError("PU/PG/PD worksheets must use the same column headers")
+            headers_raw = headers_raw or current_headers
+            normalized_headers = normalized_headers or current_normalized
+            data_rows.extend([list(row) for row in rows[1:]])
+        if headers_raw is None:
+            raise ValueError("Excel contains no readable worksheet")
+        return _read_wat_excel_rows(headers_raw, data_rows, default_model_vdd_v)
+    finally:
+        workbook.close()
+
+
+def load_gui_state(state_path: str | os.PathLike[str] | None = None) -> dict[str, object]:
+    """Load portable GUI inputs; malformed state is safely ignored."""
+    path = Path(state_path) if state_path else Path.cwd() / GUI_STATE_FILENAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_gui_state(state: dict[str, object], state_path: str | os.PathLike[str] | None = None) -> None:
+    """Persist only user-entered GUI values next to the application workspace."""
+    path = Path(state_path) if state_path else Path.cwd() / GUI_STATE_FILENAME
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 VALIDATION_COLUMNS = (
     "lot_wafer", "pu_vt", "pu_idsat", "pg_vt", "pg_idsat", "pd_vt", "pd_idsat",
     "scan4n_vmin", "select_write_vmin", "select_read_vmin",
@@ -1114,6 +1398,8 @@ def validate_config(cfg: Config) -> None:
 
 
 COLORS = ["#111827", "#2563eb", "#dc2626", "#7c3aed", "#059669"]
+# Chart-only scale. This does not alter the electrical VDD used by the model.
+SNM_PLOT_AXIS_MAX_V = 1.20
 
 
 def _fmt(value: float | None, digits: int = 3) -> str:
@@ -1170,14 +1456,15 @@ def snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
     current = result["baseline_6t"]
     target = result.get("target_6t", current)
     vdd = result["config"]["nominal_vdd"]
+    axis_max = SNM_PLOT_AXIS_MAX_V
     lot_label_raw = str(result["wat"]["corner"])
     lot_label = html.escape(lot_label_raw)
     analytical = result.get("analytical_read_snm_comparison", {})
     plot_left, plot_top, plot_w, plot_h = 145, 145, 1140, 455
 
     def xy(vin: float, vout: float) -> tuple[float, float]:
-        return (plot_left + vin / vdd * plot_w,
-                plot_top + (1.0 - vout / vdd) * plot_h)
+        return (plot_left + vin / axis_max * plot_w,
+                plot_top + (1.0 - vout / axis_max) * plot_h)
 
     current_value = current["metrics"]["read_snm_mv"]
     target_value = target["metrics"]["read_snm_mv"]
@@ -1191,8 +1478,7 @@ def snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
         '<path d="M570 82 h34" stroke="#FF9500" stroke-width="4"/><text x="614" y="88" fill="#3A3A3C" font-size="17">WAT Target VTC</text>',
         '<path d="M842 82 h34" stroke="#FF9500" stroke-width="4" stroke-dasharray="10 7"/><text x="886" y="88" fill="#3A3A3C" font-size="17">WAT Target mirrored VTC</text>',
     ]
-    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
-        voltage = fraction * vdd
+    for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
         px, py = xy(voltage, voltage)
         parts += [
             f'<path d="M{px:.1f} {plot_top} V{plot_top+plot_h} M{plot_left} {py:.1f} H{plot_left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
@@ -1228,11 +1514,12 @@ def write_snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -
     target = result.get("target_6t", current)
     cfg, wat = result["config"], result["wat"]
     vdd, lot_raw = cfg["nominal_vdd"], str(wat["corner"])
+    axis_max = SNM_PLOT_AXIS_MAX_V
     lot_label = html.escape(lot_raw)
     left, top, pw, ph = 145, 145, 1140, 455
 
     def xy(vin: float, vout: float) -> tuple[float, float]:
-        return left + vin / vdd * pw, top + (1.0 - vout / vdd) * ph
+        return left + vin / axis_max * pw, top + (1.0 - vout / axis_max) * ph
 
     current_value = current["metrics"]["write_snm_proxy_mv"]
     target_value = target["metrics"]["write_snm_proxy_mv"]
@@ -1244,8 +1531,8 @@ def write_snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -
         f'<path d="M270 82 h34" stroke="#007AFF" stroke-width="4" stroke-dasharray="10 7"/><text x="314" y="88" fill="#3A3A3C" font-size="17">{lot_label} mirrored BLB-high VTC</text>',
         '<path d="M650 82 h34" stroke="#FF9500" stroke-width="4"/><text x="694" y="88" fill="#3A3A3C" font-size="17">WAT Target write VTC pair</text>',
     ]
-    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
-        voltage = fraction * vdd; px, py = xy(voltage, voltage)
+    for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
+        px, py = xy(voltage, voltage)
         parts += [f'<path d="M{px:.1f} {top} V{top+ph} M{left} {py:.1f} H{left+pw}" stroke="#E5E5EA" stroke-width="1"/>',
                   f'<text x="{px:.1f}" y="{top+ph+27}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
                   f'<text x="{left-12}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>']
@@ -1273,6 +1560,7 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
     analytical = result.get("analytical_read_snm_comparison", {})
     lot_label = str(result["wat"]["corner"])
     vdd = result["config"]["nominal_vdd"]
+    axis_max = SNM_PLOT_AXIS_MAX_V
     panels = (
         (lot_label, current, "#007AFF", analytical.get("current_snm_mv")),
         ("WAT Target", target, "#FF9500", analytical.get("target_snm_mv")),
@@ -1295,13 +1583,12 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
         plot_left, plot_w = x0 + 95, 480
 
         def xy(x_value: float, y_value: float) -> tuple[float, float]:
-            return (plot_left + x_value / vdd * plot_w,
-                    plot_top + (1.0 - y_value / vdd) * plot_h)
+            return (plot_left + x_value / axis_max * plot_w,
+                    plot_top + (1.0 - y_value / axis_max) * plot_h)
 
         parts += [f'<text x="{x0:.1f}" y="126" fill="#1D1D1F" font-size="25" font-weight="700">{html.escape(title)}</text>',
                   f'<text x="{x0+panel_w:.1f}" y="126" text-anchor="end" fill="{color}" font-size="18" font-weight="700">Geometric RSNM {data["read_butterfly"]["snm_mv"]:.1f} mV</text>']
-        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
-            voltage = fraction * vdd
+        for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
             px, py = xy(voltage, voltage)
             parts += [f'<path d="M{px:.1f} {plot_top} V{plot_top+plot_h} M{plot_left} {py:.1f} H{plot_left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
                       f'<text x="{px:.1f}" y="{plot_top+plot_h+26}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
@@ -1316,8 +1603,8 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
         limiting = min(square["side_v"] for square in squares)
         for square in squares:
             left, top = xy(square["x_v"], square["y_v"] + square["side_v"])
-            side_px_x = square["side_v"] / vdd * plot_w
-            side_px_y = square["side_v"] / vdd * plot_h
+            side_px_x = square["side_v"] / axis_max * plot_w
+            side_px_y = square["side_v"] / axis_max * plot_h
             stroke_width = 4 if abs(square["side_v"] - limiting) < 1e-12 else 3
             parts += [f'<rect x="{left:.1f}" y="{top:.1f}" width="{side_px_x:.1f}" height="{side_px_y:.1f}" fill="#EFFAF2" stroke="#34C759" stroke-width="{stroke_width}"/>',
                       f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2+7:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">{square["lobe"]}</text>']
@@ -1329,6 +1616,183 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
                   f'<text x="{plot_left+plot_w/2:.1f}" y="{height-62}" text-anchor="middle" fill="#1D1D1F" font-size="18">Vin (V)</text>',
                   f'<text x="{x0+45:.1f}" y="{plot_top+plot_h/2:.1f}" transform="rotate(-90 {x0+45:.1f} {plot_top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="18">Vout (V)</text>']
     parts.append(f'<text x="720" y="{height-14}" text-anchor="middle" fill="#6E6E73" font-size="15">RSNM is the smaller side of squares 1 and 2. Read bias uses the configured WL and BL/BLB levels.</text></svg>')
+    return "".join(parts)
+
+
+def model_vdd_butterfly_svg(entries: list[dict], width: int = 1440) -> str:
+    """Small-multiple Read butterflies with measured-WAT and WAT-target curves."""
+    columns = 3
+    rows = max(1, math.ceil(len(entries) / columns))
+    panel_w, panel_h = 450, 405
+    height = 125 + rows * panel_h + 45
+    axis_max = SNM_PLOT_AXIS_MAX_V
+    has_target = any(item["result"].get("datasheet_targets") for item in entries)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Read SNM butterflies by model VDD" style="font-family:Calibri,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Read SNM Butterfly by Model VDD</text>',
+        '<path d="M54 82 h32" stroke="#007AFF" stroke-width="4"/><text x="96" y="88" fill="#3A3A3C" font-size="15">WAT Inverter VTC</text>',
+        '<path d="M247 82 h32" stroke="#007AFF" stroke-width="4" stroke-dasharray="10 7"/><text x="289" y="88" fill="#3A3A3C" font-size="15">WAT Mirrored VTC</text>',
+        '<rect x="452" y="69" width="21" height="21" fill="#EFFAF2" stroke="#34C759" stroke-width="3"/><text x="484" y="88" fill="#3A3A3C" font-size="15">WAT SNM square</text>',
+    ]
+    if has_target:
+        parts += [
+            '<path d="M650 82 h32" stroke="#FF9500" stroke-width="4"/><text x="692" y="88" fill="#3A3A3C" font-size="15">Target Inverter VTC</text>',
+            '<path d="M865 82 h32" stroke="#FF9500" stroke-width="4" stroke-dasharray="10 7"/><text x="907" y="88" fill="#3A3A3C" font-size="15">Target Mirrored VTC</text>',
+            '<rect x="1095" y="69" width="21" height="21" fill="none" stroke="#FF9500" stroke-width="3" stroke-dasharray="6 4"/><text x="1127" y="88" fill="#3A3A3C" font-size="15">Target SNM square</text>',
+        ]
+    for index, entry in enumerate(entries):
+        col, row = index % columns, index // columns
+        x0, y0 = 38 + col * 468, 125 + row * panel_h
+        left, top, size = x0 + 52, y0 + 72, 250
+        data = entry["result"]["baseline_6t"]
+        target = entry["result"].get("target_6t", data)
+        show_target = bool(entry["result"].get("datasheet_targets"))
+
+        def xy(x: float, y: float) -> tuple[float, float]:
+            return left + x / axis_max * size, top + (1 - y / axis_max) * size
+
+        measured_snm = data["metrics"]["read_snm_mv"]
+        target_snm = target["metrics"]["read_snm_mv"]
+        parts += [f'<text x="{x0}" y="{y0+22}" fill="#1D1D1F" font-size="19" font-weight="700">Operating VDD = {entry["model_vdd_v"]:.3f} V</text>']
+        if show_target:
+            delta = measured_snm - target_snm
+            parts.append(f'<text x="{x0}" y="{y0+47}" fill="#3A3A3C" font-size="14"><tspan fill="#007AFF" font-weight="700">WAT {measured_snm:.1f} mV</tspan><tspan> · </tspan><tspan fill="#FF9500" font-weight="700">Target {target_snm:.1f} mV</tspan><tspan> · Δ {delta:+.1f} mV</tspan></text>')
+        else:
+            parts.append(f'<text x="{x0}" y="{y0+47}" fill="#007AFF" font-size="14" font-weight="700">WAT RSNM {measured_snm:.1f} mV</text>')
+        for voltage in (0.0, 0.60, axis_max):
+            px, py = xy(voltage, voltage)
+            parts += [f'<path d="M{px:.1f} {top} V{top+size} M{left} {py:.1f} H{left+size}" stroke="#E5E5EA" stroke-width="1"/>',
+                      f'<text x="{px:.1f}" y="{top+size+19}" text-anchor="middle" fill="#6E6E73" font-size="12">{voltage:.2f}</text>',
+                      f'<text x="{left-7}" y="{py+4:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{voltage:.2f}</text>']
+        curve = data["read_vtc"]
+        direct = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in curve)
+        mirrored = " ".join(f"{xy(y, x)[0]:.1f},{xy(y, x)[1]:.1f}" for x, y in curve)
+        parts += [f'<polyline points="{direct}" fill="none" stroke="#007AFF" stroke-width="3"/>',
+                  f'<polyline points="{mirrored}" fill="none" stroke="#007AFF" stroke-width="3" stroke-dasharray="8 5"/>']
+        if show_target:
+            target_curve = target["read_vtc"]
+            target_direct = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in target_curve)
+            target_mirrored = " ".join(f"{xy(y, x)[0]:.1f},{xy(y, x)[1]:.1f}" for x, y in target_curve)
+            parts += [f'<polyline points="{target_direct}" fill="none" stroke="#FF9500" stroke-width="2.5"/>',
+                      f'<polyline points="{target_mirrored}" fill="none" stroke="#FF9500" stroke-width="2.5" stroke-dasharray="8 5"/>']
+        for square in data["read_butterfly"]["squares"]:
+            sx, sy = xy(square["x_v"], square["y_v"] + square["side_v"])
+            side = square["side_v"] / axis_max * size
+            parts.append(f'<rect x="{sx:.1f}" y="{sy:.1f}" width="{side:.1f}" height="{side:.1f}" fill="#EFFAF2" stroke="#34C759" stroke-width="3"/>')
+        if show_target:
+            for square in target["read_butterfly"]["squares"]:
+                sx, sy = xy(square["x_v"], square["y_v"] + square["side_v"])
+                side = square["side_v"] / axis_max * size
+                parts.append(f'<rect x="{sx:.1f}" y="{sy:.1f}" width="{side:.1f}" height="{side:.1f}" fill="none" stroke="#FF9500" stroke-width="2.5" stroke-dasharray="6 4"/>')
+        parts += [f'<text x="{left+size/2:.1f}" y="{top+size+48}" text-anchor="middle" fill="#1D1D1F" font-size="14">Vin (V)</text>',
+                  f'<text x="{x0+16}" y="{top+size/2:.1f}" transform="rotate(-90 {x0+16} {top+size/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="14">Vout (V)</text>']
+    parts.append(f'<text x="{width/2}" y="{height-14}" text-anchor="middle" fill="#6E6E73" font-size="14">Each panel is a complete 6T Read butterfly. Vin/Vout axes are fixed at 0 to 1.20 V.</text></svg>')
+    return "".join(parts)
+
+
+def all_model_vdd_butterfly_overlay_svg(entries: list[dict], width: int = 1440, height: int = 920) -> str:
+    """Overlay every analyzed operating VDD on one Vin/Vout chart."""
+    left, top, plot_size = 125, 145, 660
+    axis_max = SNM_PLOT_AXIS_MAX_V
+    palette = ("#007AFF", "#34C759", "#AF52DE", "#FF9500", "#FF3B30", "#00A7A7")
+    has_target = any(item["result"].get("datasheet_targets") for item in entries)
+
+    def xy(x: float, y: float) -> tuple[float, float]:
+        return left + x / axis_max * plot_size, top + (1 - y / axis_max) * plot_size
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="All operating VDD Read SNM butterfly overlay" style="font-family:Calibri,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="54" y="50" fill="#1D1D1F" font-size="30" font-weight="700">All Operating Voltages — Read SNM Butterfly Overlay</text>',
+        '<path d="M55 83 h42" stroke="#1D1D1F" stroke-width="4"/><text x="108" y="89" fill="#3A3A3C" font-size="16">Measured WAT</text>',
+    ]
+    if has_target:
+        parts += ['<path d="M260 83 h42" stroke="#1D1D1F" stroke-width="3" stroke-dasharray="10 7"/><text x="313" y="89" fill="#3A3A3C" font-size="16">WAT Target</text>']
+    for step in range(7):
+        voltage = step * 0.2
+        px, py = xy(voltage, voltage)
+        parts += [f'<path d="M{px:.1f} {top} V{top+plot_size} M{left} {py:.1f} H{left+plot_size}" stroke="#E5E5EA" stroke-width="1"/>',
+                  f'<text x="{px:.1f}" y="{top+plot_size+28}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.1f} V</text>',
+                  f'<text x="{left-12}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.1f} V</text>']
+    legend_x, legend_y = 925, 160
+    for index, entry in enumerate(entries):
+        color = palette[index % len(palette)]
+        data = entry["result"]["baseline_6t"]
+        target = entry["result"].get("target_6t", data)
+        show_target = bool(entry["result"].get("datasheet_targets"))
+        curve = data["read_vtc"]
+        for points in (curve, [(y, x) for x, y in curve]):
+            path = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in points)
+            parts.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="3.5" opacity="0.88"/>')
+        if show_target:
+            target_curve = target["read_vtc"]
+            for points in (target_curve, [(y, x) for x, y in target_curve]):
+                path = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in points)
+                parts.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="2.5" stroke-dasharray="10 7" opacity="0.88"/>')
+        y_pos = legend_y + index * 64
+        measured_snm = data["metrics"]["read_snm_mv"]
+        target_snm = target["metrics"]["read_snm_mv"]
+        parts += [f'<path d="M{legend_x} {y_pos} h42" stroke="{color}" stroke-width="5"/>',
+                  f'<text x="{legend_x+55}" y="{y_pos+6}" fill="#1D1D1F" font-size="18" font-weight="700">VDD {entry["model_vdd_v"]:.1f} V</text>',
+                  f'<text x="{legend_x+55}" y="{y_pos+29}" fill="#007AFF" font-size="14">WAT RSNM {measured_snm:.1f} mV</text>']
+        if show_target:
+            parts.append(f'<text x="{legend_x+220}" y="{y_pos+29}" fill="#FF9500" font-size="14">Target {target_snm:.1f} mV · Δ {measured_snm-target_snm:+.1f}</text>')
+    parts += [
+        f'<text x="{left+plot_size/2}" y="{height-38}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V) — operating VDD identified by curve color</text>',
+        f'<text x="42" y="{top+plot_size/2}" transform="rotate(-90 42 {top+plot_size/2})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V) — 0.0 to 1.2 V</text>',
+        '<text x="925" y="120" fill="#6E6E73" font-size="15">Color = operating VDD · Solid = measured WAT · Dashed = target</text>',
+        '</svg>',
+    ]
+    return "".join(parts)
+
+
+def snm_by_model_vdd_svg(entries: list[dict], width: int = 1100, height: int = 540) -> str:
+    """Independent SNM versus model-VDD trend chart for an Excel import."""
+    left, top, plot_w, plot_h = 115, 110, 880, 320
+    axis_max = SNM_PLOT_AXIS_MAX_V
+    has_target = any(item["result"].get("datasheet_targets") for item in entries)
+    datasets = [item["result"]["baseline_6t"] for item in entries]
+    if has_target:
+        datasets.extend(item["result"].get("target_6t", item["result"]["baseline_6t"]) for item in entries)
+    max_snm = max(data["metrics"][key] for data in datasets
+                  for key in ("read_snm_mv", "write_snm_proxy_mv"))
+    y_max = max(50.0, math.ceil(max_snm / 50.0) * 50.0)
+
+    def xy(vdd: float, snm: float) -> tuple[float, float]:
+        return left + vdd / axis_max * plot_w, top + (1 - snm / y_max) * plot_h
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="SNM versus model VDD" style="font-family:Calibri,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="52" y="48" fill="#1D1D1F" font-size="29" font-weight="700">SNM versus Model VDD</text>',
+        '<path d="M52 80 h32" stroke="#007AFF" stroke-width="4"/><text x="94" y="86" fill="#3A3A3C" font-size="16">Read SNM</text>',
+        '<path d="M230 80 h32" stroke="#FF9500" stroke-width="4"/><text x="272" y="86" fill="#3A3A3C" font-size="16">Write SNM proxy</text>',
+    ]
+    if has_target:
+        parts += ['<path d="M455 80 h32" stroke="#1D1D1F" stroke-width="3"/><text x="497" y="86" fill="#3A3A3C" font-size="16">Measured WAT</text>',
+                  '<path d="M650 80 h32" stroke="#1D1D1F" stroke-width="3" stroke-dasharray="9 6"/><text x="692" y="86" fill="#3A3A3C" font-size="16">WAT Target</text>']
+    for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
+        x, _ = xy(voltage, 0)
+        parts += [f'<path d="M{x:.1f} {top} V{top+plot_h}" stroke="#E5E5EA" stroke-width="1"/>',
+                  f'<text x="{x:.1f}" y="{top+plot_h+25}" text-anchor="middle" fill="#6E6E73" font-size="14">{voltage:.2f}</text>']
+    for snm in (0.0, y_max / 2, y_max):
+        _, y = xy(0, snm)
+        parts += [f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
+                  f'<text x="{left-10}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="14">{snm:.0f}</text>']
+    for key, color in (("read_snm_mv", "#007AFF"), ("write_snm_proxy_mv", "#FF9500")):
+        points = [xy(item["model_vdd_v"], item["result"]["baseline_6t"]["metrics"][key]) for item in entries]
+        parts.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in points)}" fill="none" stroke="{color}" stroke-width="4"/>')
+        for x, y in points:
+            parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#FFFFFF" stroke="{color}" stroke-width="3"/>')
+        if has_target:
+            target_points = [xy(item["model_vdd_v"], item["result"].get("target_6t", item["result"]["baseline_6t"])["metrics"][key]) for item in entries]
+            parts.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in target_points)}" fill="none" stroke="{color}" stroke-width="3" stroke-dasharray="9 6"/>')
+            for x, y in target_points:
+                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFFFFF" stroke="{color}" stroke-width="2"/>')
+    parts += [f'<text x="{left+plot_w/2}" y="{height-47}" text-anchor="middle" fill="#1D1D1F" font-size="18">Model VDD (V)</text>',
+              f'<text x="38" y="{top+plot_h/2}" transform="rotate(-90 38 {top+plot_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="18">SNM (mV)</text>',
+              '<text x="550" y="512" text-anchor="middle" fill="#6E6E73" font-size="14">VDD axis is fixed at 0 to 1.20 V. Zero-VDD Excel rows are omitted because SNM is undefined at 0 V.</text></svg>']
     return "".join(parts)
 
 
@@ -2056,12 +2520,12 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     </style></head><body><main>
     <h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode", "Grouped"))}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
     <div class="summary"><b>Analysis scope:</b> Read SNM plus write-condition SNM proxy. Blue curves use the measured Lot/Wafer WAT inputs; orange curves use the entered PU/PG/PD WAT targets.</div>
-    <section><h2>Read SNM Target Comparison</h2><p>The plotted curves use the WAT-calibrated compact VTC model. X-axis is Vin and Y-axis is Vout, both expressed in volts. Limiting squares are not drawn in this comparison view.</p>
+    <section><h2>Read SNM Target Comparison</h2><p>The plotted curves use the WAT-calibrated compact VTC model. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V. Limiting squares are not drawn in this comparison view.</p>
     <img src="images/{png_name}" alt="Read SNM Lot/Wafer WAT versus WAT Target comparison">
     <table><thead><tr><th>Mode</th><th>Lot/Wafer SNM (mV)</th><th>WAT Target SNM (mV)</th><th>Lot/Wafer − WAT Target (mV)</th><th>Difference (%)</th></tr></thead><tbody>{snm_rows}</tbody></table></section>
-    <section><h2>Read SNM Butterfly Analysis</h2><p>Squares 1 and 2 are fitted independently into the two read-accessed butterfly lobes. The reported geometric RSNM is the smaller square side. X-axis is Vin and Y-axis is Vout, both expressed in volts.</p>
+    <section><h2>Read SNM Butterfly Analysis</h2><p>Squares 1 and 2 are fitted independently into the two read-accessed butterfly lobes. The reported geometric RSNM is the smaller square side. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V.</p>
     <img src="images/{butterfly_png_name}" alt="Read SNM butterfly with two maximum squares"></section>
-    <section><h2>Write SNM Target Comparison</h2><p>Write condition uses the configured WL, a low write bitline and a high complementary bitline. The two VTCs are intentionally asymmetric. Write SNM is reported as the maximum tolerated rise on the nominally-low write bitline while the access device can still overcome the pull-up device; it is a WAT-calibrated write-margin proxy, not a geometric butterfly-square or sign-off WSNM.</p>
+    <section><h2>Write SNM Target Comparison</h2><p>Write condition uses the configured WL, a low write bitline and a high complementary bitline. The two VTCs are intentionally asymmetric. Vin and Vout axes are fixed at 0 to 1.20 V. Write SNM is reported as the maximum tolerated rise on the nominally-low write bitline while the access device can still overcome the pull-up device; it is a WAT-calibrated write-margin proxy, not a geometric butterfly-square or sign-off WSNM.</p>
     <img src="images/{write_png_name}" alt="Write SNM target comparison"></section>
     {electrical_snm_section}
     {assumption_section}
@@ -2076,9 +2540,143 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     return report
 
 
+def write_excel_sweep_outputs(entries: list[dict], out_dir: str | os.PathLike[str]) -> Path:
+    """Write one HTML report plus combined butterfly and SNM trend plots for Excel VDD sweeps."""
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from reportlab.graphics import renderPM
+        from svglib.svglib import svg2rlg
+    except ImportError as exc:
+        raise RuntimeError("PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
+
+    analyzed_entries = [item for item in entries if item.get("result") is not None]
+    if not analyzed_entries:
+        raise ValueError("Excel contains no Model VDD above the imported MOS threshold voltages")
+    charts = [
+        ("04_model_vdd_read_snm_butterfly", model_vdd_butterfly_svg(analyzed_entries), "Read SNM butterfly panels by model VDD"),
+        ("05_snm_vs_model_vdd", snm_by_model_vdd_svg(analyzed_entries), "Read and Write SNM versus model VDD"),
+        ("06_all_vdd_read_snm_overlay", all_model_vdd_butterfly_overlay_svg(analyzed_entries), "All operating VDD Read SNM butterfly overlay"),
+    ]
+    manifest_rows = []
+    for stem, svg, description in charts:
+        svg_path = image_dir / f"{stem}.svg"
+        png_path = image_dir / f"{stem}.png"
+        svg_path.write_text(svg, encoding="utf-8")
+        drawing = svg2rlg(str(svg_path))
+        if drawing is None:
+            raise RuntimeError(f"Could not render {stem}")
+        renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
+        manifest_rows.extend([
+            {"filename": png_path.name, "format": "PNG", "description": description},
+            {"filename": svg_path.name, "format": "SVG", "description": description},
+        ])
+    rows = []
+    for item in entries:
+        result = item.get("result")
+        metrics = result["baseline_6t"]["metrics"] if result is not None else {}
+        has_target = bool(result and result.get("datasheet_targets"))
+        target_metrics = result["target_6t"]["metrics"] if has_target else {}
+        read_snm = metrics.get("read_snm_mv")
+        target_read_snm = target_metrics.get("read_snm_mv")
+        rows.append({
+            "lot_wafer": item["lot_wafer"], "model_vdd_v": item["model_vdd_v"],
+            "read_snm_mv": read_snm,
+            "target_read_snm_mv": target_read_snm,
+            "read_snm_delta_mv": (read_snm - target_read_snm
+                                  if read_snm is not None and target_read_snm is not None else None),
+            "write_snm_proxy_mv": metrics.get("write_snm_proxy_mv"),
+            "target_write_snm_proxy_mv": target_metrics.get("write_snm_proxy_mv"),
+            "analytical_read_snm_mv": metrics.get("analytical_read_snm_mv"),
+            "analysis_status": item.get("analysis_status", "Analyzed"),
+        })
+    with open(out / "excel_model_vdd_snm.csv", "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    statistics_rows = []
+    for item in entries:
+        for mos_name in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2"):
+            stats = item.get("statistics", {}).get(mos_name)
+            if stats is None:
+                continue
+            statistics_rows.append({
+                "lot_wafer": item["lot_wafer"],
+                "model_vdd_v": item["model_vdd_v"],
+                "mos": DISPLAY_MOS_NAMES[mos_name],
+                "valid_count": stats.valid_count,
+                "total_count": stats.total_count,
+                "coverage_pct": 100.0 * stats.valid_count / stats.total_count if stats.total_count else 0.0,
+                "vt_mean_v": stats.vt_mean,
+                "vt_median_v": stats.vt_median,
+                "vt_stdev_v": stats.vt_stdev,
+                "vt_min_v": stats.vt_min,
+                "vt_max_v": stats.vt_max,
+                "idsat_mean_ua": stats.ids_mean,
+                "idsat_median_ua": stats.ids_median,
+                "idsat_stdev_ua": stats.ids_stdev,
+                "idsat_min_ua": stats.ids_min,
+                "idsat_max_ua": stats.ids_max,
+            })
+    if statistics_rows:
+        with open(out / "excel_wat_site_statistics.csv", "w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=list(statistics_rows[0])); writer.writeheader(); writer.writerows(statistics_rows)
+    with open(image_dir / "excel_sweep_image_manifest.csv", "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=list(manifest_rows[0])); writer.writeheader(); writer.writerows(manifest_rows)
+    table_rows = "".join(
+        f'<tr><td>{html.escape(row["lot_wafer"])}</td><td>{row["model_vdd_v"]:.3f}</td>'
+        f'<td>{_fmt(row["read_snm_mv"], 2)}</td><td>{_fmt(row["target_read_snm_mv"], 2)}</td><td>{_fmt(row["read_snm_delta_mv"], 2)}</td>'
+        f'<td>{_fmt(row["write_snm_proxy_mv"], 2)}</td><td>{_fmt(row["target_write_snm_proxy_mv"], 2)}</td>'
+        f'<td>{_fmt(row["analytical_read_snm_mv"], 2)}</td><td>{html.escape(row["analysis_status"])}</td></tr>' for row in rows)
+    statistics_table_rows = "".join(
+        f'<tr><td>{html.escape(row["lot_wafer"])}</td><td>{row["model_vdd_v"]:.3f}</td><td>{row["mos"]}</td>'
+        f'<td>{row["valid_count"]}/{row["total_count"]}</td><td>{row["coverage_pct"]:.1f}%</td>'
+        f'<td>{row["vt_mean_v"]:.4f}</td><td>{row["vt_stdev_v"]:.4f}</td>'
+        f'<td>{row["idsat_mean_ua"]:.3f}</td><td>{row["idsat_stdev_ua"]:.3f}</td></tr>'
+        for row in statistics_rows)
+    statistics_section = (f'''<section><h2>Wafer-Site WAT Statistics</h2>
+    <p>The 6T model uses the arithmetic mean of all valid sites at each Lot/Wafer, model VDD and physical MOS. Median, standard deviation, minimum and maximum are retained in <code>excel_wat_site_statistics.csv</code>.</p>
+    <table><thead><tr><th>Lot/Wafer</th><th>Model VDD (V)</th><th>MOS</th><th>Valid/Total</th><th>Coverage</th><th>Mean Vt (V)</th><th>Vt σ (V)</th><th>Mean Idsat (µA)</th><th>Idsat σ (µA)</th></tr></thead><tbody>{statistics_table_rows}</tbody></table></section>'''
+        if statistics_rows else "")
+    document = f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Excel VDD Sweep</title>
+    <style>body{{font-family:Calibri,Arial,sans-serif;background:#F5F5F7;color:#1D1D1F;margin:0}}main{{max-width:1500px;margin:auto;padding:42px}}section{{background:#fff;border-radius:18px;padding:24px;margin:16px 0}}img{{width:100%;height:auto;border:1px solid #E5E5EA;border-radius:12px}}table{{border-collapse:collapse;width:100%}}th,td{{padding:10px;border-bottom:1px solid #E5E5EA;text-align:left}}th{{color:#6E6E73}}.note{{color:#6E6E73}}</style></head><body><main>
+    <h1>HV28 SRAM Excel Model-VDD Sweep</h1><p class="note">PU, PG and PD worksheets are combined by Lot/Wafer and model VDD. Repeated wafer-site records are converted to V/uA and averaged per physical MOS before 6T analysis.</p>
+    <section><h2>Read SNM Butterfly by Operating VDD</h2><p>Each panel compares measured-WAT and WAT-target VTCs, mirrored VTCs and SNM squares under the same operating voltage. Vin/Vout axes are fixed at 0 to 1.20 V.</p><img src="images/04_model_vdd_read_snm_butterfly.png" alt="Measured and target Read SNM butterflies by model VDD"></section>
+    <section><h2>Independent SNM Trend</h2><p>Measured and target Read SNM / Write SNM proxy are plotted against imported model VDD.</p><img src="images/05_snm_vs_model_vdd.png" alt="Measured and target SNM versus model VDD"></section>
+    <section><h2>All Operating Voltages Overlay</h2><p>All analyzed VDD butterfly curves are integrated in one Vin/Vout plot. Curve color identifies operating VDD; solid lines are measured WAT and dashed lines are WAT Target.</p><img src="images/06_all_vdd_read_snm_overlay.png" alt="All operating VDD Read SNM butterfly overlay"></section>
+    <section><h2>Model-VDD Results</h2><table><thead><tr><th>Lot/Wafer</th><th>Model VDD (V)</th><th>WAT RSNM (mV)</th><th>Target RSNM (mV)</th><th>Δ RSNM (mV)</th><th>WAT Write Proxy (mV)</th><th>Target Write Proxy (mV)</th><th>Analytical RSNM (mV)</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table></section>
+    {statistics_section}
+    <p class="note">Raw results: <code>excel_model_vdd_snm.csv</code> and <code>excel_wat_site_statistics.csv</code>; images: <code>images/04_model_vdd_read_snm_butterfly.png</code>, <code>images/05_snm_vs_model_vdd.png</code> and <code>images/06_all_vdd_read_snm_overlay.png</code>.</p></main></body></html>'''
+    report = out / "excel_wat_sweep_report.html"
+    report.write_text(document, encoding="utf-8")
+    return report
+
+
+def analyze_excel_wat_sweep(path: str | os.PathLike[str], out_dir: str | os.PathLike[str], cfg: Config,
+                            targets: DatasheetTargets | None = None) -> Path:
+    """Analyze each imported model voltage and create one combined Excel sweep report."""
+    validate_config(cfg)
+    samples = read_wat_excel(path, cfg.nominal_vdd)
+    entries = []
+    for sample in samples:
+        highest_vt = max(getattr(sample.cell, name).vt for name in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2"))
+        if sample.model_vdd_v <= highest_vt:
+            result = None
+            status = f"WAT statistics only: VDD ≤ highest MOS Vt ({highest_vt:.3f} V)"
+        else:
+            model_cfg = replace(cfg, nominal_vdd=sample.model_vdd_v)
+            result = analyze_six_mos(sample.cell, model_cfg, targets) if targets else analyze_six_mos(sample.cell, model_cfg, None)
+            status = "Analyzed"
+        entries.append({"lot_wafer": sample.lot_wafer, "model_vdd_v": sample.model_vdd_v,
+                        "statistics": sample.statistics, "analysis_status": status, "result": result})
+    return write_excel_sweep_outputs(entries, out_dir)
+
+
 def run_analysis(csv_path: str, out_dir: str, cfg: Config, corner: str | None = None,
                  targets: DatasheetTargets | None = None) -> list[Path]:
     validate_config(cfg)
+    if Path(csv_path).suffix.lower() == ".xlsx":
+        if corner:
+            raise ValueError("--corner is not used for Excel model-VDD sweep import")
+        return [analyze_excel_wat_sweep(csv_path, Path(out_dir) / "excel_model_vdd_sweep", cfg, targets)]
     points = read_wat_csv(csv_path)
     if corner:
         points = [p for p in points if p.corner.lower() == corner.lower()]
@@ -2101,8 +2699,13 @@ def _launch_legacy_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
     root = tk.Tk(); root.title("HV28 SRAM Analysis"); root.geometry("820x720"); root.minsize(760, 680)
-    values = {"out": tk.StringVar(value=str(Path.cwd()/"output")),
-              "corner": tk.StringVar(value="DEMO28_TT_W01")}
+    saved_state = load_gui_state()
+    def saved_text(group: str, key: str, default: object) -> str:
+        return str(saved_state.get(group, {}).get(key, default)) if isinstance(saved_state.get(group), dict) else str(default)
+
+    values = {"out": tk.StringVar(value=saved_text("values", "out", Path.cwd()/"output")),
+              "corner": tk.StringVar(value=saved_text("values", "corner", "DEMO28_TT_W01")),
+              "excel_input": tk.StringVar(value=saved_text("values", "excel_input", ""))}
     defaults={"pu":("0.385","44"),"pg":("0.365","82"),"pd":("0.355","124")}
     wat_values={}
     for dev in ("pu1","pu2","pg1","pg2","pd1","pd2"):
@@ -2212,24 +2815,33 @@ def launch_gui() -> None:
     style.map("Quiet.TButton", background=[("pressed", "#D8D8DC"), ("active", "#E2E2E7")])
     style.configure("Apple.Horizontal.TProgressbar", background=BLUE, troughcolor="#E5E5EA", borderwidth=0)
 
-    values = {"out": tk.StringVar(value=str(Path.cwd()/"output")),
-              "corner": tk.StringVar(value="DEMO28_TT_W01")}
+    saved_state = load_gui_state()
+
+    def saved_text(group: str, key: str, default: object) -> str:
+        group_values = saved_state.get(group, {})
+        return str(group_values.get(key, default)) if isinstance(group_values, dict) else str(default)
+
+    values = {
+        "out": tk.StringVar(value=saved_text("values", "out", Path.cwd() / "output")),
+        "corner": tk.StringVar(value=saved_text("values", "corner", "DEMO28_TT_W01")),
+        "excel_input": tk.StringVar(value=saved_text("values", "excel_input", "")),
+    }
     defaults = {"pu": ("0.385", "44"), "pg": ("0.365", "82"), "pd": ("0.355", "124")}
     target_defaults = {"pu": ("0.380", "45"), "pg": ("0.370", "80"), "pd": ("0.360", "120")}
     wat_values: dict[str, tk.StringVar] = {}
     for dev in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2"):
         vt, ids = defaults[dev[:2]]
-        wat_values[f"{dev}_vt"] = tk.StringVar(value=vt)
-        wat_values[f"{dev}_ids"] = tk.StringVar(value=ids)
+        wat_values[f"{dev}_vt"] = tk.StringVar(value=saved_text("wat", f"{dev}_vt", vt))
+        wat_values[f"{dev}_ids"] = tk.StringVar(value=saved_text("wat", f"{dev}_ids", ids))
     target_values: dict[str, tk.StringVar] = {}
     for dev in ("pu", "pg", "pd"):
         vt, ids = target_defaults[dev]
-        target_values[f"{dev}_vt"] = tk.StringVar(value=vt)
-        target_values[f"{dev}_ids"] = tk.StringVar(value=ids)
+        target_values[f"{dev}_vt"] = tk.StringVar(value=saved_text("targets", f"{dev}_vt", vt))
+        target_values[f"{dev}_ids"] = tk.StringVar(value=saved_text("targets", f"{dev}_ids", ids))
     config_defaults = Config()
     numeric = {
-        "nominal_vdd": tk.StringVar(value=str(config_defaults.nominal_vdd)),
-        "wat_vdd": tk.StringVar(value=str(config_defaults.wat_vdd)),
+        "nominal_vdd": tk.StringVar(value=saved_text("numeric", "nominal_vdd", config_defaults.nominal_vdd)),
+        "wat_vdd": tk.StringVar(value=saved_text("numeric", "wat_vdd", config_defaults.wat_vdd)),
     }
     assumption_specs = (
         ("technology_node_nm", "Technology node", "nm"),
@@ -2245,7 +2857,7 @@ def launch_gui() -> None:
         ("write_high_bitline_over_vdd", "Write BLB / VDD", "×VDD"),
     )
     assumption_values = {
-        key: tk.StringVar(value=str(getattr(config_defaults, key)))
+        key: tk.StringVar(value=saved_text("assumptions", key, getattr(config_defaults, key)))
         for key, _label, _unit in assumption_specs
     }
 
@@ -2301,6 +2913,33 @@ def launch_gui() -> None:
     ttk.Entry(top_fields, textvariable=values["corner"], width=14, style="Apple.TEntry").pack(side="left", padx=10)
     tk.Label(top_fields, text="  6T INDEPENDENT  ", bg="#EEF6FF", fg=BLUE,
              font=("Calibri", 9, "bold"), padx=8, pady=5).pack(side="right")
+
+    excel_row = ttk.Frame(left, style="Card.TFrame"); excel_row.pack(fill="x", pady=(2, 7))
+    ttk.Label(excel_row, text="Excel 6T WAT", style="Body.TLabel").pack(side="left")
+    excel_label = ttk.Label(excel_row, textvariable=values["excel_input"], style="Meta.TLabel")
+    excel_label.pack(side="left", fill="x", expand=True, padx=(10, 6))
+
+    def pick_excel() -> None:
+        selected = filedialog.askopenfilename(
+            title="Import 6T WAT Excel", filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
+        if not selected:
+            return
+        try:
+            samples = read_wat_excel(selected, float(numeric["nominal_vdd"].get()))
+            first = samples[0]
+            values["excel_input"].set(selected)
+            values["corner"].set(first.lot_wafer)
+            numeric["nominal_vdd"].set(f"{first.model_vdd_v:.3f}")
+            for mos_name in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2"):
+                mos = getattr(first.cell, mos_name)
+                wat_values[f"{mos_name}_vt"].set(f"{mos.vt:.6g}")
+                wat_values[f"{mos_name}_ids"].set(f"{mos.ids:.6g}")
+            status.set(f"Excel loaded: {len(samples)} model-VDD point(s); first point copied to the 6T inputs")
+            status_label.configure(fg=GREEN)
+        except Exception as exc:
+            messagebox.showerror("Excel import", str(exc))
+
+    ttk.Button(excel_row, text="Import Excel…", style="Quiet.TButton", command=pick_excel).pack(side="right")
 
     schematic = tk.Canvas(left, bg=CARD, highlightthickness=0, height=540)
     schematic.pack(fill="both", expand=True)
@@ -2448,13 +3087,21 @@ def launch_gui() -> None:
         except Exception as exc:
             result_queue.put((False, None, exc))
 
+    def excel_worker(excel_path: str, cfg: Config, targets: DatasheetTargets, out_path: str) -> None:
+        try:
+            report = analyze_excel_wat_sweep(excel_path, Path(out_path) / "excel_model_vdd_sweep", cfg, targets)
+            result_queue.put((True, None, report))
+        except Exception as exc:
+            result_queue.put((False, None, exc))
+
     def poll_result() -> None:
         try: ok, cell, payload = result_queue.get_nowait()
         except queue.Empty:
             root.after(80, poll_result); return
-        progress.stop(); analyze_button.state(["!disabled"])
+        progress.stop(); analyze_button.state(["!disabled"]); excel_analyze_button.state(["!disabled"])
         if ok:
-            status.set(f"Complete · {cell.corner} · HTML report opened")
+            label = "Excel model-VDD sweep" if cell is None else cell.corner
+            status.set(f"Complete · {label} · HTML report opened")
             status_label.configure(fg=GREEN)
             webbrowser.open(Path(payload).resolve().as_uri())
         else:
@@ -2474,15 +3121,50 @@ def launch_gui() -> None:
         threading.Thread(target=worker, args=(cell, cfg, targets, values["out"].get()), daemon=True).start()
         root.after(80, poll_result)
 
+    def execute_excel_sweep() -> None:
+        excel_path = values["excel_input"].get().strip()
+        if not excel_path:
+            messagebox.showerror("Excel import", "Choose a 6T WAT Excel workbook first.")
+            return
+        try:
+            _cell, cfg, targets = collect_inputs()
+        except Exception as exc:
+            status.set("Check the input values")
+            status_label.configure(fg=RED)
+            messagebox.showerror("Invalid input", str(exc)); return
+        status.set("Analyzing Excel model-VDD sweep…")
+        status_label.configure(fg=BLUE)
+        analyze_button.state(["disabled"]); excel_analyze_button.state(["disabled"]); progress.start(10)
+        threading.Thread(target=excel_worker, args=(excel_path, cfg, targets, values["out"].get()), daemon=True).start()
+        root.after(80, poll_result)
+
     ttk.Label(right_footer, text="Read / Write SNM · Lot/Wafer vs WAT Target", style="Meta.TLabel").pack(pady=(0, 7))
     analyze_button = ttk.Button(right_footer, text="Analyze & Open HTML", style="Accent.TButton", command=execute)
     analyze_button.pack(fill="x")
+    excel_analyze_button = ttk.Button(right_footer, text="Analyze Excel VDD Sweep", style="Quiet.TButton", command=execute_excel_sweep)
+    excel_analyze_button.pack(fill="x", pady=(7, 0))
+
+    def persist_and_close() -> None:
+        state = {
+            "values": {key: variable.get() for key, variable in values.items()},
+            "wat": {key: variable.get() for key, variable in wat_values.items()},
+            "targets": {key: variable.get() for key, variable in target_values.items()},
+            "numeric": {key: variable.get() for key, variable in numeric.items()},
+            "assumptions": {key: variable.get() for key, variable in assumption_values.items()},
+        }
+        try:
+            save_gui_state(state)
+        except OSError:
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", persist_and_close)
     root.mainloop()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p=argparse.ArgumentParser(description="6T SRAM / WAT cell-level SNM analyzer")
-    p.add_argument("--input",help="WAT CSV; omit to open GUI")
+    p.add_argument("--input",help="WAT CSV or six-MOS WAT Excel (.xlsx); omit to open GUI")
     p.add_argument("--output",default="output",help="output directory")
     p.add_argument("--corner",help="analyze only this corner")
     p.add_argument("--vdd",type=float,default=.80,help="nominal SRAM VDD")

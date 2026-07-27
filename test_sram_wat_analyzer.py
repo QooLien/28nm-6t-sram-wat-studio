@@ -6,7 +6,8 @@ from pathlib import Path
 from sram_wat_analyzer import (
     Config, DatasheetTargets, MosWat, SixTWatCell, Sram6T, ThreeTWatCell,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    generic_28nm_assumption_rows, read_wat_csv,
+    _read_wat_excel_rows, generic_28nm_assumption_rows, load_gui_state, read_wat_csv,
+    save_gui_state,
     validate_config, wat_electrical_snm_rows, write_outputs,
 )
 
@@ -99,14 +100,15 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("WAT Target VTC", svg)
             self.assertIn("Vin (V)", svg)
             self.assertIn("Vout (V)", svg)
-            self.assertIn("0.45", svg)
-            self.assertIn("0.90", svg)
+            self.assertIn("0.30", svg)
+            self.assertIn("1.20", svg)
             self.assertNotIn("SNM squares in both butterfly lobes", svg)
             butterfly_svg = (image_dir / "02_read_snm_butterfly.svg").read_text(encoding="utf-8")
             self.assertIn("Maximum squares 1 and 2", butterfly_svg)
             self.assertIn("smaller side of squares 1 and 2", butterfly_svg)
             self.assertIn("Vin (V)", butterfly_svg)
             self.assertIn("Vout (V)", butterfly_svg)
+            self.assertIn("1.20", butterfly_svg)
             self.assertNotIn("Figure 3.15", butterfly_svg)
             write_svg = (image_dir / "03_write_snm_target_comparison.svg").read_text(encoding="utf-8")
             self.assertIn("Write SNM Target Comparison", write_svg)
@@ -216,6 +218,58 @@ class AnalyzerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(read_wat_csv(source)[0].corner, "TT")
+
+    def test_excel_long_form_converts_units_and_groups_six_mos(self):
+        headers = ["Lot/Wafer", "Model VDD", "VDD Unit", "MOS", "Vt", "Vt Unit", "Idsat", "Idsat Unit"]
+        rows = [
+            ["W01", 900, "mV", name, value, "mV", current, unit]
+            for name, value, current, unit in (
+                ("PUL", 380, 0.045, "mA"), ("PUR", 382, 46, "uA"),
+                ("PGL", 365, 0.082, "mA"), ("PGR", 366, 83, "uA"),
+                ("PDL", 355, 0.124, "mA"), ("PDR", 356, 125, "uA"),
+            )
+        ]
+        samples = _read_wat_excel_rows(headers, rows, .9)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].lot_wafer, "W01")
+        self.assertAlmostEqual(samples[0].model_vdd_v, .9)
+        self.assertAlmostEqual(samples[0].cell.pu1.vt, .380)
+        self.assertAlmostEqual(samples[0].cell.pu1.ids, 45.0)
+        self.assertAlmostEqual(samples[0].cell.pd2.ids, 125.0)
+
+    def test_excel_wide_form_and_gui_state(self):
+        headers = ["Lot/Wafer", "Model VDD (V)", "PUL Vt (mV)", "PUL Idsat (uA)",
+                   "PUR Vt (mV)", "PUR Idsat (uA)", "PGL Vt (mV)", "PGL Idsat (uA)",
+                   "PGR Vt (mV)", "PGR Idsat (uA)", "PDL Vt (mV)", "PDL Idsat (uA)",
+                   "PDR Vt (mV)", "PDR Idsat (uA)"]
+        row = ["W02", 1.2, 380, 45, 381, 46, 365, 82, 366, 83, 355, 124, 356, 125]
+        samples = _read_wat_excel_rows(headers, [row], .9)
+        self.assertEqual(len(samples), 1)
+        self.assertAlmostEqual(samples[0].model_vdd_v, 1.2)
+        self.assertAlmostEqual(samples[0].cell.pg2.vt, .366)
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            save_gui_state({"values": {"corner": "W02"}}, state_path)
+            self.assertEqual(load_gui_state(state_path)["values"]["corner"], "W02")
+
+    def test_excel_repeated_wafer_sites_are_aggregated_with_coverage(self):
+        headers = ["Lot/Wafer", "Site", "Model VDD", "MOS", "Vt", "Vt Unit",
+                   "Idsat", "Idsat Unit", "Notes"]
+        rows = []
+        for mos in ("PUL", "PUR", "PGL", "PGR", "PDL", "PDR"):
+            for site in range(1, 18):
+                if site <= 12:
+                    rows.append(["W03", f"S{site:02d}", 1.2, mos,
+                                 0.30 + site * 0.001, "V", 40.0 + site, "uA", "Measured"])
+                else:
+                    rows.append(["W03", f"S{site:02d}", 1.2, mos,
+                                 None, "V", None, "uA", "Unavailable"])
+        sample = _read_wat_excel_rows(headers, rows, .9)[0]
+        stats = sample.statistics["pu1"]
+        self.assertEqual(stats.valid_count, 12)
+        self.assertEqual(stats.total_count, 17)
+        self.assertAlmostEqual(stats.vt_mean, 0.3065)
+        self.assertAlmostEqual(sample.cell.pu1.ids, 46.5)
 
 
 if __name__ == "__main__":
