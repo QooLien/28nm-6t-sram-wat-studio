@@ -1708,8 +1708,11 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
             side_px_x = square["side_v"] / axis_max * plot_w
             side_px_y = square["side_v"] / axis_max * plot_h
             stroke_width = 4 if abs(square["side_v"] - limiting) < 1e-12 else 3
+            state_label = "L0/R1" if square["lobe"] == 1 else "L1/R0"
+            value_label = f'{square["side_mv"]:.1f} mV'
             parts += [f'<rect x="{left:.1f}" y="{top:.1f}" width="{side_px_x:.1f}" height="{side_px_y:.1f}" fill="#EFFAF2" stroke="#34C759" stroke-width="{stroke_width}"/>',
-                      f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2+7:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">{"L0/R1" if square["lobe"] == 1 else "L1/R0"}</text>']
+                      f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2-2:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{state_label}</text>',
+                      f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2+17:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="14" font-weight="700">{value_label}</text>']
             arrow_x = min(left + side_px_x + 16, plot_left + plot_w - 8)
             parts += [f'<path d="M{arrow_x:.1f} {top+3:.1f} V{top+side_px_y-3:.1f} M{arrow_x-5:.1f} {top+3:.1f} H{arrow_x+5:.1f} M{arrow_x-5:.1f} {top+side_px_y-3:.1f} H{arrow_x+5:.1f}" stroke="#34C759" stroke-width="2"/>']
 
@@ -1786,12 +1789,16 @@ def model_vdd_butterfly_svg(entries: list[dict], width: int = 1440) -> str:
         for square in data["read_butterfly"]["squares"]:
             sx, sy = xy(square["x_v"], square["y_v"] + square["side_v"])
             side = square["side_v"] / axis_max * size
-            parts.append(f'<rect x="{sx:.1f}" y="{sy:.1f}" width="{side:.1f}" height="{side:.1f}" fill="#EFFAF2" stroke="#34C759" stroke-width="3"/>')
+            label_y = sy - 7 if square["lobe"] == 1 else sy + side + 15
+            parts += [f'<rect x="{sx:.1f}" y="{sy:.1f}" width="{side:.1f}" height="{side:.1f}" fill="#EFFAF2" stroke="#34C759" stroke-width="3"/>',
+                      f'<text x="{sx+side/2:.1f}" y="{label_y:.1f}" text-anchor="middle" fill="#248A3D" font-size="11" font-weight="700">WAT {square["side_mv"]:.1f} mV</text>']
         if show_target:
             for square in target["read_butterfly"]["squares"]:
                 sx, sy = xy(square["x_v"], square["y_v"] + square["side_v"])
                 side = square["side_v"] / axis_max * size
-                parts.append(f'<rect x="{sx:.1f}" y="{sy:.1f}" width="{side:.1f}" height="{side:.1f}" fill="none" stroke="#FF9500" stroke-width="2.5" stroke-dasharray="6 4"/>')
+                label_y = sy - 20 if square["lobe"] == 1 else sy + side + 28
+                parts += [f'<rect x="{sx:.1f}" y="{sy:.1f}" width="{side:.1f}" height="{side:.1f}" fill="none" stroke="#FF9500" stroke-width="2.5" stroke-dasharray="6 4"/>',
+                          f'<text x="{sx+side/2:.1f}" y="{label_y:.1f}" text-anchor="middle" fill="#C56A00" font-size="11" font-weight="700">Target {square["side_mv"]:.1f} mV</text>']
         parts += [f'<text x="{left+size/2:.1f}" y="{top+size+48}" text-anchor="middle" fill="#1D1D1F" font-size="14">Vin (V)</text>',
                   f'<text x="{x0+16}" y="{top+size/2:.1f}" transform="rotate(-90 {x0+16} {top+size/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="14">Vout (V)</text>']
     parts.append(f'<text x="{width/2}" y="{height-14}" text-anchor="middle" fill="#6E6E73" font-size="14">Each panel is a complete 6T Read butterfly. Vin/Vout axes are fixed at 0 to 1.20 V.</text></svg>')

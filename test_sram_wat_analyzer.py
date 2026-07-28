@@ -6,7 +6,8 @@ from pathlib import Path
 from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, MosWat, SixTWatCell, Sram6T, ThreeTWatCell,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, generic_28nm_assumption_rows, load_gui_state, read_wat_csv,
+    _read_wat_excel_rows, generic_28nm_assumption_rows, load_gui_state,
+    model_vdd_butterfly_svg, read_wat_csv,
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_outputs,
 )
@@ -133,6 +134,9 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("cell RSNM is the smaller value", butterfly_svg)
             self.assertIn("L0/R1", butterfly_svg)
             self.assertIn("L1/R0", butterfly_svg)
+            for dataset in (result["baseline_6t"], result["target_6t"]):
+                for square in dataset["read_butterfly"]["squares"]:
+                    self.assertIn(f'>{square["side_mv"]:.1f} mV</text>', butterfly_svg)
             self.assertIn("Vin (V)", butterfly_svg)
             self.assertIn("Vout (V)", butterfly_svg)
             self.assertIn("1.20", butterfly_svg)
@@ -174,6 +178,14 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual([row["mode"] for row in rows], ["Read SNM", "Write SNM Proxy"])
             self.assertIn("lot_wafer_snm_mv", rows[0])
             self.assertNotIn("current_snm_mv", rows[0])
+
+            sweep_svg = model_vdd_butterfly_svg([
+                {"model_vdd_v": self.cfg.nominal_vdd, "result": result}
+            ])
+            measured_square = result["baseline_6t"]["read_butterfly"]["squares"][0]
+            target_square = result["target_6t"]["read_butterfly"]["squares"][0]
+            self.assertIn(f'WAT {measured_square["side_mv"]:.1f} mV', sweep_svg)
+            self.assertIn(f'Target {target_square["side_mv"]:.1f} mV', sweep_svg)
 
     def test_wat_electrical_snm_table_uses_measured_inputs(self):
         result = analyze_three_mos(self.cell, self.cfg, self.targets)
