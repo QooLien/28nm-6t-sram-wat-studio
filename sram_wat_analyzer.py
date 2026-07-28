@@ -281,6 +281,112 @@ class Device:
         return 0.5 * self.beta * vov * vov
 
 
+def _inverse_vtc(curve: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Return y=f^-1(x) on the original x grid for a decreasing VTC."""
+    xs = [point[0] for point in curve]
+    ys = [point[1] for point in curve]
+    reversed_ys = list(reversed(ys))
+
+    def inverse_y(x_value: float) -> float:
+        index = bisect_left(reversed_ys, x_value)
+        if index <= 0:
+            return xs[-1]
+        if index >= len(reversed_ys):
+            return xs[0]
+        y0, y1 = reversed_ys[index - 1], reversed_ys[index]
+        x0, x1 = xs[-index], xs[-index - 1]
+        if abs(y1 - y0) < 1e-15:
+            return (x0 + x1) / 2.0
+        return x0 + (x_value - y0) * (x1 - x0) / (y1 - y0)
+
+    return [(x_value, inverse_y(x_value)) for x_value in xs]
+
+
+def _fit_butterfly_squares(direct_curve: list[tuple[float, float]],
+                            mirrored_curve: list[tuple[float, float]],
+                            vdd: float, mode: str) -> dict:
+    """Fit independent maximum squares between two VTCs on a shared Vin grid."""
+    if len(direct_curve) != len(mirrored_curve) or len(direct_curve) < 21 or vdd <= 0:
+        return {"valid": False, "reason": "VDD must be positive and matched curves need >= 21 points",
+                "snm_v": None, "snm_mv": None, "squares": []}
+    xs = [point[0] for point in direct_curve]
+    if any(abs(x - mirrored_curve[index][0]) > 1e-12 for index, x in enumerate(xs)):
+        return {"valid": False, "reason": "Direct and mirrored VTC grids do not match",
+                "snm_v": None, "snm_mv": None, "squares": []}
+    bounds = [(x, min(direct_curve[index][1], mirrored_curve[index][1]),
+               max(direct_curve[index][1], mirrored_curve[index][1]))
+              for index, x in enumerate(xs)]
+
+    # The central VTC crossing is the metastable boundary between the two eyes.
+    differences = [direct_curve[index][1] - mirrored_curve[index][1]
+                   for index in range(len(xs))]
+    crossing_candidates = []
+    for index in range(len(xs) - 1):
+        d0, d1 = differences[index], differences[index + 1]
+        if d0 == 0:
+            crossing_candidates.append(xs[index])
+        elif d0 * d1 < 0:
+            fraction = abs(d0) / (abs(d0) + abs(d1))
+            crossing_candidates.append(xs[index] + fraction * (xs[index + 1] - xs[index]))
+    crossing = (min(crossing_candidates, key=lambda value: abs(value - vdd / 2.0))
+                if crossing_candidates else
+                xs[min(range(len(xs)), key=lambda index: abs(differences[index]))])
+    split = min(range(len(xs)), key=lambda index: abs(xs[index] - crossing))
+
+    states = (("upper_left", "Left node=0 / Right node=1"),
+              ("lower_right", "Left node=1 / Right node=0"))
+    squares = []
+    for lobe, ((start, stop), (state_key, state_label)) in enumerate(
+            zip(((0, split), (split, len(xs) - 1)), states), 1):
+        best_side = 0.0
+        best_position = None
+        for left_index in range(start, stop + 1):
+            minimum_upper = math.inf
+            maximum_lower = -math.inf
+            for right_index in range(left_index, stop + 1):
+                minimum_upper = min(minimum_upper, bounds[right_index][2])
+                maximum_lower = max(maximum_lower, bounds[right_index][1])
+                side = xs[right_index] - xs[left_index]
+                clearance = minimum_upper - maximum_lower
+                if side <= clearance + 1e-12:
+                    if side > best_side:
+                        y0 = maximum_lower + max(0.0, clearance - side) / 2.0
+                        best_side = side
+                        best_position = (xs[left_index], y0)
+                elif right_index > left_index:
+                    break
+        if best_position is None:
+            return {"valid": False, "reason": f"No square found in lobe {lobe}",
+                    "snm_v": None, "snm_mv": None, "squares": squares}
+        squares.append({"lobe": lobe, "state_key": state_key, "state": state_label,
+                        "x_v": best_position[0], "y_v": best_position[1],
+                        "side_v": best_side, "side_mv": 1000.0 * best_side})
+
+    upper_v, lower_v = squares[0]["side_v"], squares[1]["side_v"]
+    mean_v = (upper_v + lower_v) / 2.0
+    delta_v = upper_v - lower_v
+    snm_v = min(upper_v, lower_v)
+    return {
+        "valid": True,
+        "reason": "Independent two-eye maximum-square fit",
+        "definition": "Cell Read SNM is the smaller of the two state-dependent square sides",
+        "mode": mode,
+        "grid_points": len(xs),
+        "crossing_v": crossing,
+        "trip_v": crossing,
+        "snm_v": snm_v,
+        "snm_mv": 1000.0 * snm_v,
+        "snm_upper_left_v": upper_v,
+        "snm_upper_left_mv": 1000.0 * upper_v,
+        "snm_lower_right_v": lower_v,
+        "snm_lower_right_mv": 1000.0 * lower_v,
+        "delta_snm_v": delta_v,
+        "delta_snm_mv": 1000.0 * delta_v,
+        "mismatch_index_pct": (abs(delta_v) / mean_v * 100.0 if mean_v > 0 else None),
+        "squares": squares,
+    }
+
+
 class Sram6T:
     def __init__(self, wat: WatPoint, cfg: Config):
         self.wat, self.cfg = wat, cfg
@@ -385,73 +491,12 @@ class Sram6T:
 
     def butterfly_squares(self, vdd: float, mode: str = "read",
                           points: int = 1201) -> dict:
-        """Numerically fit the largest axis-aligned square in each VTC lobe.
-
-        This implements the graphical definition illustrated by Figure 3.15(b):
-        determine the largest square in each butterfly eye and use the smaller
-        side as SNM.  The mirrored VTC is obtained by exchanging x and y.
-        """
+        """Fit the two squares of a symmetric cell from one VTC and its inverse."""
         if vdd <= 0 or points < 21:
             return {"valid": False, "reason": "VDD must be positive and points >= 21",
                     "snm_v": None, "snm_mv": None, "squares": []}
         curve = self.vtc(vdd, mode, points)
-        xs = [point[0] for point in curve]
-        ys = [point[1] for point in curve]
-        reversed_ys = list(reversed(ys))
-
-        def inverse_y(x_value: float) -> float:
-            """Piecewise-linear inverse of a monotonic non-increasing VTC."""
-            index = bisect_left(reversed_ys, x_value)
-            if index <= 0:
-                return xs[-1]
-            if index >= len(reversed_ys):
-                return xs[0]
-            y0, y1 = reversed_ys[index - 1], reversed_ys[index]
-            x0, x1 = xs[-index], xs[-index - 1]
-            if abs(y1 - y0) < 1e-15:
-                return (x0 + x1) / 2.0
-            return x0 + (x_value - y0) * (x1 - x0) / (y1 - y0)
-
-        bounds = []
-        for x_value, direct_y in curve:
-            mirrored_y = inverse_y(x_value)
-            bounds.append((x_value, min(direct_y, mirrored_y),
-                           max(direct_y, mirrored_y)))
-
-        trip = self.trip_point(vdd, mode)
-        split = min(range(points), key=lambda index: abs(xs[index] - trip))
-        squares = []
-        for lobe, (start, stop) in enumerate(((0, split), (split, points - 1)), 1):
-            best_side = 0.0
-            best_position = None
-            for left_index in range(start, stop + 1):
-                minimum_upper = math.inf
-                maximum_lower = -math.inf
-                for right_index in range(left_index, stop + 1):
-                    minimum_upper = min(minimum_upper, bounds[right_index][2])
-                    maximum_lower = max(maximum_lower, bounds[right_index][1])
-                    side = xs[right_index] - xs[left_index]
-                    clearance = minimum_upper - maximum_lower
-                    if side <= clearance + 1e-12:
-                        if side > best_side:
-                            y0 = maximum_lower + max(0.0, clearance - side) / 2.0
-                            best_side = side
-                            best_position = (xs[left_index], y0)
-                    elif right_index > left_index:
-                        break
-            if best_position is None:
-                return {"valid": False, "reason": f"No square found in lobe {lobe}",
-                        "snm_v": None, "snm_mv": None, "squares": squares}
-            squares.append({"lobe": lobe, "x_v": best_position[0],
-                            "y_v": best_position[1], "side_v": best_side,
-                            "side_mv": 1000.0 * best_side})
-
-        snm_v = min(square["side_v"] for square in squares)
-        return {"valid": True, "reason": "Two-lobe maximum-square fit",
-                "definition": "Figure 3.15(b): smaller side of squares 1 and 2",
-                "mode": mode, "grid_points": points, "trip_v": trip,
-                "snm_v": snm_v, "snm_mv": 1000.0 * snm_v,
-                "squares": squares}
+        return _fit_butterfly_squares(curve, _inverse_vtc(curve), vdd, mode)
 
     def analytical_read_snm_eq_3_36(self, vdd: float) -> dict:
         """Evaluate the 6T read-SNM expression from Section 3.4.2, Eq. 3.36.
@@ -623,6 +668,34 @@ class Sram6T:
         return None
 
 
+class AsymmetricSram6T:
+    """Cross-coupled Read-SNM model retaining all six independent WAT objects."""
+
+    def __init__(self, cell: SixTWatCell, cfg: Config):
+        self.cell = cell
+        self.cfg = cfg
+        self.left = Sram6T(cell.side(1), cfg)   # PUL / PGL / PDL
+        self.right = Sram6T(cell.side(2), cfg)  # PUR / PGR / PDR
+
+    def read_butterfly(self, vdd: float, points: int = 1201) -> dict:
+        # Plot coordinates are (left storage node, right storage node).
+        # The right inverter directly gives y=f_right(x).  The left inverter
+        # gives x=f_left(y), therefore its inverse is the second curve y(x).
+        direct_fit = self.right.vtc(vdd, "read", points)
+        mirrored_fit = _inverse_vtc(self.left.vtc(vdd, "read", points))
+        fitted = _fit_butterfly_squares(direct_fit, mirrored_fit, vdd, "read")
+        fitted["coordinate_definition"] = {
+            "x": "left storage-node voltage (PUL/PGL/PDL side)",
+            "y": "right storage-node voltage (PUR/PGR/PDR side)",
+            "direct_vtc": "right inverter: y=f_right(x)",
+            "mirrored_vtc": "inverse left inverter: y=f_left^-1(x)",
+        }
+        direct_plot = self.right.vtc(vdd, "read", 201)
+        mirrored_plot = _inverse_vtc(self.left.vtc(vdd, "read", 201))
+        return {"read_butterfly": fitted, "read_vtc": direct_plot,
+                "read_vtc_mirrored": mirrored_plot}
+
+
 class WtZeroBitVminTest:
     """Object-oriented WT 0-bit Vmin flow for one mismatched 6T bitcell."""
 
@@ -775,10 +848,12 @@ def analyze(wat: WatPoint, cfg: Config) -> dict:
     square_points = max(1201, cfg.grid_points)
     read_butterfly = model.butterfly_squares(cfg.nominal_vdd, "read", square_points)
     write_low_vtc, write_high_vtc = model.write_vtc_pair(cfg.nominal_vdd, 201)
+    read_vtc = model.vtc(cfg.nominal_vdd, "read", 201)
     baseline = {"metrics": metric(model, cfg, read_butterfly),
                 "analytical_read_snm_eq_3_36": model.analytical_read_snm_eq_3_36(cfg.nominal_vdd),
                 "read_butterfly": read_butterfly,
-                "read_vtc": model.vtc(cfg.nominal_vdd, "read", 201),
+                "read_vtc": read_vtc,
+                "read_vtc_mirrored": _inverse_vtc(read_vtc),
                 "write_vtc_low": write_low_vtc,
                 "write_vtc_high": write_high_vtc,
                 "read_trip_v": model.trip_point(cfg.nominal_vdd, "read")}
@@ -1347,10 +1422,28 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
         "corner": cell.corner,
         "mos": {DISPLAY_MOS_NAMES[name]: asdict(getattr(cell, name))
                 for name in ("pu1","pu2","pg1","pg2","pd1","pd2")},
-        "method": "two half-cell compact models; report uses the lower Read SNM",
+        "method": "asymmetric cross-coupled 6T Read butterfly; cell RSNM uses the smaller state margin",
     }
-    baseline = cell_metric(cell, cfg)
-    result["cell"]["baseline_metrics"] = baseline
+    half_cell = cell_metric(cell, cfg)
+    asymmetric = AsymmetricSram6T(cell, cfg).read_butterfly(
+        cfg.nominal_vdd, max(1201, cfg.grid_points))
+    baseline = result["baseline_6t"]
+    baseline.update(asymmetric)
+    butterfly = asymmetric["read_butterfly"]
+    baseline["metrics"].update({
+        "read_snm_mv": butterfly["snm_mv"],
+        "read_snm_upper_left_mv": butterfly["snm_upper_left_mv"],
+        "read_snm_lower_right_mv": butterfly["snm_lower_right_mv"],
+        "read_snm_delta_mv": butterfly["delta_snm_mv"],
+        "read_snm_mismatch_index_pct": butterfly["mismatch_index_pct"],
+        "write_snm_proxy_mv": half_cell["write_snm_proxy_mv"],
+        "cell_ratio_beta": half_cell["cell_ratio_beta"],
+        "pull_up_ratio_beta": half_cell["pull_up_ratio_beta"],
+        "cell_ratio_ids_proxy": half_cell["cell_ratio_ids_proxy"],
+        "pull_up_ratio_ids_proxy": half_cell["pull_up_ratio_ids_proxy"],
+    })
+    result["cell"]["baseline_metrics"] = baseline["metrics"]
+    result["cell"]["read_snm_state_definition"] = butterfly["coordinate_definition"]
     result["datasheet_targets"] = asdict(datasheet_targets) if datasheet_targets else None
     result["target_comparisons"] = _target_comparisons(cell, datasheet_targets)
     _attach_target_model(result, datasheet_targets, cfg)
@@ -1400,6 +1493,15 @@ def validate_config(cfg: Config) -> None:
 COLORS = ["#111827", "#2563eb", "#dc2626", "#7c3aed", "#059669"]
 # Chart-only scale. This does not alter the electrical VDD used by the model.
 SNM_PLOT_AXIS_MAX_V = 1.20
+
+
+def _read_vtc_pair(data: dict) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Return both curves in common (Vin, Vout) plot coordinates."""
+    direct = data["read_vtc"]
+    mirrored = data.get("read_vtc_mirrored")
+    if mirrored is None:
+        mirrored = _inverse_vtc(direct)
+    return direct, mirrored
 
 
 def _fmt(value: float | None, digits: int = 3) -> str:
@@ -1486,9 +1588,9 @@ def snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
             f'<text x="{plot_left-12}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
         ]
     for data, color in ((current, "#007AFF"), (target, "#FF9500")):
-        curve = data["read_vtc"]
-        direct = " ".join(f'{xy(vin,vout)[0]:.1f},{xy(vin,vout)[1]:.1f}' for vin, vout in curve)
-        mirrored = " ".join(f'{xy(vout,vin)[0]:.1f},{xy(vout,vin)[1]:.1f}' for vin, vout in curve)
+        direct_curve, mirrored_curve = _read_vtc_pair(data)
+        direct = " ".join(f'{xy(vin,vout)[0]:.1f},{xy(vin,vout)[1]:.1f}' for vin, vout in direct_curve)
+        mirrored = " ".join(f'{xy(vin,vout)[0]:.1f},{xy(vin,vout)[1]:.1f}' for vin, vout in mirrored_curve)
         parts += [f'<polyline points="{direct}" fill="none" stroke="{color}" stroke-width="4"/>',
                   f'<polyline points="{mirrored}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="10 7" opacity=".9"/>']
     analytical_current = analytical.get("current_snm_mv")
@@ -1572,10 +1674,10 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Read SNM butterfly maximum squares" style="font-family:Calibri,Arial,sans-serif">',
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
         '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Read SNM Butterfly Analysis</text>',
-        '<path d="M54 82 h34" stroke="#3A3A3C" stroke-width="4"/><text x="98" y="88" fill="#3A3A3C" font-size="17">Inverter VTC</text>',
-        '<path d="M260 82 h34" stroke="#3A3A3C" stroke-width="4" stroke-dasharray="10 7"/><text x="304" y="88" fill="#3A3A3C" font-size="17">Mirrored VTC</text>',
-        '<rect x="506" y="68" width="24" height="24" fill="none" stroke="#34C759" stroke-width="3"/><text x="542" y="88" fill="#3A3A3C" font-size="17">Maximum squares 1 and 2</text>',
-        '<text x="888" y="88" fill="#5856D6" font-size="17">Analytical RSNM shown as an independent reference</text>',
+        '<path d="M54 82 h34" stroke="#3A3A3C" stroke-width="4"/><text x="98" y="88" fill="#3A3A3C" font-size="17">Right inverter VTC</text>',
+        '<path d="M285 82 h34" stroke="#3A3A3C" stroke-width="4" stroke-dasharray="10 7"/><text x="329" y="88" fill="#3A3A3C" font-size="17">Inverse left inverter VTC</text>',
+        '<rect x="600" y="68" width="24" height="24" fill="none" stroke="#34C759" stroke-width="3"/><text x="636" y="88" fill="#3A3A3C" font-size="17">Maximum squares 1 and 2</text>',
+        '<text x="970" y="88" fill="#5856D6" font-size="17">Analytical RSNM shown as an independent reference</text>',
     ]
     for index, (title, data, color, analytical_value) in enumerate(panels):
         x0 = margin_x + index * (panel_w + gap)
@@ -1593,9 +1695,9 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
             parts += [f'<path d="M{px:.1f} {plot_top} V{plot_top+plot_h} M{plot_left} {py:.1f} H{plot_left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
                       f'<text x="{px:.1f}" y="{plot_top+plot_h+26}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
                       f'<text x="{plot_left-10}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>']
-        curve = data["read_vtc"]
-        direct = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in curve)
-        mirrored = " ".join(f'{xy(y,x)[0]:.1f},{xy(y,x)[1]:.1f}' for x, y in curve)
+        direct_curve, mirrored_curve = _read_vtc_pair(data)
+        direct = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in direct_curve)
+        mirrored = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in mirrored_curve)
         parts += [f'<polyline points="{direct}" fill="none" stroke="{color}" stroke-width="4"/>',
                   f'<polyline points="{mirrored}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="10 7"/>']
 
@@ -1607,15 +1709,20 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
             side_px_y = square["side_v"] / axis_max * plot_h
             stroke_width = 4 if abs(square["side_v"] - limiting) < 1e-12 else 3
             parts += [f'<rect x="{left:.1f}" y="{top:.1f}" width="{side_px_x:.1f}" height="{side_px_y:.1f}" fill="#EFFAF2" stroke="#34C759" stroke-width="{stroke_width}"/>',
-                      f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2+7:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">{square["lobe"]}</text>']
+                      f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2+7:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">{"L0/R1" if square["lobe"] == 1 else "L1/R0"}</text>']
             arrow_x = min(left + side_px_x + 16, plot_left + plot_w - 8)
             parts += [f'<path d="M{arrow_x:.1f} {top+3:.1f} V{top+side_px_y-3:.1f} M{arrow_x-5:.1f} {top+3:.1f} H{arrow_x+5:.1f} M{arrow_x-5:.1f} {top+side_px_y-3:.1f} H{arrow_x+5:.1f}" stroke="#34C759" stroke-width="2"/>']
 
         eq_text = f'Analytical RSNM {analytical_value:.1f} mV' if analytical_value is not None else 'Analytical RSNM N/A'
-        parts += [f'<text x="{x0+panel_w:.1f}" y="{plot_top+plot_h+60}" text-anchor="end" fill="#5856D6" font-size="17" font-weight="700">{eq_text}</text>',
+        butterfly = data["read_butterfly"]
+        state_text = (f'Upper {butterfly.get("snm_upper_left_mv", squares[0]["side_mv"]):.1f} mV · '
+                      f'Lower {butterfly.get("snm_lower_right_mv", squares[1]["side_mv"]):.1f} mV · '
+                      f'Asymmetry {_fmt(butterfly.get("mismatch_index_pct"), 1)}%')
+        parts += [f'<text x="{x0:.1f}" y="{plot_top+plot_h+60}" fill="#3A3A3C" font-size="15" font-weight="700">{state_text}</text>',
+                  f'<text x="{x0+panel_w:.1f}" y="{plot_top+plot_h+82}" text-anchor="end" fill="#5856D6" font-size="16" font-weight="700">{eq_text}</text>',
                   f'<text x="{plot_left+plot_w/2:.1f}" y="{height-62}" text-anchor="middle" fill="#1D1D1F" font-size="18">Vin (V)</text>',
                   f'<text x="{x0+45:.1f}" y="{plot_top+plot_h/2:.1f}" transform="rotate(-90 {x0+45:.1f} {plot_top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="18">Vout (V)</text>']
-    parts.append(f'<text x="720" y="{height-14}" text-anchor="middle" fill="#6E6E73" font-size="15">RSNM is the smaller side of squares 1 and 2. Read bias uses the configured WL and BL/BLB levels.</text></svg>')
+    parts.append(f'<text x="720" y="{height-14}" text-anchor="middle" fill="#6E6E73" font-size="15">Upper and lower margins represent opposite stored states; cell RSNM is the smaller value.</text></svg>')
     return "".join(parts)
 
 
@@ -1665,15 +1772,15 @@ def model_vdd_butterfly_svg(entries: list[dict], width: int = 1440) -> str:
             parts += [f'<path d="M{px:.1f} {top} V{top+size} M{left} {py:.1f} H{left+size}" stroke="#E5E5EA" stroke-width="1"/>',
                       f'<text x="{px:.1f}" y="{top+size+19}" text-anchor="middle" fill="#6E6E73" font-size="12">{voltage:.2f}</text>',
                       f'<text x="{left-7}" y="{py+4:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{voltage:.2f}</text>']
-        curve = data["read_vtc"]
-        direct = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in curve)
-        mirrored = " ".join(f"{xy(y, x)[0]:.1f},{xy(y, x)[1]:.1f}" for x, y in curve)
+        direct_curve, mirrored_curve = _read_vtc_pair(data)
+        direct = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in direct_curve)
+        mirrored = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in mirrored_curve)
         parts += [f'<polyline points="{direct}" fill="none" stroke="#007AFF" stroke-width="3"/>',
                   f'<polyline points="{mirrored}" fill="none" stroke="#007AFF" stroke-width="3" stroke-dasharray="8 5"/>']
         if show_target:
-            target_curve = target["read_vtc"]
-            target_direct = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in target_curve)
-            target_mirrored = " ".join(f"{xy(y, x)[0]:.1f},{xy(y, x)[1]:.1f}" for x, y in target_curve)
+            target_direct_curve, target_mirrored_curve = _read_vtc_pair(target)
+            target_direct = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in target_direct_curve)
+            target_mirrored = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in target_mirrored_curve)
             parts += [f'<polyline points="{target_direct}" fill="none" stroke="#FF9500" stroke-width="2.5"/>',
                       f'<polyline points="{target_mirrored}" fill="none" stroke="#FF9500" stroke-width="2.5" stroke-dasharray="8 5"/>']
         for square in data["read_butterfly"]["squares"]:
@@ -1721,13 +1828,11 @@ def all_model_vdd_butterfly_overlay_svg(entries: list[dict], width: int = 1440, 
         data = entry["result"]["baseline_6t"]
         target = entry["result"].get("target_6t", data)
         show_target = bool(entry["result"].get("datasheet_targets"))
-        curve = data["read_vtc"]
-        for points in (curve, [(y, x) for x, y in curve]):
+        for points in _read_vtc_pair(data):
             path = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in points)
             parts.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="3.5" opacity="0.88"/>')
         if show_target:
-            target_curve = target["read_vtc"]
-            for points in (target_curve, [(y, x) for x, y in target_curve]):
+            for points in _read_vtc_pair(target):
                 path = " ".join(f"{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}" for x, y in points)
                 parts.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="2.5" stroke-dasharray="10 7" opacity="0.88"/>')
         y_pos = legend_y + index * 64
@@ -2391,6 +2496,26 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         writer = csv.DictWriter(target_file, fieldnames=list(comparison_export_rows[0]))
         writer.writeheader(); writer.writerows(comparison_export_rows)
 
+    state_rows = []
+    for label, data in (("Lot/Wafer", result["baseline_6t"]),
+                        ("WAT Target", result.get("target_6t", result["baseline_6t"]))):
+        butterfly = data["read_butterfly"]
+        squares = butterfly["squares"]
+        upper = butterfly.get("snm_upper_left_mv", squares[0]["side_mv"])
+        lower = butterfly.get("snm_lower_right_mv", squares[1]["side_mv"])
+        mean = (upper + lower) / 2.0
+        state_rows.append({
+            "dataset": label,
+            "upper_left_state_snm_mv": upper,
+            "lower_right_state_snm_mv": lower,
+            "cell_read_snm_min_mv": min(upper, lower),
+            "upper_minus_lower_mv": upper - lower,
+            "mismatch_index_pct": abs(upper - lower) / mean * 100.0 if mean > 0 else None,
+        })
+    with open(out / "read_snm_state_mismatch.csv", "w", newline="", encoding="utf-8-sig") as state_file:
+        writer = csv.DictWriter(state_file, fieldnames=list(state_rows[0]))
+        writer.writeheader(); writer.writerows(state_rows)
+
     analytical = result.get("analytical_read_snm_comparison", {})
     analytical_rows = []
     for dataset in ("current", "target"):
@@ -2465,6 +2590,11 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         f'<tr><td>{row["mode"]}</td><td>{row["current_snm_mv"]:.2f}</td>'
         f'<td>{row["target_snm_mv"]:.2f}</td><td>{row["delta_mv"]:+.2f}</td>'
         f'<td>{_fmt(row["delta_pct"], 2)}%</td></tr>' for row in comparison_rows)
+    state_table_rows = "".join(
+        f'<tr><td>{row["dataset"]}</td><td>{row["upper_left_state_snm_mv"]:.2f}</td>'
+        f'<td>{row["lower_right_state_snm_mv"]:.2f}</td><td>{row["cell_read_snm_min_mv"]:.2f}</td>'
+        f'<td>{row["upper_minus_lower_mv"]:+.2f}</td><td>{_fmt(row["mismatch_index_pct"], 2)}%</td></tr>'
+        for row in state_rows)
     analytical_table_rows = "".join(
         f'<tr><td>{row["dataset"]}</td><td>{"VALID" if row["valid"] else "N/A"}</td>'
         f'<td>{_fmt(row["snm_mv"], 2)}</td><td>{_fmt(row["vth_eff_v"], 4)}</td>'
@@ -2523,8 +2653,9 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     <section><h2>Read SNM Target Comparison</h2><p>The plotted curves use the WAT-calibrated compact VTC model. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V. Limiting squares are not drawn in this comparison view.</p>
     <img src="images/{png_name}" alt="Read SNM Lot/Wafer WAT versus WAT Target comparison">
     <table><thead><tr><th>Mode</th><th>Lot/Wafer SNM (mV)</th><th>WAT Target SNM (mV)</th><th>Lot/Wafer − WAT Target (mV)</th><th>Difference (%)</th></tr></thead><tbody>{snm_rows}</tbody></table></section>
-    <section><h2>Read SNM Butterfly Analysis</h2><p>Squares 1 and 2 are fitted independently into the two read-accessed butterfly lobes. The reported geometric RSNM is the smaller square side. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V.</p>
-    <img src="images/{butterfly_png_name}" alt="Read SNM butterfly with two maximum squares"></section>
+    <section><h2>Read SNM Butterfly and Left/Right Mismatch</h2><p>The measured 6T model keeps PUL/PGL/PDL and PUR/PGR/PDR independent. The upper-left and lower-right eyes represent opposite stored states. Cell RSNM is the smaller state margin; a larger difference or mismatch index indicates stronger left/right imbalance. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V.</p>
+    <img src="images/{butterfly_png_name}" alt="Asymmetric Read SNM butterfly with two state margins">
+    <table><thead><tr><th>Dataset</th><th>Upper-left state SNM (mV)</th><th>Lower-right state SNM (mV)</th><th>Cell RSNM = min (mV)</th><th>Upper - Lower (mV)</th><th>Mismatch index</th></tr></thead><tbody>{state_table_rows}</tbody></table></section>
     <section><h2>Write SNM Target Comparison</h2><p>Write condition uses the configured WL, a low write bitline and a high complementary bitline. The two VTCs are intentionally asymmetric. Vin and Vout axes are fixed at 0 to 1.20 V. Write SNM is reported as the maximum tolerated rise on the nominally-low write bitline while the access device can still overcome the pull-up device; it is a WAT-calibrated write-margin proxy, not a geometric butterfly-square or sign-off WSNM.</p>
     <img src="images/{write_png_name}" alt="Write SNM target comparison"></section>
     {electrical_snm_section}
@@ -2533,7 +2664,7 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     {target_section}
     <section><h2>Model Settings</h2><table><tbody><tr><td>Technology node</td><td>28 nm generic compact model</td></tr><tr><td>SRAM analysis VDD</td><td>{cfg["nominal_vdd"]:.3f} V</td></tr><tr><td>WAT calibration VDD</td><td>{cfg["wat_vdd"]:.3f} V</td></tr></tbody></table></section>
     {object_section}
-    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>generic_28nm_assumptions.csv</code>, <code>analytical_read_snm.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/{png_name}</code>, <code>images/{butterfly_png_name}</code> and <code>images/{write_png_name}</code>.</p>
+    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>read_snm_state_mismatch.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>generic_28nm_assumptions.csv</code>, <code>analytical_read_snm.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/{png_name}</code>, <code>images/{butterfly_png_name}</code> and <code>images/{write_png_name}</code>.</p>
     </main></body></html>'''
     report = out / "sram_wat_report.html"
     report.write_text(document, encoding="utf-8")
@@ -2582,6 +2713,10 @@ def write_excel_sweep_outputs(entries: list[dict], out_dir: str | os.PathLike[st
         rows.append({
             "lot_wafer": item["lot_wafer"], "model_vdd_v": item["model_vdd_v"],
             "read_snm_mv": read_snm,
+            "read_snm_upper_left_mv": metrics.get("read_snm_upper_left_mv"),
+            "read_snm_lower_right_mv": metrics.get("read_snm_lower_right_mv"),
+            "read_snm_state_delta_mv": metrics.get("read_snm_delta_mv"),
+            "read_snm_mismatch_index_pct": metrics.get("read_snm_mismatch_index_pct"),
             "target_read_snm_mv": target_read_snm,
             "read_snm_delta_mv": (read_snm - target_read_snm
                                   if read_snm is not None and target_read_snm is not None else None),
@@ -2623,7 +2758,9 @@ def write_excel_sweep_outputs(entries: list[dict], out_dir: str | os.PathLike[st
         writer = csv.DictWriter(file, fieldnames=list(manifest_rows[0])); writer.writeheader(); writer.writerows(manifest_rows)
     table_rows = "".join(
         f'<tr><td>{html.escape(row["lot_wafer"])}</td><td>{row["model_vdd_v"]:.3f}</td>'
-        f'<td>{_fmt(row["read_snm_mv"], 2)}</td><td>{_fmt(row["target_read_snm_mv"], 2)}</td><td>{_fmt(row["read_snm_delta_mv"], 2)}</td>'
+        f'<td>{_fmt(row["read_snm_upper_left_mv"], 2)}</td><td>{_fmt(row["read_snm_lower_right_mv"], 2)}</td>'
+        f'<td>{_fmt(row["read_snm_mv"], 2)}</td><td>{_fmt(row["read_snm_state_delta_mv"], 2)}</td>'
+        f'<td>{_fmt(row["read_snm_mismatch_index_pct"], 2)}</td><td>{_fmt(row["target_read_snm_mv"], 2)}</td><td>{_fmt(row["read_snm_delta_mv"], 2)}</td>'
         f'<td>{_fmt(row["write_snm_proxy_mv"], 2)}</td><td>{_fmt(row["target_write_snm_proxy_mv"], 2)}</td>'
         f'<td>{_fmt(row["analytical_read_snm_mv"], 2)}</td><td>{html.escape(row["analysis_status"])}</td></tr>' for row in rows)
     statistics_table_rows = "".join(
@@ -2642,7 +2779,7 @@ def write_excel_sweep_outputs(entries: list[dict], out_dir: str | os.PathLike[st
     <section><h2>Read SNM Butterfly by Operating VDD</h2><p>Each panel compares measured-WAT and WAT-target VTCs, mirrored VTCs and SNM squares under the same operating voltage. Vin/Vout axes are fixed at 0 to 1.20 V.</p><img src="images/04_model_vdd_read_snm_butterfly.png" alt="Measured and target Read SNM butterflies by model VDD"></section>
     <section><h2>Independent SNM Trend</h2><p>Measured and target Read SNM / Write SNM proxy are plotted against imported model VDD.</p><img src="images/05_snm_vs_model_vdd.png" alt="Measured and target SNM versus model VDD"></section>
     <section><h2>All Operating Voltages Overlay</h2><p>All analyzed VDD butterfly curves are integrated in one Vin/Vout plot. Curve color identifies operating VDD; solid lines are measured WAT and dashed lines are WAT Target.</p><img src="images/06_all_vdd_read_snm_overlay.png" alt="All operating VDD Read SNM butterfly overlay"></section>
-    <section><h2>Model-VDD Results</h2><table><thead><tr><th>Lot/Wafer</th><th>Model VDD (V)</th><th>WAT RSNM (mV)</th><th>Target RSNM (mV)</th><th>Δ RSNM (mV)</th><th>WAT Write Proxy (mV)</th><th>Target Write Proxy (mV)</th><th>Analytical RSNM (mV)</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table></section>
+    <section><h2>Model-VDD Results</h2><table><thead><tr><th>Lot/Wafer</th><th>Model VDD (V)</th><th>Upper-left RSNM (mV)</th><th>Lower-right RSNM (mV)</th><th>Cell RSNM (mV)</th><th>State delta (mV)</th><th>Mismatch (%)</th><th>Target RSNM (mV)</th><th>WAT - Target (mV)</th><th>WAT Write Proxy (mV)</th><th>Target Write Proxy (mV)</th><th>Analytical RSNM (mV)</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table></section>
     {statistics_section}
     <p class="note">Raw results: <code>excel_model_vdd_snm.csv</code> and <code>excel_wat_site_statistics.csv</code>; images: <code>images/04_model_vdd_read_snm_butterfly.png</code>, <code>images/05_snm_vs_model_vdd.png</code> and <code>images/06_all_vdd_read_snm_overlay.png</code>.</p></main></body></html>'''
     report = out / "excel_wat_sweep_report.html"

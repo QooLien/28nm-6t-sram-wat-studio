@@ -7,6 +7,7 @@ The active workflow is focused on:
 - Read SNM and write-condition SNM proxy
 - Lot/Wafer WAT versus WAT Target VTC comparison
 - Read butterfly maximum-square extraction
+- Independent upper-left / lower-right Read-SNM mismatch analysis
 - Independent analytical Read SNM cross-check
 - PU / PG / PD Vt and Idsat comparison
 
@@ -34,11 +35,14 @@ All active SNM charts use standard inverter VTC coordinates:
 
 The axes are not normalized ratios. At SRAM VDD = 0.90 V, the center tick is 0.45 V.
 
-The direct inverter VTC is plotted as `(Vin, Vout)`. The mirrored VTC exchanges the coordinates:
+For a symmetric cell, the direct inverter VTC is plotted as `(Vin, Vout)` and the second curve is its inverse. For six independent MOS inputs, the two curves are built separately:
 
 ```text
-(Vin, Vout) -> (Vout, Vin)
+direct:       right inverter, Vright = f_right(Vleft)
+second curve: inverse left inverter, Vright = f_left^-1(Vleft)
 ```
+
+This preserves PUL/PGL/PDL versus PUR/PGR/PDR mismatch instead of averaging the two sides before drawing the butterfly.
 
 The generic Read condition defaults to `WL = BL = BLB = VDD`; the WL/VDD and BL/VDD ratios can be edited in the interface.
 
@@ -61,13 +65,17 @@ The square-law device current is then evaluated with the WAT-calibrated beta pro
 
 ## Geometric Read SNM
 
-The tool numerically constructs the direct and mirrored Read VTC curves, separates the two butterfly lobes, and fits the largest axis-aligned square in each lobe.
+The tool numerically constructs the two cross-coupled Read VTC curves, separates the butterfly eyes, and fits the largest axis-aligned square in each eye. The upper-left and lower-right squares correspond to opposite stored states.
 
 ```text
-Geometric RSNM = min(square 1 side, square 2 side)
+RSNM_upper = upper-left square side
+RSNM_lower = lower-right square side
+Cell RSNM  = min(RSNM_upper, RSNM_lower)
+State delta = RSNM_upper - RSNM_lower
+Mismatch index = |State delta| / mean(RSNM_upper, RSNM_lower) * 100%
 ```
 
-The butterfly SVG uses equal X/Y pixel scale so a voltage square is displayed as a true square.
+An ideal symmetric cell produces nearly equal state margins. A left/right device mismatch can enlarge one eye and shrink the other; the smaller value remains the conservative cell margin. Swapping all left and right MOS inputs swaps the two state margins while preserving Cell RSNM. The butterfly SVG uses equal X/Y pixel scale so a voltage square is displayed as a true square.
 
 ## Analytical Read SNM
 
@@ -99,6 +107,7 @@ Geometry and temperature are documented reference values. They do not override b
 
 - `sram_wat_report.html`: main interactive report
 - `snm_target_comparison.csv`: Read SNM and Write SNM proxy, Lot/Wafer versus WAT Target
+- `read_snm_state_mismatch.csv`: upper-left/lower-right state margins, conservative Cell RSNM, signed delta and mismatch index
 - `wat_electrical_snm_table.csv`: WAT inputs, derived ratios, Read SNM and Write SNM proxy
 - `analytical_read_snm.csv`: analytical Read SNM parameters and result
 - `generic_28nm_assumptions.csv`: default parameter policy and active status
@@ -129,7 +138,7 @@ The GUI can import an `.xlsx` workbook through **Import Excel…** and generate 
 
 Start from `HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx`. It follows the manually organized nine-column format exactly: Lot/Wafer, Site, Model VDD, MOS, Vt, Vt Unit, Idsat, Idsat Unit and Notes. PU, PG and PD use separate worksheets; every physical MOS and Model VDD currently has S01-S12 records. If S13-S17 later become available, append them with the same columns and the loader will include them automatically. The distributed workbook deliberately uses plain formatted ranges with worksheet filters instead of Excel Table objects. This avoids the table-repair warning seen with some older or company-managed Excel installations while preserving sorting and filtering.
 
-For repeated site rows, the loader groups data by Lot/Wafer + Model VDD + physical MOS. The arithmetic mean of valid Vt and Idsat measurements is used as the 6T model input. Actual row count, median, sample standard deviation, minimum and maximum are exported to `excel_wat_site_statistics.csv`. A Model VDD at or below the highest imported MOS Vt remains in the WAT statistics but is reported as SNM N/A.
+For repeated site rows, the loader groups data by Lot/Wafer + Model VDD + physical MOS. The arithmetic mean of valid Vt and Idsat measurements is used for each of the six independent MOS inputs; the left and right sides are not merged. Actual row count, median, sample standard deviation, minimum and maximum are exported to `excel_wat_site_statistics.csv`. The sweep result also exports both state margins and the mismatch index. A Model VDD at or below the highest imported MOS Vt remains in the WAT statistics but is reported as SNM N/A.
 
 Use either of these worksheet formats. Blank unit cells default to V for Vt / model VDD and uA for Idsat. Supported voltage units are V, mV, uV and nV; supported current units are A, mA, uA, nA and pA. A 0 V model-VDD row is retained as input data but omitted from SNM plotting because SNM is undefined at zero supply.
 

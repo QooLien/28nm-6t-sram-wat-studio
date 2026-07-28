@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from sram_wat_analyzer import (
-    Config, DatasheetTargets, MosWat, SixTWatCell, Sram6T, ThreeTWatCell,
+    AsymmetricSram6T, Config, DatasheetTargets, MosWat, SixTWatCell, Sram6T, ThreeTWatCell,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, generic_28nm_assumption_rows, load_gui_state, read_wat_csv,
     save_gui_state,
@@ -75,6 +75,31 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(set(result["cell"]["mos"]), {"PUL", "PUR", "PGL", "PGR", "PDL", "PDR"})
         self.assertEqual(len(result["target_comparisons"]), 6)
         self.assertEqual(len(result["snm_target_comparison"]), 2)
+        metrics = result["baseline_6t"]["metrics"]
+        self.assertIn("read_snm_upper_left_mv", metrics)
+        self.assertIn("read_snm_lower_right_mv", metrics)
+        self.assertAlmostEqual(metrics["read_snm_mv"],
+                               min(metrics["read_snm_upper_left_mv"],
+                                   metrics["read_snm_lower_right_mv"]))
+
+    def test_asymmetric_read_snm_detects_and_swaps_left_right_mismatch(self):
+        cell = SixTWatCell(
+            "MISMATCH",
+            MosWat(.35, 29.2), MosWat(.39, 20.0),
+            MosWat(.27, 40.3), MosWat(.31, 30.0),
+            MosWat(.27, 47.6), MosWat(.33, 35.0),
+        )
+        original = AsymmetricSram6T(cell, self.cfg).read_butterfly(.9, 1201)["read_butterfly"]
+        swapped_cell = SixTWatCell(
+            "SWAPPED", cell.pu2, cell.pu1, cell.pg2, cell.pg1, cell.pd2, cell.pd1)
+        swapped = AsymmetricSram6T(swapped_cell, self.cfg).read_butterfly(.9, 1201)["read_butterfly"]
+        self.assertGreater(original["mismatch_index_pct"], 1.0)
+        self.assertAlmostEqual(original["snm_upper_left_mv"],
+                               swapped["snm_lower_right_mv"], delta=1.0)
+        self.assertAlmostEqual(original["snm_lower_right_mv"],
+                               swapped["snm_upper_left_mv"], delta=1.0)
+        self.assertAlmostEqual(original["snm_mv"], swapped["snm_mv"], delta=1.0)
+        self.assertAlmostEqual(original["delta_snm_mv"], -swapped["delta_snm_mv"], delta=1.0)
 
     def test_html_png_and_csv_include_read_and_write_snm(self):
         result = analyze_three_mos(self.cell, self.cfg, self.targets)
@@ -105,7 +130,9 @@ class AnalyzerTests(unittest.TestCase):
             self.assertNotIn("SNM squares in both butterfly lobes", svg)
             butterfly_svg = (image_dir / "02_read_snm_butterfly.svg").read_text(encoding="utf-8")
             self.assertIn("Maximum squares 1 and 2", butterfly_svg)
-            self.assertIn("smaller side of squares 1 and 2", butterfly_svg)
+            self.assertIn("cell RSNM is the smaller value", butterfly_svg)
+            self.assertIn("L0/R1", butterfly_svg)
+            self.assertIn("L1/R0", butterfly_svg)
             self.assertIn("Vin (V)", butterfly_svg)
             self.assertIn("Vout (V)", butterfly_svg)
             self.assertIn("1.20", butterfly_svg)
@@ -126,6 +153,7 @@ class AnalyzerTests(unittest.TestCase):
             self.assertFalse((output / "wt_test_0bit_vmin.csv").exists())
             self.assertFalse((output / "sram_wat_results.csv").exists())
             self.assertTrue((output / "snm_target_comparison.csv").exists())
+            self.assertTrue((output / "read_snm_state_mismatch.csv").exists())
             self.assertTrue((output / "analytical_read_snm.csv").exists())
             self.assertFalse((output / "analytical_read_snm_eq_3_36.csv").exists())
             self.assertTrue((output / "wat_electrical_snm_table.csv").exists())
@@ -138,6 +166,8 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("No W/L, Cox, mobility", html)
             self.assertIn("Generic 28 nm Default Assumptions", html)
             self.assertIn("VTH,eff", html)
+            self.assertIn("Read SNM Butterfly and Left/Right Mismatch", html)
+            self.assertIn("Mismatch index", html)
             with open(output / "snm_target_comparison.csv", encoding="utf-8-sig") as source:
                 rows = list(csv.DictReader(source))
             self.assertEqual(len(rows), 2)
