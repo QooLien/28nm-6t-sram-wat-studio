@@ -1938,7 +1938,7 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
             side_px_x = square["side_v"] / axis_max * plot_w
             side_px_y = square["side_v"] / axis_max * plot_h
             stroke_width = 4 if abs(square["side_v"] - limiting) < 1e-12 else 3
-            state_label = "L0/R1" if square["lobe"] == 1 else "L1/R0"
+            state_label = "QB=0 / Q=1" if square["lobe"] == 1 else "QB=1 / Q=0"
             value_label = f'{square["side_mv"]:.1f} mV'
             parts += [f'<rect x="{left:.1f}" y="{top:.1f}" width="{side_px_x:.1f}" height="{side_px_y:.1f}" fill="#EFFAF2" stroke="#34C759" stroke-width="{stroke_width}"/>',
                       f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2-2:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{state_label}</text>',
