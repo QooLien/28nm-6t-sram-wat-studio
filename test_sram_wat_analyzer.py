@@ -4,12 +4,13 @@ import unittest
 from pathlib import Path
 
 from sram_wat_analyzer import (
-    AsymmetricSram6T, Config, DatasheetTargets, MosWat, SixTWatCell, Sram6T, ThreeTWatCell,
+    AsymmetricSram6T, Config, DatasheetTargets, MosWat, RsnmVccPoint,
+    SixTWatCell, Sram6T, ThreeTWatCell,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, generic_28nm_assumption_rows, load_gui_state,
-    model_vdd_butterfly_svg, read_wat_csv,
+    _read_wat_excel_rows, analyze_rsnm_vcc_curve, generic_28nm_assumption_rows,
+    load_gui_state, model_vdd_butterfly_svg, read_wat_csv, rsnm_vcc_curve_svg,
     save_gui_state,
-    validate_config, wat_electrical_snm_rows, write_outputs,
+    validate_config, wat_electrical_snm_rows, write_outputs, write_rsnm_vcc_curve_outputs,
 )
 
 
@@ -330,6 +331,38 @@ class AnalyzerTests(unittest.TestCase):
                 ["Lot/Wafer", "Site", "Model VDD", "MOS", "Vt", "Vt Unit",
                  "Idsat", "Idsat Unit", "Notes"],
             )
+
+    def test_manual_rsnm_vcc_curve_brackets_eye_closure_and_exports(self):
+        base_vt = {"pu": .385, "pg": .365, "pd": .355}
+        base_ids = {"pu": 44.0, "pg": 82.0, "pd": 124.0}
+
+        def scaled(kind, vcc):
+            return base_ids[kind] * (max(vcc - base_vt[kind], 0) /
+                                     (.9 - base_vt[kind])) ** 2
+
+        points = [
+            RsnmVccPoint(vcc,
+                         MosWat(base_vt["pu"], scaled("pu", vcc)),
+                         MosWat(base_vt["pg"], scaled("pg", vcc)),
+                         MosWat(base_vt["pd"], scaled("pd", vcc)))
+            for vcc in (.34, .36, .38, .40, .60, .90)
+        ]
+        analysis = analyze_rsnm_vcc_curve(points, self.cfg, fit_points=401)
+        self.assertFalse(analysis["rows"][0]["valid_eye"])
+        self.assertTrue(analysis["rows"][-1]["valid_eye"])
+        self.assertIsNotNone(analysis["eye_closure"])
+        self.assertGreater(analysis["eye_closure"]["estimated_vcc_v"], .36)
+        self.assertLess(analysis["eye_closure"]["estimated_vcc_v"], .38)
+        svg = rsnm_vcc_curve_svg(analysis)
+        self.assertIn("Estimated RSNM versus Model VCC", svg)
+        self.assertIn("Estimated eye closure", svg)
+        self.assertIn("Read SNM (mV)", svg)
+        with tempfile.TemporaryDirectory() as td:
+            report = write_rsnm_vcc_curve_outputs(analysis, Path(td) / "curve")
+            self.assertTrue(report.exists())
+            self.assertTrue((report.parent / "rsnm_vcc_curve.csv").exists())
+            self.assertTrue((report.parent / "images" / "01_rsnm_vs_model_vcc.png").exists())
+            self.assertIn("Estimated eye-closure VCC", report.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
