@@ -1628,7 +1628,7 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Estimated Read SNM versus Model VCC" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-        '<text x="52" y="50" fill="#1D1D1F" font-size="30" font-weight="700">Estimated RSNM versus Model VCC</text>',
+        '<text x="52" y="54" fill="#1D1D1F" font-size="38" font-weight="700">Estimated RSNM versus Model VCC</text>',
         '<path d="M52 79 h38" stroke="#007AFF" stroke-width="4"/><text x="101" y="85" fill="#3A3A3C" font-size="16">Manual VCC / PU / PG / PD WAT inputs</text>',
     ]
     for step in range(7):
@@ -1653,13 +1653,25 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
         parts.append(f'<polyline points="{points_text}" fill="none" stroke="#007AFF" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>')
     for index, row in enumerate(valid_rows):
         x, y = xy(row["vcc_v"], row["rsnm_mv"])
-        if row["vcc_v"] <= .40:
-            low_voltage_offsets = ((-10, -13, "end"), (11, 5, "start"), (0, -18, "middle"))
-            label_dx, label_dy, label_anchor = low_voltage_offsets[index % 3]
+        vcc = row["vcc_v"]
+        if vcc <= .375:
+            label_dx, label_dy, label_anchor = (-18, -36, "end")
+        elif vcc <= .385:
+            label_dx, label_dy, label_anchor = (20, -52, "start")
+        elif vcc <= .42:
+            label_dx, label_dy, label_anchor = (22, 26, "start")
+        elif vcc <= .47:
+            label_dx, label_dy, label_anchor = (0, 42, "middle")
+        elif vcc <= .53:
+            label_dx, label_dy, label_anchor = (0, 38, "middle")
+        elif vcc <= .65:
+            label_dx, label_dy, label_anchor = (0, -40, "middle")
         else:
-            label_dx, label_dy, label_anchor = (0, -13 if index % 2 == 0 else 23, "middle")
+            label_dx, label_dy, label_anchor = (0, -30 if index % 2 == 0 else 28, "middle")
         parts += [f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#FFFFFF" stroke="#007AFF" stroke-width="3"/>',
-                  f'<text x="{x+label_dx:.1f}" y="{y+label_dy:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" font-size="12" font-weight="700">{row["rsnm_mv"]:.1f}</text>']
+                  f'<text x="{x+label_dx:.1f}" y="{y+label_dy:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" font-size="14" font-weight="700">'
+                  f'<tspan x="{x+label_dx:.1f}">VCC {row["vcc_v"]:.2f} V</tspan>'
+                  f'<tspan x="{x+label_dx:.1f}" dy="18">RSNM {row["rsnm_mv"]:.1f} mV</tspan></text>']
     for row in rows:
         if row["valid_eye"]:
             continue
@@ -3165,6 +3177,8 @@ def launch_gui() -> None:
     style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Calibri", 24, "bold"))
     style.configure("Subtitle.TLabel", background=BG, foreground=SECONDARY, font=("Calibri", 10))
     style.configure("Section.TLabel", background=CARD, foreground=TEXT, font=("Calibri", 13, "bold"))
+    style.configure("ChartTitle.TLabel", background=CARD, foreground=TEXT,
+                    font=("Calibri", 18, "bold"))
     style.configure("Body.TLabel", background=CARD, foreground=TEXT, font=("Calibri", 10))
     style.configure("Meta.TLabel", background=CARD, foreground=SECONDARY, font=("Calibri", 9))
     style.configure("Apple.TEntry", fieldbackground="#F2F2F7", foreground=TEXT, bordercolor="#E5E5EA",
@@ -3632,7 +3646,7 @@ def launch_gui() -> None:
                                      style="Apple.Horizontal.TProgressbar")
     curve_progress.pack(fill="x", pady=(0, 9))
 
-    ttk.Label(curve_chart_card, text="Estimated Read SNM Curve", style="Section.TLabel").grid(
+    ttk.Label(curve_chart_card, text="Estimated Read SNM Curve", style="ChartTitle.TLabel").grid(
         row=0, column=0, sticky="w")
     ttk.Label(curve_chart_card,
               text="X: Model VCC (V)  /  Y: RSNM (mV). X marks indicate no valid butterfly eye.",
@@ -3695,14 +3709,25 @@ def launch_gui() -> None:
         for index, row in enumerate(valid_rows):
             x, y = xy(row["vcc_v"], row["rsnm_mv"])
             curve_canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=CARD, outline=BLUE, width=2)
-            if row["vcc_v"] <= .40:
-                offsets = ((-9, -12, "e"), (9, 5, "w"), (0, -16, "center"))
-                label_dx, label_dy, label_anchor = offsets[index % 3]
+            vcc = row["vcc_v"]
+            if vcc <= .375:
+                label_dx, label_dy, label_anchor = -14, -32, "e"
+            elif vcc <= .385:
+                label_dx, label_dy, label_anchor = 16, -44, "w"
+            elif vcc <= .42:
+                label_dx, label_dy, label_anchor = 18, 24, "w"
+            elif vcc <= .47:
+                label_dx, label_dy, label_anchor = 0, 36, "center"
+            elif vcc <= .53:
+                label_dx, label_dy, label_anchor = 0, 32, "center"
+            elif vcc <= .65:
+                label_dx, label_dy, label_anchor = 0, -34, "center"
             else:
-                label_dx, label_dy, label_anchor = 0, (-13 if index % 2 == 0 else 15), "center"
+                label_dx, label_dy, label_anchor = 0, (-28 if index % 2 == 0 else 26), "center"
             curve_canvas.create_text(x + label_dx, y + label_dy,
-                                     text=f'{row["rsnm_mv"]:.1f}', fill=TEXT,
-                                     anchor=label_anchor, font=("Calibri", 8, "bold"))
+                                     text=f'VCC {row["vcc_v"]:.2f} V\nRSNM {row["rsnm_mv"]:.1f} mV',
+                                     fill=TEXT, justify="center",
+                                     anchor=label_anchor, font=("Calibri", 10, "bold"))
         for row in rows:
             if row["valid_eye"]:
                 continue
@@ -3715,7 +3740,7 @@ def launch_gui() -> None:
                                      fill="#FF9500", width=2, dash=(6, 4))
             curve_canvas.create_text(x + 8, top_margin + 12,
                                      text=f'Eye closure {closure["estimated_vcc_v"]:.4f} V',
-                                     anchor="w", fill="#C56A00", font=("Calibri", 10, "bold"))
+                                     anchor="w", fill="#C56A00", font=("Calibri", 12, "bold"))
         curve_canvas.create_text(left_margin + plot_width / 2, height - 25, text="Model VCC (V)",
                                  fill=TEXT, font=("Calibri", 10, "bold"))
         curve_canvas.create_text(18, top_margin + plot_height / 2, text="Read SNM (mV)", angle=90,

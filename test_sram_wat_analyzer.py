@@ -357,6 +357,8 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("Estimated RSNM versus Model VCC", svg)
         self.assertIn("Estimated eye closure", svg)
         self.assertIn("Read SNM (mV)", svg)
+        self.assertIn("VCC 0.38 V", svg)
+        self.assertIn("RSNM", svg)
         with tempfile.TemporaryDirectory() as td:
             report = write_rsnm_vcc_curve_outputs(analysis, Path(td) / "curve")
             self.assertTrue(report.exists())
