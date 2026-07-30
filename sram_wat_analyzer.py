@@ -150,7 +150,7 @@ class ThreeTWatCell:
 
 @dataclass(frozen=True)
 class RsnmVccPoint:
-    """Grouped PU/PG/PD WAT inputs measured at one operating VCC."""
+    """Grouped PU/PG/PD WAT inputs measured at one operating VDD."""
     vcc_v: float
     pu: MosWat
     pg: MosWat
@@ -1519,9 +1519,9 @@ def _fmt(value: float | None, digits: int = 3) -> str:
 
 def _interpolate_rsnm_vcc_point(low: RsnmVccPoint, high: RsnmVccPoint,
                                 vcc_v: float) -> RsnmVccPoint:
-    """Linearly interpolate measured electrical inputs between two VCC rows."""
+    """Linearly interpolate measured electrical inputs between two VDD rows."""
     if high.vcc_v <= low.vcc_v:
-        raise ValueError("VCC interpolation requires increasing endpoints")
+        raise ValueError("VDD interpolation requires increasing endpoints")
     fraction = (vcc_v - low.vcc_v) / (high.vcc_v - low.vcc_v)
 
     def mos(a: MosWat, b: MosWat) -> MosWat:
@@ -1534,21 +1534,21 @@ def _interpolate_rsnm_vcc_point(low: RsnmVccPoint, high: RsnmVccPoint,
 
 def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
                            fit_points: int = 801) -> dict:
-    """Calculate grouped-6T Read SNM at each manually entered VCC point.
+    """Calculate grouped-6T Read SNM at each manually entered VDD point.
 
-    Each Idsat value is calibrated at its own row VCC.  Eye closure is only
+    Each Idsat value is calibrated at its own row VDD.  Eye closure is only
     estimated when the supplied rows bracket an invalid-to-valid butterfly-eye
     transition; electrical values inside that bracket are linearly interpolated.
     """
     if len(points) < 2:
-        raise ValueError("Enter at least two VCC rows")
+        raise ValueError("Enter at least two VDD rows")
     fit_points = max(201, int(fit_points))
     ordered = sorted(points, key=lambda point: point.vcc_v)
     for index, point in enumerate(ordered):
         if not math.isfinite(point.vcc_v) or not 0 < point.vcc_v <= SNM_PLOT_AXIS_MAX_V:
-            raise ValueError(f"Row {index + 1}: VCC must be > 0 and <= {SNM_PLOT_AXIS_MAX_V:.2f} V")
+            raise ValueError(f"Row {index + 1}: VDD must be > 0 and <= {SNM_PLOT_AXIS_MAX_V:.2f} V")
         if index and abs(point.vcc_v - ordered[index - 1].vcc_v) < 1e-12:
-            raise ValueError(f"Duplicate VCC row: {point.vcc_v:.6g} V")
+            raise ValueError(f"Duplicate VDD row: {point.vcc_v:.6g} V")
         for name, mos in (("PU", point.pu), ("PG", point.pg), ("PD", point.pd)):
             if not math.isfinite(mos.vt) or mos.vt <= 0:
                 raise ValueError(f"Row {index + 1} {name}: Vt must be greater than zero")
@@ -1559,7 +1559,7 @@ def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
         point_cfg = replace(cfg, nominal_vdd=point.vcc_v, wat_vdd=point.vcc_v,
                             grid_points=fit_points)
         wat = WatPoint(
-            f"VCC_{point.vcc_v:.6g}", point.pu.vt, point.pu.ids,
+            f"VDD_{point.vcc_v:.6g}", point.pu.vt, point.pu.ids,
             point.pg.vt, point.pg.ids, point.pd.vt, point.pd.ids,
         )
         butterfly = Sram6T(wat, point_cfg).butterfly_squares(
@@ -1610,12 +1610,12 @@ def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
         "eye_closure": closure,
         "axis_max_v": SNM_PLOT_AXIS_MAX_V,
         "fit_points": fit_points,
-        "definition": "Estimated eye-closure VCC is a compact-model boundary, not measured WT Vmin",
+        "definition": "Estimated eye-closure VDD is a compact-model boundary, not measured WT Vmin",
     }
 
 
 def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> str:
-    """Render Read SNM versus manually supplied operating VCC values."""
+    """Render Read SNM versus manually supplied operating VDD values."""
     rows = analysis["rows"]
     left, top, plot_w, plot_h = 110, 105, 1050, 470
     max_rsnm = max((row["rsnm_mv"] for row in rows if row["rsnm_mv"] is not None), default=50.0)
@@ -1626,10 +1626,10 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
                 top + (1.0 - rsnm_mv / y_max) * plot_h)
 
     parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Estimated Read SNM versus Model VCC" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Estimated Read SNM versus Model VDD" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-        '<text x="52" y="54" fill="#1D1D1F" font-size="38" font-weight="700">Estimated RSNM versus Model VCC</text>',
-        '<path d="M52 79 h38" stroke="#007AFF" stroke-width="4"/><text x="101" y="85" fill="#3A3A3C" font-size="16">Manual VCC / PU / PG / PD WAT inputs</text>',
+        '<text x="52" y="54" fill="#1D1D1F" font-size="38" font-weight="700">Estimated RSNM versus Model VDD</text>',
+        '<path d="M52 79 h38" stroke="#007AFF" stroke-width="4"/><text x="101" y="85" fill="#3A3A3C" font-size="16">Manual VDD / PU / PG / PD WAT inputs</text>',
     ]
     for step in range(7):
         voltage = step * 0.2
@@ -1670,7 +1670,7 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
             label_dx, label_dy, label_anchor = (0, -30 if index % 2 == 0 else 28, "middle")
         parts += [f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#FFFFFF" stroke="#007AFF" stroke-width="3"/>',
                   f'<text x="{x+label_dx:.1f}" y="{y+label_dy:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" font-size="14" font-weight="700">'
-                  f'<tspan x="{x+label_dx:.1f}">VCC {row["vcc_v"]:.2f} V</tspan>'
+                  f'<tspan x="{x+label_dx:.1f}">VDD {row["vcc_v"]:.2f} V</tspan>'
                   f'<tspan x="{x+label_dx:.1f}" dy="18">RSNM {row["rsnm_mv"]:.1f} mV</tspan></text>']
     for row in rows:
         if row["valid_eye"]:
@@ -1681,11 +1681,11 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
         boundary_x, boundary_y = xy(closure["estimated_vcc_v"], 0.0)
         parts += [f'<path d="M{boundary_x:.1f} {top} V{top+plot_h}" stroke="#FF9500" stroke-width="3" stroke-dasharray="8 6"/>',
                   f'<circle cx="{boundary_x:.1f}" cy="{boundary_y:.1f}" r="7" fill="#FFFFFF" stroke="#FF9500" stroke-width="3"/>',
-                  f'<text x="{boundary_x+12:.1f}" y="{top+28}" fill="#C56A00" font-size="16" font-weight="700">Estimated eye closure {closure["estimated_vcc_v"]:.4f} V</text>']
+                  f'<text x="{boundary_x+12:.1f}" y="{top+28}" fill="#C56A00" font-size="16" font-weight="700">Estimated eye-closure VDD {closure["estimated_vcc_v"]:.4f} V</text>']
     else:
-        parts.append(f'<text x="{left+plot_w-8}" y="{top+28}" text-anchor="end" fill="#C56A00" font-size="16" font-weight="700">Eye closure not bracketed by the entered rows</text>')
+        parts.append(f'<text x="{left+plot_w-8}" y="{top+28}" text-anchor="end" fill="#C56A00" font-size="16" font-weight="700">Eye-closure VDD not bracketed by the entered rows</text>')
     parts += [
-        f'<text x="{left+plot_w/2}" y="{height-62}" text-anchor="middle" fill="#1D1D1F" font-size="18">Model VCC (V)</text>',
+        f'<text x="{left+plot_w/2}" y="{height-62}" text-anchor="middle" fill="#1D1D1F" font-size="18">Model VDD (V)</text>',
         f'<text x="38" y="{top+plot_h/2}" transform="rotate(-90 38 {top+plot_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="18">Read SNM (mV)</text>',
         f'<text x="{width/2}" y="{height-18}" text-anchor="middle" fill="#6E6E73" font-size="14">X = no valid butterfly eye. Boundary is a compact-model estimate and is not measured WT Vmin.</text>',
         '</svg>',
@@ -1694,7 +1694,7 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
 
 
 def write_rsnm_vcc_curve_outputs(analysis: dict, out_dir: str | os.PathLike[str]) -> Path:
-    """Write CSV, SVG, PNG and an HTML report for manual RSNM/VCC analysis."""
+    """Write CSV, SVG, PNG and an HTML report for manual RSNM/VDD analysis."""
     out = Path(out_dir)
     image_dir = out / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -1708,7 +1708,7 @@ def write_rsnm_vcc_curve_outputs(analysis: dict, out_dir: str | os.PathLike[str]
         raise RuntimeError("PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
     drawing = svg2rlg(str(svg_path))
     if drawing is None:
-        raise RuntimeError("Could not render RSNM versus VCC chart")
+        raise RuntimeError("Could not render RSNM versus VDD chart")
     renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
 
     csv_fields = ["vcc_v", "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
@@ -1727,11 +1727,11 @@ def write_rsnm_vcc_curve_outputs(analysis: dict, out_dir: str | os.PathLike[str]
         f'<td>{row["pd_vt_v"]:.4f}</td><td>{row["pd_idsat_ua"]:.3f}</td>'
         f'<td>{_fmt(row["rsnm_mv"], 2)}</td><td>{row["status"]}</td></tr>'
         for row in analysis["rows"])
-    document = f'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HV28 SRAM Analysis - RSNM vs VCC</title>
+    document = f'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HV28 SRAM Analysis - RSNM vs VDD</title>
     <style>:root{{font:100%/1.5 Calibri,"Microsoft JhengHei",Arial,sans-serif;color:#1d1d1f;background:#f5f5f7}}*{{box-sizing:border-box}}body{{margin:0;padding:2rem}}main{{max-width:1500px;margin:auto}}h1{{font-size:2.6rem;letter-spacing:-.03em}}section{{background:#fff;border-radius:1.25rem;padding:1.5rem;margin:1rem 0}}img{{display:block;width:100%;height:auto;border:1px solid #e5e5ea;border-radius:1rem}}table{{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}}th,td{{padding:.7rem;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}.note{{color:#6e6e73}}</style></head><body><main>
-    <h1>HV28 SRAM Analysis</h1><p>Manual VCC / PU / PG / PD WAT curve analysis</p>
-    <section><h2>Estimated RSNM versus Model VCC</h2><p><b>Estimated eye-closure VCC:</b> {closure_text}</p><img src="images/{png_path.name}" alt="Estimated Read SNM versus Model VCC"><p class="note">This is a compact-model estimate derived from manually entered Vt and Idsat. It is not measured WT Vmin.</p></section>
-    <section><h2>Input and calculated values</h2><table><thead><tr><th>VCC (V)</th><th>PU Vt</th><th>PU Isat</th><th>PG Vt</th><th>PG Isat</th><th>PD Vt</th><th>PD Isat</th><th>RSNM (mV)</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table></section>
+    <h1>HV28 SRAM Analysis</h1><p>Manual VDD / PU / PG / PD WAT curve analysis</p>
+    <section><h2>Estimated RSNM versus Model VDD</h2><p><b>Estimated eye-closure VDD:</b> {closure_text}</p><img src="images/{png_path.name}" alt="Estimated Read SNM versus Model VDD"><p class="note">This is a compact-model estimate derived from manually entered Vt and Idsat. It is not measured WT Vmin.</p></section>
+    <section><h2>Input and calculated values</h2><table><thead><tr><th>VDD (V)</th><th>PU Vt</th><th>PU Isat</th><th>PG Vt</th><th>PG Isat</th><th>PD Vt</th><th>PD Isat</th><th>RSNM (mV)</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table></section>
     </main></body></html>'''
     report = out / "rsnm_vcc_report.html"
     report.write_text(document, encoding="utf-8")
@@ -3255,7 +3255,7 @@ def launch_gui() -> None:
     bitcell_tab = ttk.Frame(notebook, style="Root.TFrame")
     curve_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
-    notebook.add(curve_tab, text="RSNM vs VCC Curve")
+    notebook.add(curve_tab, text="RSNM vs VDD Curve")
 
     content = ttk.Frame(bitcell_tab, style="Root.TFrame"); content.pack(fill="both", expand=True)
     content.columnconfigure(0, weight=7); content.columnconfigure(1, weight=4); content.rowconfigure(0, weight=1)
@@ -3532,7 +3532,7 @@ def launch_gui() -> None:
     excel_analyze_button = ttk.Button(right_footer, text="Analyze Excel VDD Sweep", style="Quiet.TButton", command=execute_excel_sweep)
     excel_analyze_button.pack(fill="x", pady=(7, 0))
 
-    # Dedicated manual VCC / grouped PU-PG-PD curve-analysis tab.
+    # Dedicated manual VDD / grouped PU-PG-PD curve-analysis tab.
     curve_tab.columnconfigure(0, weight=6)
     curve_tab.columnconfigure(1, weight=7)
     curve_tab.rowconfigure(0, weight=1)
@@ -3543,13 +3543,13 @@ def launch_gui() -> None:
     curve_chart_card.columnconfigure(0, weight=1)
     curve_chart_card.rowconfigure(3, weight=1)
 
-    ttk.Label(curve_input_card, text="Manual VCC Sweep Inputs", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(curve_input_card, text="Manual VDD Sweep Inputs", style="Section.TLabel").pack(anchor="w")
     ttk.Label(curve_input_card,
-              text="Enter grouped PU / PG / PD Vt and Isat measured at each VCC. Blank rows are ignored.",
+              text="Enter grouped PU / PG / PD Vt and Isat measured at each VDD. Blank rows are ignored.",
               style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(2, 10))
 
     curve_columns = (
-        ("vcc", "VCC", TEXT),
+        ("vcc", "VDD", TEXT),
         ("pu_vt", "PU Vt", RED), ("pu_ids", "PU Isat", RED),
         ("pg_vt", "PG Vt", GREEN), ("pg_ids", "PG Isat", GREEN),
         ("pd_vt", "PD Vt", BLUE), ("pd_ids", "PD Isat", BLUE),
@@ -3599,7 +3599,7 @@ def launch_gui() -> None:
 
     def append_curve_row(data: dict[str, object] | None = None) -> None:
         if len(curve_row_vars) >= 20:
-            messagebox.showinfo("VCC sweep", "A maximum of 20 manual rows is supported.")
+            messagebox.showinfo("VDD sweep", "A maximum of 20 manual rows is supported.")
             return
         data = data or {}
         curve_row_vars.append({key: tk.StringVar(value=str(data.get(key, "")))
@@ -3608,7 +3608,7 @@ def launch_gui() -> None:
 
     def remove_curve_row() -> None:
         if len(curve_row_vars) <= 2:
-            messagebox.showinfo("VCC sweep", "Keep at least two input rows.")
+            messagebox.showinfo("VDD sweep", "Keep at least two input rows.")
             return
         curve_row_vars.pop()
         rebuild_curve_rows()
@@ -3635,10 +3635,10 @@ def launch_gui() -> None:
     ttk.Button(curve_controls, text="Restore Example", style="Quiet.TButton",
                command=restore_curve_example).pack(side="right")
     ttk.Label(curve_input_card,
-              text="Isat may be 0 uA below threshold. For accurate eye closure, include rows on both sides of the expected boundary.",
+              text="Isat may be 0 uA below threshold. For accurate eye-closure VDD, include rows on both sides of the expected boundary.",
               style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(0, 9))
 
-    curve_status = tk.StringVar(value="Ready to analyze the VCC sweep")
+    curve_status = tk.StringVar(value="Ready to analyze the VDD sweep")
     curve_status_label = tk.Label(curve_input_card, textvariable=curve_status, bg=CARD, fg=SECONDARY,
                                   font=("Calibri", 9), anchor="w", justify="left", wraplength=560)
     curve_status_label.pack(fill="x", pady=(3, 6))
@@ -3649,9 +3649,9 @@ def launch_gui() -> None:
     ttk.Label(curve_chart_card, text="Estimated Read SNM Curve", style="ChartTitle.TLabel").grid(
         row=0, column=0, sticky="w")
     ttk.Label(curve_chart_card,
-              text="X: Model VCC (V)  /  Y: RSNM (mV). X marks indicate no valid butterfly eye.",
+              text="X: Model VDD (V)  /  Y: RSNM (mV). X marks indicate no valid butterfly eye.",
               style="Meta.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 6))
-    curve_summary = tk.StringVar(value="Analyze at least two VCC rows to display the curve.")
+    curve_summary = tk.StringVar(value="Analyze at least two VDD rows to display the curve.")
     curve_summary_label = tk.Label(curve_chart_card, textvariable=curve_summary, bg=CARD, fg=SECONDARY,
                                    font=("Calibri", 10, "bold"), anchor="w", justify="left")
     curve_summary_label.grid(row=2, column=0, sticky="ew", pady=(0, 6))
@@ -3725,7 +3725,7 @@ def launch_gui() -> None:
             else:
                 label_dx, label_dy, label_anchor = 0, (-28 if index % 2 == 0 else 26), "center"
             curve_canvas.create_text(x + label_dx, y + label_dy,
-                                     text=f'VCC {row["vcc_v"]:.2f} V\nRSNM {row["rsnm_mv"]:.1f} mV',
+                                     text=f'VDD {row["vcc_v"]:.2f} V\nRSNM {row["rsnm_mv"]:.1f} mV',
                                      fill=TEXT, justify="center",
                                      anchor=label_anchor, font=("Calibri", 10, "bold"))
         for row in rows:
@@ -3739,9 +3739,9 @@ def launch_gui() -> None:
             curve_canvas.create_line(x, top_margin, x, top_margin + plot_height,
                                      fill="#FF9500", width=2, dash=(6, 4))
             curve_canvas.create_text(x + 8, top_margin + 12,
-                                     text=f'Eye closure {closure["estimated_vcc_v"]:.4f} V',
+                                     text=f'Eye-closure VDD {closure["estimated_vcc_v"]:.4f} V',
                                      anchor="w", fill="#C56A00", font=("Calibri", 12, "bold"))
-        curve_canvas.create_text(left_margin + plot_width / 2, height - 25, text="Model VCC (V)",
+        curve_canvas.create_text(left_margin + plot_width / 2, height - 25, text="Model VDD (V)",
                                  fill=TEXT, font=("Calibri", 10, "bold"))
         curve_canvas.create_text(18, top_margin + plot_height / 2, text="Read SNM (mV)", angle=90,
                                  fill=TEXT, font=("Calibri", 10, "bold"))
@@ -3797,30 +3797,30 @@ def launch_gui() -> None:
             curve_report_path = Path(payload)
             closure = analysis.get("eye_closure")
             if closure:
-                summary = f'Estimated eye-closure VCC: {closure["estimated_vcc_v"]:.4f} V'
+                summary = f'Estimated eye-closure VDD: {closure["estimated_vcc_v"]:.4f} V'
                 curve_summary_label.configure(fg="#C56A00")
             else:
-                summary = "Eye closure not bracketed by the entered rows"
+                summary = "Eye-closure VDD not bracketed by the entered rows"
                 curve_summary_label.configure(fg=SECONDARY)
             curve_summary.set(summary)
-            curve_status.set(f"Complete - {len(analysis['rows'])} VCC point(s); HTML and PNG saved")
+            curve_status.set(f"Complete - {len(analysis['rows'])} VDD point(s); HTML and PNG saved")
             curve_status_label.configure(fg=GREEN)
             curve_open_button.state(["!disabled"])
             draw_curve_chart()
         else:
             curve_status.set("RSNM curve analysis could not be completed")
             curve_status_label.configure(fg=RED)
-            messagebox.showerror("RSNM vs VCC analysis", str(payload))
+            messagebox.showerror("RSNM vs VDD analysis", str(payload))
 
     def execute_curve_analysis() -> None:
         try:
             points, cfg = collect_curve_inputs()
         except Exception as exc:
-            curve_status.set("Check the VCC sweep input values")
+            curve_status.set("Check the VDD sweep input values")
             curve_status_label.configure(fg=RED)
-            messagebox.showerror("Invalid VCC sweep input", str(exc))
+            messagebox.showerror("Invalid VDD sweep input", str(exc))
             return
-        curve_status.set("Calculating Read SNM at each VCC point...")
+        curve_status.set("Calculating Read SNM at each VDD point...")
         curve_status_label.configure(fg=BLUE)
         curve_analyze_button.state(["disabled"])
         curve_open_button.state(["disabled"])
@@ -3835,7 +3835,7 @@ def launch_gui() -> None:
 
     curve_action_row = ttk.Frame(curve_input_card, style="Card.TFrame")
     curve_action_row.pack(side="bottom", fill="x", pady=(8, 0))
-    curve_analyze_button = ttk.Button(curve_action_row, text="Analyze RSNM vs VCC",
+    curve_analyze_button = ttk.Button(curve_action_row, text="Analyze RSNM vs VDD",
                                       style="Accent.TButton", command=execute_curve_analysis)
     curve_analyze_button.pack(fill="x")
     curve_open_button = ttk.Button(curve_action_row, text="Open HTML Result",

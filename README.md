@@ -10,7 +10,7 @@ The active workflow is focused on:
 - Independent upper-left / lower-right Read-SNM mismatch analysis
 - Independent analytical Read SNM cross-check
 - PU / PG / PD Vt and Idsat comparison
-- Manual grouped-PU/PG/PD RSNM-versus-VCC curve analysis and eye-closure estimation
+- Manual grouped-PU/PG/PD RSNM-versus-VDD curve analysis and eye-closure estimation
 
 Hold SNM and Vmin comparison are not included in the active report.
 
@@ -26,13 +26,13 @@ For a company intranet/offline PC, follow [INTRANET_PC_SETUP.md](INTRANET_PC_SET
 4. Review or replace the editable `Generic 28 nm Default Assumptions` values. A blank field automatically uses its generic default.
 5. Select `Analyze & Open HTML`.
 
-The **RSNM vs VCC Curve** tab is an independent workflow:
+The **RSNM vs VDD Curve** tab is an independent workflow:
 
-1. Enter at least two VCC rows with grouped PU / PG / PD Vt and Idsat values.
-2. Include points below and above the expected stability boundary if eye-closure VCC is required.
-3. Select `Analyze RSNM vs VCC` to update the embedded chart and generate HTML, PNG, SVG, CSV and JSON results.
+1. Enter at least two VDD rows with grouped PU / PG / PD Vt and Idsat values.
+2. Include points below and above the expected stability boundary if eye-closure VDD is required.
+3. Select `Analyze RSNM vs VDD` to update the embedded chart and generate HTML, PNG, SVG, CSV and JSON results.
 
-Each row's Idsat is treated as measured at that row's VCC. The program recalibrates the compact device strengths for every row. If an invalid-eye row and the next valid-eye row bracket the boundary, Vt and Idsat are linearly interpolated and a bisection search estimates the eye-closure VCC. This model boundary is not measured WT Vmin.
+Each row's Idsat is treated as measured at that row's VDD. The program recalibrates the compact device strengths for every row. If an invalid-eye row and the next valid-eye row bracket the boundary, Vt and Idsat are linearly interpolated and a bisection search estimates the eye-closure VDD. This model boundary is not measured WT Vmin.
 
 ## Read SNM chart convention
 
@@ -132,11 +132,11 @@ Geometry and temperature are documented reference values. They do not override b
 
 The manual curve tab writes to `output/rsnm_vcc_curve/`:
 
-- `rsnm_vcc_report.html`: dedicated RSNM-versus-VCC report
+- `rsnm_vcc_report.html`: dedicated RSNM-versus-VDD report (legacy-compatible filename)
 - `rsnm_vcc_curve.csv`: manual inputs, calculated RSNM and valid-eye status
 - `rsnm_vcc_curve.json`: complete curve analysis and eye-closure bracket
-- `images/01_rsnm_vs_model_vcc.png`: downloadable chart
-- `images/01_rsnm_vs_model_vcc.svg`: scalable chart source
+- `images/01_rsnm_vs_model_vcc.png`: downloadable VDD chart (legacy-compatible filename)
+- `images/01_rsnm_vs_model_vcc.svg`: scalable VDD chart source (legacy-compatible filename)
 
 ## Formula guide
 
@@ -173,7 +173,7 @@ Lot/Wafer | Model VDD (V) | PUL Vt (mV) | PUL Idsat (uA) | ... | PDR Vt (mV) | P
 W01       | 0.900         | 380         | 45             | ... | 356         | 125
 ```
 
-Accepted MOS names are PUL/PUR/PGL/PGR/PDL/PDR, PU1/PU2/PG1/PG2/PD1/PD2, or the conventional M2/M4/M5/M6/M1/M3 names. When sheets named PU, PG and PD are present, the loader combines all three automatically. The application saves manual 6T inputs, manual RSNM/VCC rows, targets, model settings, assumptions, output folder and last selected Excel path in `.hv28_sram_analysis_state.json` when it closes; this local state file is not committed to Git.
+Accepted MOS names are PUL/PUR/PGL/PGR/PDL/PDR, PU1/PU2/PG1/PG2/PD1/PD2, or the conventional M2/M4/M5/M6/M1/M3 names. When sheets named PU, PG and PD are present, the loader combines all three automatically. The application saves manual 6T inputs, manual RSNM/VDD rows, targets, model settings, assumptions, output folder and last selected Excel path in `.hv28_sram_analysis_state.json` when it closes; this local state file is not committed to Git.
 
 ## Engineering limitation
 

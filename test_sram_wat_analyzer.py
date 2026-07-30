@@ -354,17 +354,17 @@ class AnalyzerTests(unittest.TestCase):
         self.assertGreater(analysis["eye_closure"]["estimated_vcc_v"], .36)
         self.assertLess(analysis["eye_closure"]["estimated_vcc_v"], .38)
         svg = rsnm_vcc_curve_svg(analysis)
-        self.assertIn("Estimated RSNM versus Model VCC", svg)
-        self.assertIn("Estimated eye closure", svg)
+        self.assertIn("Estimated RSNM versus Model VDD", svg)
+        self.assertIn("Estimated eye-closure VDD", svg)
         self.assertIn("Read SNM (mV)", svg)
-        self.assertIn("VCC 0.38 V", svg)
+        self.assertIn("VDD 0.38 V", svg)
         self.assertIn("RSNM", svg)
         with tempfile.TemporaryDirectory() as td:
             report = write_rsnm_vcc_curve_outputs(analysis, Path(td) / "curve")
             self.assertTrue(report.exists())
             self.assertTrue((report.parent / "rsnm_vcc_curve.csv").exists())
             self.assertTrue((report.parent / "images" / "01_rsnm_vs_model_vcc.png").exists())
-            self.assertIn("Estimated eye-closure VCC", report.read_text(encoding="utf-8"))
+            self.assertIn("Estimated eye-closure VDD", report.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
