@@ -357,8 +357,12 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("Estimated RSNM versus Model VDD", svg)
         self.assertIn("Estimated eye-closure VDD", svg)
         self.assertIn("Read SNM (mV)", svg)
-        self.assertIn("VDD 0.38 V", svg)
-        self.assertIn("RSNM", svg)
+        self.assertIn('data-vdd-guide="0.38"', svg)
+        self.assertEqual(svg.count("data-vdd-guide="),
+                         sum(row["valid_eye"] for row in analysis["rows"]))
+        self.assertNotIn(">VDD 0.38 V<", svg)
+        self.assertNotIn(">RSNM ", svg)
+        self.assertRegex(svg, r">\d+\.\d mV</text>")
         with tempfile.TemporaryDirectory() as td:
             report = write_rsnm_vcc_curve_outputs(analysis, Path(td) / "curve")
             self.assertTrue(report.exists())

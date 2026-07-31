@@ -1648,6 +1648,12 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
     if closure:
         curve_points.append(xy(closure["estimated_vcc_v"], 0.0))
     curve_points.extend(xy(row["vcc_v"], row["rsnm_mv"]) for row in valid_rows)
+    for row in valid_rows:
+        x, y = xy(row["vcc_v"], row["rsnm_mv"])
+        parts.append(
+            f'<path data-vdd-guide="{row["vcc_v"]:.2f}" d="M{x:.1f} {y+6:.1f} V{top+plot_h:.1f}" '
+            'stroke="#B9D7FF" stroke-width="1.5" stroke-dasharray="4 5"/>'
+        )
     if curve_points:
         points_text = " ".join(f"{x:.1f},{y:.1f}" for x, y in curve_points)
         parts.append(f'<polyline points="{points_text}" fill="none" stroke="#007AFF" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>')
@@ -1669,9 +1675,7 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
         else:
             label_dx, label_dy, label_anchor = (0, -30 if index % 2 == 0 else 28, "middle")
         parts += [f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#FFFFFF" stroke="#007AFF" stroke-width="3"/>',
-                  f'<text x="{x+label_dx:.1f}" y="{y+label_dy:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" font-size="14" font-weight="700">'
-                  f'<tspan x="{x+label_dx:.1f}">VDD {row["vcc_v"]:.2f} V</tspan>'
-                  f'<tspan x="{x+label_dx:.1f}" dy="18">RSNM {row["rsnm_mv"]:.1f} mV</tspan></text>']
+                  f'<text x="{x+label_dx:.1f}" y="{y+label_dy:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" font-size="14" font-weight="700">{row["rsnm_mv"]:.1f} mV</text>']
     for row in rows:
         if row["valid_eye"]:
             continue
@@ -3659,7 +3663,7 @@ def launch_gui() -> None:
     ttk.Label(curve_chart_card, text="Estimated Read SNM Curve", style="ChartTitle.TLabel").grid(
         row=0, column=0, sticky="w")
     ttk.Label(curve_chart_card,
-              text="X: Model VDD (V)  /  Y: RSNM (mV). X marks indicate no valid butterfly eye.",
+              text="X: Model VDD (V)  /  Y: RSNM (mV). Vertical guides map each point to VDD; X marks indicate no valid butterfly eye.",
               style="Meta.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 6))
     curve_summary = tk.StringVar(value="Analyze at least two VDD rows to display the curve.")
     curve_summary_label = tk.Label(curve_chart_card, textvariable=curve_summary, bg=CARD, fg=SECONDARY,
@@ -3713,31 +3717,60 @@ def launch_gui() -> None:
         if closure:
             display_points.append(xy(closure["estimated_vcc_v"], 0.0))
         display_points.extend(xy(row["vcc_v"], row["rsnm_mv"]) for row in valid_rows)
+        baseline_y = top_margin + plot_height
+        for row in valid_rows:
+            guide_x, guide_y = xy(row["vcc_v"], row["rsnm_mv"])
+            curve_canvas.create_line(guide_x, guide_y + 5, guide_x, baseline_y,
+                                     fill="#B9D7FF", width=1, dash=(3, 4))
         if len(display_points) >= 2:
             curve_canvas.create_line(*[coordinate for point in display_points for coordinate in point],
                                      fill=BLUE, width=3, smooth=False)
+
+        placed_label_boxes: list[tuple[int, int, int, int]] = []
+
+        def boxes_overlap(first: tuple[int, int, int, int],
+                          second: tuple[int, int, int, int], padding: int = 5) -> bool:
+            return not (first[2] + padding < second[0] or
+                        first[0] - padding > second[2] or
+                        first[3] + padding < second[1] or
+                        first[1] - padding > second[3])
+
+        label_candidates = (
+            (-11, -9, "se"), (11, -9, "sw"),
+            (-11, 9, "ne"), (11, 9, "nw"),
+            (0, -15, "s"), (0, 15, "n"),
+            (-16, 0, "e"), (16, 0, "w"),
+        )
         for index, row in enumerate(valid_rows):
             x, y = xy(row["vcc_v"], row["rsnm_mv"])
             curve_canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=CARD, outline=BLUE, width=2)
-            vcc = row["vcc_v"]
-            if vcc <= .375:
-                label_dx, label_dy, label_anchor = -14, -32, "e"
-            elif vcc <= .385:
-                label_dx, label_dy, label_anchor = 16, -44, "w"
-            elif vcc <= .42:
-                label_dx, label_dy, label_anchor = 18, 24, "w"
-            elif vcc <= .47:
-                label_dx, label_dy, label_anchor = 0, 36, "center"
-            elif vcc <= .53:
-                label_dx, label_dy, label_anchor = 0, 32, "center"
-            elif vcc <= .65:
-                label_dx, label_dy, label_anchor = 0, -34, "center"
-            else:
-                label_dx, label_dy, label_anchor = 0, (-28 if index % 2 == 0 else 26), "center"
-            curve_canvas.create_text(x + label_dx, y + label_dy,
-                                     text=f'VDD {row["vcc_v"]:.2f} V\nRSNM {row["rsnm_mv"]:.1f} mV',
-                                     fill=TEXT, justify="center",
-                                     anchor=label_anchor, font=("Calibri", 10, "bold"))
+            ordered_candidates = label_candidates[index % 4:] + label_candidates[:index % 4]
+            chosen_item = None
+            for label_dx, label_dy, label_anchor in ordered_candidates:
+                label_item = curve_canvas.create_text(
+                    x + label_dx, y + label_dy,
+                    text=f'{row["rsnm_mv"]:.1f} mV', fill=TEXT,
+                    anchor=label_anchor, font=("Calibri", 10, "bold"))
+                bbox = curve_canvas.bbox(label_item)
+                within_plot = bool(bbox and bbox[0] >= left_margin + 3 and
+                                   bbox[2] <= left_margin + plot_width - 3 and
+                                   bbox[1] >= top_margin + 3 and
+                                   bbox[3] <= baseline_y - 3)
+                collision = bool(bbox and any(boxes_overlap(bbox, used)
+                                              for used in placed_label_boxes))
+                if bbox and within_plot and not collision:
+                    placed_label_boxes.append(bbox)
+                    chosen_item = label_item
+                    break
+                curve_canvas.delete(label_item)
+            if chosen_item is None:
+                fallback_y = max(top_margin + 12, min(y - 14, baseline_y - 12))
+                chosen_item = curve_canvas.create_text(
+                    x, fallback_y, text=f'{row["rsnm_mv"]:.1f} mV', fill=TEXT,
+                    anchor="s", font=("Calibri", 10, "bold"))
+                fallback_bbox = curve_canvas.bbox(chosen_item)
+                if fallback_bbox:
+                    placed_label_boxes.append(fallback_bbox)
         for row in rows:
             if row["valid_eye"]:
                 continue
