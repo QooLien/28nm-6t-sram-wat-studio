@@ -371,6 +371,7 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("Estimated eye-closure VDD", svg)
         self.assertIn("Read SNM (mV)", svg)
         self.assertIn('data-vdd-guide="0.38"', svg)
+        self.assertIn(">0.38 V</text>", svg)
         self.assertEqual(svg.count("data-vdd-guide="),
                          sum(row["valid_eye"] for row in analysis["rows"]))
         self.assertNotIn(">VDD 0.38 V<", svg)

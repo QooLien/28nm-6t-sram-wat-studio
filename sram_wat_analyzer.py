@@ -115,6 +115,27 @@ def create_run_output_dir(base_dir: str | os.PathLike[str], wafer_id: object,
     return candidate
 
 
+def _stagger_label_rows(labels: list[tuple[float, str]],
+                        character_width: float = 8.0,
+                        minimum_gap: float = 8.0) -> list[int]:
+    """Assign compact non-overlapping rows to labels centered at pixel X positions."""
+    row_right_edges: list[float] = []
+    assigned: list[int] = []
+    for center_x, text in labels:
+        estimated_width = max(42.0, len(text) * character_width)
+        left_edge = center_x - estimated_width / 2.0
+        right_edge = center_x + estimated_width / 2.0
+        for row_index, previous_right in enumerate(row_right_edges):
+            if left_edge >= previous_right + minimum_gap:
+                row_right_edges[row_index] = right_edge
+                assigned.append(row_index)
+                break
+        else:
+            row_right_edges.append(right_edge)
+            assigned.append(len(row_right_edges) - 1)
+    return assigned
+
+
 @dataclass(frozen=True)
 class SixTWatCell:
     """Object-oriented WAT description of all six physical bitcell devices."""
@@ -1650,7 +1671,7 @@ def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
     }
 
 
-def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> str:
+def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 780) -> str:
     """Render Read SNM versus manually supplied operating VDD values."""
     rows = analysis["rows"]
     left, top, plot_w, plot_h = 110, 105, 1050, 470
@@ -1660,6 +1681,16 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
     def xy(vcc_v: float, rsnm_mv: float) -> tuple[float, float]:
         return (left + vcc_v / SNM_PLOT_AXIS_MAX_V * plot_w,
                 top + (1.0 - rsnm_mv / y_max) * plot_h)
+
+    valid_rows = [row for row in rows if row["rsnm_mv"] is not None]
+    axis_labels = [(xy(row["vcc_v"], 0.0)[0], f'{row["vcc_v"]:.2f} V')
+                   for row in valid_rows]
+    axis_label_rows = _stagger_label_rows(axis_labels, character_width=8.5)
+    baseline_y = top + plot_h
+    axis_label_y = [baseline_y + 54 + row_index * 23 for row_index in axis_label_rows]
+    axis_title_y = max(baseline_y + 122,
+                       (max(axis_label_y, default=baseline_y + 54) + 48))
+    height = max(height, int(axis_title_y + 78))
 
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Estimated Read SNM versus Model VDD" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
@@ -1678,18 +1709,19 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
         parts += [f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
                   f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="14">{value:.0f}</text>']
 
-    valid_rows = [row for row in rows if row["rsnm_mv"] is not None]
     curve_points = []
     closure = analysis.get("eye_closure")
     if closure:
         curve_points.append(xy(closure["estimated_vcc_v"], 0.0))
     curve_points.extend(xy(row["vcc_v"], row["rsnm_mv"]) for row in valid_rows)
-    for row in valid_rows:
+    for row, voltage_y in zip(valid_rows, axis_label_y):
         x, y = xy(row["vcc_v"], row["rsnm_mv"])
-        parts.append(
-            f'<path data-vdd-guide="{row["vcc_v"]:.2f}" d="M{x:.1f} {y+6:.1f} V{top+plot_h:.1f}" '
-            'stroke="#B9D7FF" stroke-width="1.5" stroke-dasharray="4 5"/>'
-        )
+        parts += [
+            f'<path data-vdd-guide="{row["vcc_v"]:.2f}" d="M{x:.1f} {y+6:.1f} V{voltage_y-18:.1f}" '
+            'stroke="#B9D7FF" stroke-width="1.5" stroke-dasharray="4 5"/>',
+            f'<text x="{x:.1f}" y="{voltage_y:.1f}" text-anchor="middle" fill="#0062CC" '
+            f'font-size="15" font-weight="700">{row["vcc_v"]:.2f} V</text>',
+        ]
     if curve_points:
         points_text = " ".join(f"{x:.1f},{y:.1f}" for x, y in curve_points)
         parts.append(f'<polyline points="{points_text}" fill="none" stroke="#007AFF" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>')
@@ -1711,7 +1743,8 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
         else:
             label_dx, label_dy, label_anchor = (0, -30 if index % 2 == 0 else 28, "middle")
         parts += [f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#FFFFFF" stroke="#007AFF" stroke-width="3"/>',
-                  f'<text x="{x+label_dx:.1f}" y="{y+label_dy:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" font-size="14" font-weight="700">{row["rsnm_mv"]:.1f} mV</text>']
+                  f'<text x="{x+label_dx:.1f}" y="{y+label_dy:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" '
+                  f'font-size="16" font-weight="700" style="paint-order:stroke;stroke:#FFFFFF;stroke-width:6;stroke-linejoin:round">{row["rsnm_mv"]:.1f} mV</text>']
     for row in rows:
         if row["valid_eye"]:
             continue
@@ -1725,8 +1758,8 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 720) -> 
     else:
         parts.append(f'<text x="{left+plot_w-8}" y="{top+28}" text-anchor="end" fill="#C56A00" font-size="16" font-weight="700">Eye-closure VDD not bracketed by the entered rows</text>')
     parts += [
-        f'<text x="{left+plot_w/2}" y="{height-62}" text-anchor="middle" fill="#1D1D1F" font-size="18">Model VDD (V)</text>',
-        f'<text x="38" y="{top+plot_h/2}" transform="rotate(-90 38 {top+plot_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="18">Read SNM (mV)</text>',
+        f'<text x="{left+plot_w/2}" y="{axis_title_y:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">Model VDD (V)</text>',
+        f'<text x="38" y="{top+plot_h/2}" transform="rotate(-90 38 {top+plot_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">Read SNM (mV)</text>',
         f'<text x="{width/2}" y="{height-18}" text-anchor="middle" fill="#6E6E73" font-size="14">X = no valid butterfly eye. Boundary is a compact-model estimate and is not measured WT Vmin.</text>',
         '</svg>',
     ]
@@ -3727,7 +3760,7 @@ def launch_gui() -> None:
         curve_canvas.delete("all")
         width = max(curve_canvas.winfo_width(), 520)
         height = max(curve_canvas.winfo_height(), 420)
-        left_margin, right_margin, top_margin, bottom_margin = 72, 24, 42, 68
+        left_margin, right_margin, top_margin, bottom_margin = 78, 24, 42, 142
         plot_width = width - left_margin - right_margin
         plot_height = height - top_margin - bottom_margin
         if not curve_result:
@@ -3766,13 +3799,28 @@ def launch_gui() -> None:
             display_points.append(xy(closure["estimated_vcc_v"], 0.0))
         display_points.extend(xy(row["vcc_v"], row["rsnm_mv"]) for row in valid_rows)
         baseline_y = top_margin + plot_height
-        for row in valid_rows:
+        voltage_labels = [(xy(row["vcc_v"], 0.0)[0], f'{row["vcc_v"]:.2f} V')
+                          for row in valid_rows]
+        voltage_label_rows = _stagger_label_rows(
+            voltage_labels, character_width=7.2, minimum_gap=7.0)
+        voltage_label_y = [baseline_y + 44 + label_row * 18
+                           for label_row in voltage_label_rows]
+        for row, label_y in zip(valid_rows, voltage_label_y):
             guide_x, guide_y = xy(row["vcc_v"], row["rsnm_mv"])
-            curve_canvas.create_line(guide_x, guide_y + 5, guide_x, baseline_y,
+            curve_canvas.create_line(guide_x, guide_y + 5, guide_x, label_y - 13,
                                      fill="#B9D7FF", width=1, dash=(3, 4))
+            curve_canvas.create_text(
+                guide_x, label_y, text=f'{row["vcc_v"]:.2f} V',
+                fill="#0062CC", font=("Calibri", 11, "bold"))
         if len(display_points) >= 2:
             curve_canvas.create_line(*[coordinate for point in display_points for coordinate in point],
                                      fill=BLUE, width=3, smooth=False)
+
+        curve_segment_boxes = [
+            (int(min(first[0], second[0]) - 5), int(min(first[1], second[1]) - 5),
+             int(max(first[0], second[0]) + 5), int(max(first[1], second[1]) + 5))
+            for first, second in zip(display_points, display_points[1:])
+        ]
 
         placed_label_boxes: list[tuple[int, int, int, int]] = []
 
@@ -3784,10 +3832,10 @@ def launch_gui() -> None:
                         first[1] - padding > second[3])
 
         label_candidates = (
-            (-11, -9, "se"), (11, -9, "sw"),
-            (-11, 9, "ne"), (11, 9, "nw"),
-            (0, -15, "s"), (0, 15, "n"),
-            (-16, 0, "e"), (16, 0, "w"),
+            (-15, -13, "se"), (15, -13, "sw"),
+            (-15, 13, "ne"), (15, 13, "nw"),
+            (0, -22, "s"), (0, 22, "n"),
+            (-22, 0, "e"), (22, 0, "w"),
         )
         for index, row in enumerate(valid_rows):
             x, y = xy(row["vcc_v"], row["rsnm_mv"])
@@ -3798,7 +3846,7 @@ def launch_gui() -> None:
                 label_item = curve_canvas.create_text(
                     x + label_dx, y + label_dy,
                     text=f'{row["rsnm_mv"]:.1f} mV', fill=TEXT,
-                    anchor=label_anchor, font=("Calibri", 10, "bold"))
+                    anchor=label_anchor, font=("Calibri", 11, "bold"))
                 bbox = curve_canvas.bbox(label_item)
                 within_plot = bool(bbox and bbox[0] >= left_margin + 3 and
                                    bbox[2] <= left_margin + plot_width - 3 and
@@ -3806,19 +3854,31 @@ def launch_gui() -> None:
                                    bbox[3] <= baseline_y - 3)
                 collision = bool(bbox and any(boxes_overlap(bbox, used)
                                               for used in placed_label_boxes))
-                if bbox and within_plot and not collision:
+                curve_collision = bool(bbox and any(
+                    boxes_overlap(bbox, segment, padding=1)
+                    for segment in curve_segment_boxes))
+                if bbox and within_plot and not collision and not curve_collision:
                     placed_label_boxes.append(bbox)
                     chosen_item = label_item
+                    label_background = curve_canvas.create_rectangle(
+                        bbox[0] - 2, bbox[1] - 1, bbox[2] + 2, bbox[3] + 1,
+                        fill=CARD, outline="")
+                    curve_canvas.tag_lower(label_background, label_item)
                     break
                 curve_canvas.delete(label_item)
             if chosen_item is None:
                 fallback_y = max(top_margin + 12, min(y - 14, baseline_y - 12))
                 chosen_item = curve_canvas.create_text(
                     x, fallback_y, text=f'{row["rsnm_mv"]:.1f} mV', fill=TEXT,
-                    anchor="s", font=("Calibri", 10, "bold"))
+                    anchor="s", font=("Calibri", 11, "bold"))
                 fallback_bbox = curve_canvas.bbox(chosen_item)
                 if fallback_bbox:
                     placed_label_boxes.append(fallback_bbox)
+                    label_background = curve_canvas.create_rectangle(
+                        fallback_bbox[0] - 2, fallback_bbox[1] - 1,
+                        fallback_bbox[2] + 2, fallback_bbox[3] + 1,
+                        fill=CARD, outline="")
+                    curve_canvas.tag_lower(label_background, chosen_item)
         for row in rows:
             if row["valid_eye"]:
                 continue
@@ -3832,10 +3892,10 @@ def launch_gui() -> None:
             curve_canvas.create_text(x + 8, top_margin + 12,
                                      text=f'Eye-closure VDD {closure["estimated_vcc_v"]:.4f} V',
                                      anchor="w", fill="#C56A00", font=("Calibri", 12, "bold"))
-        curve_canvas.create_text(left_margin + plot_width / 2, height - 25, text="Model VDD (V)",
-                                 fill=TEXT, font=("Calibri", 10, "bold"))
+        curve_canvas.create_text(left_margin + plot_width / 2, height - 24, text="Model VDD (V)",
+                                 fill=TEXT, font=("Calibri", 12, "bold"))
         curve_canvas.create_text(18, top_margin + plot_height / 2, text="Read SNM (mV)", angle=90,
-                                 fill=TEXT, font=("Calibri", 10, "bold"))
+                                 fill=TEXT, font=("Calibri", 12, "bold"))
 
     curve_canvas.bind("<Configure>", draw_curve_chart)
     draw_curve_chart()
