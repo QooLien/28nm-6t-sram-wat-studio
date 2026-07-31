@@ -1671,6 +1671,87 @@ def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
     }
 
 
+def analyze_write_trip_margin_curve(points: list[RsnmVccPoint], cfg: Config,
+                                    fit_points: int = 801) -> dict:
+    """Estimate write-trip margin versus VDD from grouped PU/PG/PD WAT inputs.
+
+    WTM is the rise permitted on the nominally-low write bitline while the
+    access device can still overcome the pull-up at the inverter trip point.
+    It is a compact-model trend metric rather than measured Select_Write Vmin.
+    """
+    if len(points) < 2:
+        raise ValueError("Enter at least two VDD rows")
+    fit_points = max(201, int(fit_points))
+    ordered = sorted(points, key=lambda point: point.vcc_v)
+    for index, point in enumerate(ordered):
+        if not math.isfinite(point.vcc_v) or not 0 < point.vcc_v <= SNM_PLOT_AXIS_MAX_V:
+            raise ValueError(
+                f"Row {index + 1}: VDD must be > 0 and <= {SNM_PLOT_AXIS_MAX_V:.2f} V")
+        if index and abs(point.vcc_v - ordered[index - 1].vcc_v) < 1e-12:
+            raise ValueError(f"Duplicate VDD row: {point.vcc_v:.6g} V")
+        for name, mos in (("PU", point.pu), ("PG", point.pg), ("PD", point.pd)):
+            if not math.isfinite(mos.vt) or mos.vt <= 0:
+                raise ValueError(f"Row {index + 1} {name}: Vt must be greater than zero")
+            if not math.isfinite(mos.ids) or mos.ids < 0:
+                raise ValueError(f"Row {index + 1} {name}: Idsat must be zero or greater")
+
+    def evaluate(point: RsnmVccPoint) -> dict:
+        point_cfg = replace(cfg, nominal_vdd=point.vcc_v, wat_vdd=point.vcc_v,
+                            grid_points=fit_points)
+        wat = WatPoint(
+            f"VDD_{point.vcc_v:.6g}", point.pu.vt, point.pu.ids,
+            point.pg.vt, point.pg.ids, point.pd.vt, point.pd.ids,
+        )
+        margin_v = Sram6T(wat, point_cfg).write_snm(point.vcc_v)
+        valid = bool(math.isfinite(margin_v) and margin_v > 1e-9)
+        return {"valid": valid, "wtm_mv": 1000.0 * margin_v if valid else None}
+
+    evaluated = []
+    for point in ordered:
+        result = evaluate(point)
+        evaluated.append({
+            "vdd_v": point.vcc_v,
+            "pu_vt_v": point.pu.vt, "pu_idsat_ua": point.pu.ids,
+            "pg_vt_v": point.pg.vt, "pg_idsat_ua": point.pg.ids,
+            "pd_vt_v": point.pd.vt, "pd_idsat_ua": point.pd.ids,
+            "wtm_mv": result["wtm_mv"], "writable": result["valid"],
+            "status": "WRITABLE" if result["valid"] else "NO WRITE MARGIN",
+        })
+
+    boundary = None
+    for index in range(len(ordered) - 1):
+        if evaluated[index]["writable"] or not evaluated[index + 1]["writable"]:
+            continue
+        low_point, high_point = ordered[index], ordered[index + 1]
+        low_v, high_v = low_point.vcc_v, high_point.vcc_v
+        for _ in range(16):
+            middle_v = (low_v + high_v) / 2.0
+            middle_point = _interpolate_rsnm_vcc_point(low_point, high_point, middle_v)
+            if evaluate(middle_point)["valid"]:
+                high_v = middle_v
+            else:
+                low_v = middle_v
+        boundary = {
+            "estimated_vdd_v": (low_v + high_v) / 2.0,
+            "lower_no_margin_vdd_v": low_v,
+            "upper_writable_vdd_v": high_v,
+            "source_low_vdd_v": low_point.vcc_v,
+            "source_high_vdd_v": high_point.vcc_v,
+            "method": "Bisection with linear interpolation of Vt and Idsat between bracketing rows",
+        }
+        break
+
+    return {
+        "rows": evaluated,
+        "write_boundary": boundary,
+        "axis_max_v": SNM_PLOT_AXIS_MAX_V,
+        "fit_points": fit_points,
+        "definition": (
+            "Estimated write-trip margin is low-bitline voltage tolerance; "
+            "the boundary is not measured Select_Write Vmin"),
+    }
+
+
 def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 780) -> str:
     """Render Read SNM versus manually supplied operating VDD values."""
     rows = analysis["rows"]
@@ -1807,6 +1888,86 @@ def write_rsnm_vcc_curve_outputs(analysis: dict, out_dir: str | os.PathLike[str]
     <section><h2>Input and calculated values</h2><table><thead><tr><th>VDD (V)</th><th>PU Vt</th><th>PU Isat</th><th>PG Vt</th><th>PG Isat</th><th>PD Vt</th><th>PD Isat</th><th>RSNM (mV)</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table></section>
     </main></body></html>'''
     report = out / "rsnm_vcc_report.html"
+    report.write_text(document, encoding="utf-8")
+    return report
+
+
+def write_trip_margin_curve_svg(analysis: dict, width: int = 1280,
+                                height: int = 780) -> str:
+    """Render WTM versus VDD with the same visual grammar as the RSNM curve."""
+    boundary = analysis.get("write_boundary")
+    adapted = {
+        "rows": [
+            {**row, "vcc_v": row["vdd_v"], "rsnm_mv": row["wtm_mv"],
+             "valid_eye": row["writable"]}
+            for row in analysis["rows"]
+        ],
+        "eye_closure": ({"estimated_vcc_v": boundary["estimated_vdd_v"]}
+                        if boundary else None),
+    }
+    svg = rsnm_vcc_curve_svg(adapted, width=width, height=height)
+    replacements = (
+        ("Estimated Read SNM versus Model VDD", "Estimated Write Trip Margin versus Model VDD"),
+        ("Estimated RSNM versus Model VDD", "Estimated Write Trip Margin versus Model VDD"),
+        ("Estimated eye-closure VDD", "Estimated write boundary VDD"),
+        ("Eye-closure VDD not bracketed by the entered rows",
+         "Write boundary VDD not bracketed by the entered rows"),
+        ("Read SNM (mV)", "Write Trip Margin (mV)"),
+        ("X = no valid butterfly eye. Boundary is a compact-model estimate and is not measured WT Vmin.",
+         "X = no positive write margin. Boundary is a compact-model estimate and is not measured Select_Write Vmin."),
+    )
+    for source, target in replacements:
+        svg = svg.replace(source, target)
+    return svg
+
+
+def write_write_trip_margin_outputs(analysis: dict,
+                                    out_dir: str | os.PathLike[str]) -> Path:
+    """Write HTML, PNG, SVG, CSV and JSON for manual WTM/VDD analysis."""
+    out = Path(out_dir)
+    image_dir = out / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    svg_path = image_dir / "01_write_trip_margin_vs_model_vdd.svg"
+    png_path = image_dir / "01_write_trip_margin_vs_model_vdd.png"
+    svg_path.write_text(write_trip_margin_curve_svg(analysis), encoding="utf-8")
+    try:
+        from reportlab.graphics import renderPM
+        from svglib.svglib import svg2rlg
+    except ImportError as exc:
+        raise RuntimeError(
+            "PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
+    drawing = svg2rlg(str(svg_path))
+    if drawing is None:
+        raise RuntimeError("Could not render Write Trip Margin versus VDD chart")
+    renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
+
+    csv_fields = ["vdd_v", "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
+                  "pd_vt_v", "pd_idsat_ua", "wtm_mv", "writable", "status"]
+    with open(out / "write_trip_margin_curve.csv", "w", newline="",
+              encoding="utf-8-sig") as source:
+        writer = csv.DictWriter(source, fieldnames=csv_fields)
+        writer.writeheader()
+        writer.writerows({key: row.get(key) for key in csv_fields}
+                         for row in analysis["rows"])
+    (out / "write_trip_margin_curve.json").write_text(
+        json.dumps(analysis, indent=2), encoding="utf-8")
+
+    boundary = analysis.get("write_boundary")
+    boundary_text = (f'{boundary["estimated_vdd_v"]:.4f} V'
+                     if boundary else "Not bracketed")
+    table_rows = "".join(
+        f'<tr><td>{row["vdd_v"]:.3f}</td><td>{row["pu_vt_v"]:.4f}</td><td>{row["pu_idsat_ua"]:.3f}</td>'
+        f'<td>{row["pg_vt_v"]:.4f}</td><td>{row["pg_idsat_ua"]:.3f}</td>'
+        f'<td>{row["pd_vt_v"]:.4f}</td><td>{row["pd_idsat_ua"]:.3f}</td>'
+        f'<td>{_fmt(row["wtm_mv"], 2)}</td><td>{row["status"]}</td></tr>'
+        for row in analysis["rows"])
+    document = f'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HV28 SRAM Analysis - Write Trip Margin</title>
+    <style>:root{{font:100%/1.5 Calibri,"Microsoft JhengHei",Arial,sans-serif;color:#1d1d1f;background:#f5f5f7}}*{{box-sizing:border-box}}body{{margin:0;padding:2rem}}main{{max-width:1500px;margin:auto}}h1{{font-size:2.6rem;letter-spacing:-.03em}}section{{background:#fff;border-radius:1.25rem;padding:1.5rem;margin:1rem 0}}img{{display:block;width:100%;height:auto;border:1px solid #e5e5ea;border-radius:1rem}}table{{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}}th,td{{padding:.7rem;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}.note{{color:#6e6e73}}</style></head><body><main>
+    <h1>HV28 SRAM Analysis</h1><p>Manual VDD / PU / PG / PD WAT write-trip analysis</p>
+    <section><h2>Estimated Write Trip Margin versus Model VDD</h2><p><b>Estimated write boundary VDD:</b> {boundary_text}</p><img src="images/{png_path.name}" alt="Estimated Write Trip Margin versus Model VDD"><p class="note">WTM is the permitted rise of the nominally-low write bitline while PG can still overcome PU at the inverter trip point. This compact-model estimate is not measured Select_Write Vmin.</p></section>
+    <section><h2>Input and calculated values</h2><table><thead><tr><th>VDD (V)</th><th>PU Vt</th><th>PU Isat</th><th>PG Vt</th><th>PG Isat</th><th>PD Vt</th><th>PD Isat</th><th>WTM (mV)</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table></section>
+    </main></body></html>'''
+    report = out / "write_trip_margin_report.html"
     report.write_text(document, encoding="utf-8")
     return report
 
@@ -3337,8 +3498,10 @@ def launch_gui() -> None:
     notebook.pack(fill="both", expand=True)
     bitcell_tab = ttk.Frame(notebook, style="Root.TFrame")
     curve_tab = ttk.Frame(notebook, style="Root.TFrame")
+    write_margin_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
     notebook.add(curve_tab, text="RSNM vs VDD Curve")
+    notebook.add(write_margin_tab, text="Write Trip Margin")
 
     content = ttk.Frame(bitcell_tab, style="Root.TFrame"); content.pack(fill="both", expand=True)
     content.columnconfigure(0, weight=7); content.columnconfigure(1, weight=4); content.rowconfigure(0, weight=1)
@@ -3998,6 +4161,147 @@ def launch_gui() -> None:
                                    style="Quiet.TButton", command=open_curve_report)
     curve_open_button.pack(fill="x", pady=(7, 0))
     curve_open_button.state(["disabled"])
+
+    # Independent write-trip analysis. It intentionally reuses the same manual
+    # VDD/WAT rows so Read and Write trends are compared from identical inputs.
+    write_margin_tab.columnconfigure(0, weight=4)
+    write_margin_tab.columnconfigure(1, weight=9)
+    write_margin_tab.rowconfigure(0, weight=1)
+    wtm_input_card = ttk.Frame(write_margin_tab, style="Card.TFrame", padding=20)
+    wtm_input_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+    wtm_chart_card = ttk.Frame(write_margin_tab, style="Card.TFrame", padding=18)
+    wtm_chart_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    wtm_chart_card.columnconfigure(0, weight=1)
+    wtm_chart_card.rowconfigure(3, weight=1)
+
+    ttk.Label(wtm_input_card, text="Write Trip Margin", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(
+        wtm_input_card,
+        text=("Uses the VDD / PU / PG / PD rows from the RSNM tab. "
+              "The result estimates how far the low write bitline may rise while PG can still overcome PU."),
+        style="Meta.TLabel", wraplength=410).pack(anchor="w", pady=(3, 16))
+    wtm_definition = tk.Frame(wtm_input_card, bg="#F5F9FF", padx=14, pady=12)
+    wtm_definition.pack(fill="x", pady=(0, 14))
+    tk.Label(wtm_definition, text="Interpretation", bg="#F5F9FF", fg=TEXT,
+             font=("Calibri", 11, "bold"), anchor="w").pack(fill="x")
+    tk.Label(
+        wtm_definition,
+        text=("Larger positive WTM means more write voltage tolerance. "
+              "WTM near 0 mV indicates the model write boundary. It is not measured Select_Write Vmin."),
+        bg="#F5F9FF", fg=SECONDARY, font=("Calibri", 10),
+        justify="left", wraplength=380, anchor="w").pack(fill="x", pady=(4, 0))
+    ttk.Button(wtm_input_card, text="Edit shared VDD inputs", style="Quiet.TButton",
+               command=lambda: notebook.select(curve_tab)).pack(fill="x", pady=(0, 14))
+
+    wtm_status = tk.StringVar(value="Ready to estimate Write Trip Margin")
+    wtm_status_label = tk.Label(
+        wtm_input_card, textvariable=wtm_status, bg=CARD, fg=SECONDARY,
+        font=("Calibri", 9), anchor="w", justify="left", wraplength=410)
+    wtm_status_label.pack(fill="x", pady=(3, 6))
+    wtm_progress = ttk.Progressbar(
+        wtm_input_card, mode="indeterminate", style="Apple.Horizontal.TProgressbar")
+    wtm_progress.pack(fill="x", pady=(0, 9))
+
+    ttk.Label(wtm_chart_card, text="Estimated Write Trip Margin Curve",
+              style="ChartTitle.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        wtm_chart_card,
+        text="X: Model VDD (V)  /  Y: Write Trip Margin (mV). X marks indicate no positive modeled write margin.",
+        style="Meta.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 6))
+    wtm_summary = tk.StringVar(value="Analyze at least two shared VDD rows to display the curve.")
+    wtm_summary_label = tk.Label(
+        wtm_chart_card, textvariable=wtm_summary, bg=CARD, fg=SECONDARY,
+        font=("Calibri", 10, "bold"), anchor="w", justify="left")
+    wtm_summary_label.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+    wtm_canvas = tk.Canvas(wtm_chart_card, bg=CARD, highlightthickness=0, bd=0,
+                           width=720, height=550)
+    wtm_canvas.grid(row=3, column=0, sticky="nsew")
+    wtm_canvas.create_text(360, 260, text="Write Trip Margin curve will appear here",
+                           fill=SECONDARY, font=("Calibri", 13))
+    wtm_result_queue: queue.Queue = queue.Queue()
+    wtm_report_path: Path | None = None
+    wtm_chart_image = None
+
+    def wtm_worker(points: list[RsnmVccPoint], cfg: Config,
+                   out_path: Path, wafer_id: str) -> None:
+        try:
+            analysis = analyze_write_trip_margin_curve(points, cfg)
+            run_dir = create_run_output_dir(out_path, wafer_id, "write_trip_margin_vdd_curve")
+            report = write_write_trip_margin_outputs(analysis, run_dir)
+            wtm_result_queue.put((True, analysis, report))
+        except Exception as exc:
+            wtm_result_queue.put((False, None, exc))
+
+    def poll_wtm_result() -> None:
+        nonlocal wtm_report_path, wtm_chart_image
+        try:
+            ok, analysis, payload = wtm_result_queue.get_nowait()
+        except queue.Empty:
+            root.after(80, poll_wtm_result)
+            return
+        wtm_progress.stop()
+        wtm_analyze_button.state(["!disabled"])
+        if ok:
+            wtm_report_path = Path(payload)
+            boundary = analysis.get("write_boundary")
+            if boundary:
+                wtm_summary.set(
+                    f'Estimated write boundary VDD: {boundary["estimated_vdd_v"]:.4f} V')
+                wtm_summary_label.configure(fg="#C56A00")
+            else:
+                wtm_summary.set("Write boundary VDD not bracketed by the entered rows")
+                wtm_summary_label.configure(fg=SECONDARY)
+            wtm_status.set(
+                f"Complete - {len(analysis['rows'])} VDD point(s); saved to {wtm_report_path.parent}")
+            wtm_status_label.configure(fg=GREEN)
+            wtm_open_button.state(["!disabled"])
+            png_path = wtm_report_path.parent / "images" / "01_write_trip_margin_vs_model_vdd.png"
+            image = tk.PhotoImage(file=str(png_path))
+            wtm_chart_image = image.subsample(2, 2)
+            wtm_canvas.delete("all")
+            wtm_canvas.create_image(
+                max(wtm_canvas.winfo_width(), 720) / 2,
+                max(wtm_canvas.winfo_height(), 550) / 2,
+                image=wtm_chart_image, anchor="center")
+        else:
+            wtm_status.set("Write Trip Margin analysis could not be completed")
+            wtm_status_label.configure(fg=RED)
+            messagebox.showerror("Write Trip Margin analysis", str(payload))
+
+    def execute_wtm_analysis() -> None:
+        try:
+            points, cfg = collect_curve_inputs()
+        except Exception as exc:
+            wtm_status.set("Check the shared VDD sweep input values")
+            wtm_status_label.configure(fg=RED)
+            messagebox.showerror("Invalid VDD sweep input", str(exc))
+            return
+        wtm_status.set("Calculating Write Trip Margin at each VDD point...")
+        wtm_status_label.configure(fg=BLUE)
+        wtm_analyze_button.state(["disabled"])
+        wtm_open_button.state(["disabled"])
+        wtm_progress.start(10)
+        wafer_id = values["corner"].get().strip() or "Manual"
+        output_path = Path(values["out"].get())
+        threading.Thread(target=wtm_worker,
+                         args=(points, cfg, output_path, wafer_id), daemon=True).start()
+        root.after(80, poll_wtm_result)
+
+    def open_wtm_report() -> None:
+        if wtm_report_path and wtm_report_path.exists():
+            webbrowser.open(wtm_report_path.resolve().as_uri())
+
+    wtm_action_row = ttk.Frame(wtm_input_card, style="Card.TFrame")
+    wtm_action_row.pack(side="bottom", fill="x", pady=(8, 0))
+    wtm_analyze_button = ttk.Button(
+        wtm_action_row, text="Analyze Write Trip Margin vs VDD",
+        style="Accent.TButton", command=execute_wtm_analysis)
+    wtm_analyze_button.pack(fill="x")
+    wtm_open_button = ttk.Button(
+        wtm_action_row, text="Open HTML Result", style="Quiet.TButton",
+        command=open_wtm_report)
+    wtm_open_button.pack(fill="x", pady=(7, 0))
+    wtm_open_button.state(["disabled"])
 
     def persist_and_close() -> None:
         state = {

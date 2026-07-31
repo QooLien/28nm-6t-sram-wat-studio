@@ -8,10 +8,12 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_rsnm_vcc_curve, generic_28nm_assumption_rows,
+    _read_wat_excel_rows, analyze_rsnm_vcc_curve, analyze_write_trip_margin_curve,
+    generic_28nm_assumption_rows,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, read_wat_csv, rsnm_vcc_curve_svg,
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_outputs, write_rsnm_vcc_curve_outputs,
+    write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
 
 
@@ -383,6 +385,38 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((report.parent / "rsnm_vcc_curve.csv").exists())
             self.assertTrue((report.parent / "images" / "01_rsnm_vs_model_vcc.png").exists())
             self.assertIn("Estimated eye-closure VDD", report.read_text(encoding="utf-8"))
+
+    def test_write_trip_margin_curve_brackets_boundary_and_exports(self):
+        base_vt = {"pu": .385, "pg": .365, "pd": .355}
+        base_ids = {"pu": 44.0, "pg": 82.0, "pd": 124.0}
+
+        def scaled(kind, vdd):
+            return base_ids[kind] * (max(vdd - base_vt[kind], 0) /
+                                     (.9 - base_vt[kind])) ** 2
+
+        points = [
+            RsnmVccPoint(vdd,
+                         MosWat(base_vt["pu"], scaled("pu", vdd)),
+                         MosWat(base_vt["pg"], scaled("pg", vdd)),
+                         MosWat(base_vt["pd"], scaled("pd", vdd)))
+            for vdd in (.34, .38, .40, .50, .90)
+        ]
+        analysis = analyze_write_trip_margin_curve(points, self.cfg, fit_points=401)
+        self.assertFalse(analysis["rows"][0]["writable"])
+        self.assertTrue(analysis["rows"][-1]["writable"])
+        self.assertIsNotNone(analysis["write_boundary"])
+        self.assertGreater(analysis["write_boundary"]["estimated_vdd_v"], .38)
+        self.assertLess(analysis["write_boundary"]["estimated_vdd_v"], .40)
+        svg = write_trip_margin_curve_svg(analysis)
+        self.assertIn("Estimated Write Trip Margin versus Model VDD", svg)
+        self.assertIn("Write Trip Margin (mV)", svg)
+        self.assertIn("Estimated write boundary VDD", svg)
+        with tempfile.TemporaryDirectory() as td:
+            report = write_write_trip_margin_outputs(analysis, Path(td) / "wtm")
+            self.assertTrue(report.exists())
+            self.assertTrue((report.parent / "write_trip_margin_curve.csv").exists())
+            self.assertTrue((report.parent / "images" /
+                             "01_write_trip_margin_vs_model_vdd.png").exists())
 
 
 if __name__ == "__main__":

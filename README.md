@@ -11,6 +11,7 @@ The active workflow is focused on:
 - Independent analytical Read SNM cross-check
 - PU / PG / PD Vt and Idsat comparison
 - Manual grouped-PU/PG/PD RSNM-versus-VDD curve analysis and eye-closure estimation
+- Write Trip Margin versus VDD trend analysis and estimated write boundary
 
 Hold SNM and Vmin comparison are not included in the active report.
 
@@ -33,6 +34,8 @@ The **RSNM vs VDD Curve** tab is an independent workflow:
 3. Select `Analyze RSNM vs VDD` to update the embedded chart and generate HTML, PNG, SVG, CSV and JSON results.
 
 Each row's Idsat is treated as measured at that row's VDD. The program recalibrates the compact device strengths for every row. If an invalid-eye row and the next valid-eye row bracket the boundary, Vt and Idsat are linearly interpolated and a bisection search estimates the eye-closure VDD. This model boundary is not measured WT Vmin.
+
+The **Write Trip Margin** tab reuses the same manual VDD / PU / PG / PD rows so Read and Write trends are based on identical WAT inputs. It calculates the maximum rise allowed on the nominally-low write bitline while PG can still overcome PU, then estimates the boundary between zero and positive write margin. The tab independently generates HTML, PNG, SVG, CSV and JSON results. This boundary is a compact-model reference and is not measured `Select_Write Vmin`.
 
 ## Read SNM chart convention
 
