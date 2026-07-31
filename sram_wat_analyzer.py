@@ -3194,7 +3194,10 @@ def launch_gui() -> None:
     style.configure("Apple.TNotebook.Tab", background="#E9E9ED", foreground=TEXT,
                     borderwidth=0, padding=(18, 9), font=("Calibri", 10, "bold"))
     style.map("Apple.TNotebook.Tab", background=[("selected", CARD), ("active", "#F0F0F4")],
-              foreground=[("selected", BLUE)])
+              foreground=[("selected", BLUE)],
+              font=[("selected", ("Calibri", 12, "bold")),
+                    ("!selected", ("Calibri", 10, "bold"))],
+              padding=[("selected", (22, 12)), ("!selected", (18, 9))])
 
     saved_state = load_gui_state()
 
@@ -3557,16 +3560,18 @@ def launch_gui() -> None:
     curve_row_vars: list[dict[str, tk.StringVar]] = []
     curve_table = ttk.Frame(curve_input_card, style="Card.TFrame")
     curve_table.pack(fill="x")
-    header_row = ttk.Frame(curve_table, style="Card.TFrame")
-    header_row.pack(fill="x")
-    tk.Label(header_row, text="#", bg=CARD, fg=SECONDARY,
-             font=("Calibri", 9, "bold"), width=3).grid(row=0, column=0, padx=(0, 2))
+    curve_table.columnconfigure(0, minsize=30)
+    for column in range(1, len(curve_columns) + 1):
+        curve_table.columnconfigure(column, minsize=72, weight=1, uniform="curve_data")
+    tk.Label(curve_table, text="#", bg=CARD, fg=SECONDARY,
+             font=("Calibri", 9, "bold")).grid(
+                 row=0, column=0, padx=(0, 3), pady=(0, 3), sticky="ew")
     for column, (_key, label, color) in enumerate(curve_columns, 1):
         unit = "(V)" if _key == "vcc" or _key.endswith("_vt") else "(uA)"
-        tk.Label(header_row, text=f"{label}\n{unit}", bg=CARD, fg=color,
-                 font=("Calibri", 8, "bold"), width=8).grid(row=0, column=column, padx=2)
-    curve_rows_frame = ttk.Frame(curve_table, style="Card.TFrame")
-    curve_rows_frame.pack(fill="x", pady=(3, 0))
+        tk.Label(curve_table, text=f"{label}\n{unit}", bg=CARD, fg=color,
+                 font=("Calibri", 8, "bold")).grid(
+                     row=0, column=column, padx=3, pady=(0, 3), sticky="ew")
+    curve_row_widgets: list[tk.Widget] = []
 
     def default_curve_rows() -> list[dict[str, str]]:
         base_vt = {"pu": .385, "pg": .365, "pd": .355}
@@ -3588,14 +3593,19 @@ def launch_gui() -> None:
         return result
 
     def rebuild_curve_rows() -> None:
-        for child in curve_rows_frame.winfo_children():
+        for child in curve_row_widgets:
             child.destroy()
+        curve_row_widgets.clear()
         for row_index, variables in enumerate(curve_row_vars):
-            tk.Label(curve_rows_frame, text=str(row_index + 1), bg=CARD, fg=SECONDARY,
-                     font=("Calibri", 8), width=3).grid(row=row_index, column=0, padx=(0, 2), pady=2)
+            number_label = tk.Label(curve_table, text=str(row_index + 1), bg=CARD, fg=SECONDARY,
+                                    font=("Calibri", 8))
+            number_label.grid(row=row_index + 1, column=0, padx=(0, 3), pady=2, sticky="ew")
+            curve_row_widgets.append(number_label)
             for column, (key, _label, _color) in enumerate(curve_columns, 1):
-                ttk.Entry(curve_rows_frame, textvariable=variables[key], width=8,
-                          style="Apple.TEntry").grid(row=row_index, column=column, padx=2, pady=2)
+                entry = ttk.Entry(curve_table, textvariable=variables[key], width=7,
+                                  style="Apple.TEntry")
+                entry.grid(row=row_index + 1, column=column, padx=3, pady=2, sticky="ew")
+                curve_row_widgets.append(entry)
 
     def append_curve_row(data: dict[str, object] | None = None) -> None:
         if len(curve_row_vars) >= 20:
