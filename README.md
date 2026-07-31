@@ -114,6 +114,14 @@ Geometry and temperature are documented reference values. They do not override b
 
 ## Outputs
 
+Every GUI and command-line analysis creates a separate archive directory so an older result is never overwritten:
+
+```text
+output/YYYY-MM-DD/WaferID/HHMMSS_analysis-name/
+```
+
+If two runs start during the same second, `_02`, `_03`, and so on are appended automatically. Windows-invalid characters in the Lot/Wafer ID are replaced with underscores. Each run also includes `run_info.json` with the original Wafer ID, local creation time, analysis type and absolute output directory.
+
 - `sram_wat_report.html`: main interactive report
 - `snm_target_comparison.csv`: Read SNM and Write SNM proxy, Lot/Wafer versus WAT Target
 - `read_snm_state_mismatch.csv`: upper-left/lower-right state margins, conservative Cell RSNM, signed delta and mismatch index
@@ -130,7 +138,7 @@ Geometry and temperature are documented reference values. They do not override b
 - `images/03_write_snm_target_comparison.svg`: scalable chart source
 - `images/image_manifest.csv`: image manifest
 
-The manual curve tab writes to `output/rsnm_vcc_curve/`:
+The manual curve tab uses the same dated archive structure with the `rsnm_vdd_curve` analysis name:
 
 - `rsnm_vcc_report.html`: dedicated RSNM-versus-VDD report (legacy-compatible filename)
 - `rsnm_vcc_curve.csv`: manual inputs, calculated RSNM and valid-eye status

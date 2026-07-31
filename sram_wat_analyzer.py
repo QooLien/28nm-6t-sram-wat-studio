@@ -20,6 +20,7 @@ import statistics as statlib
 import sys
 import webbrowser
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -77,6 +78,41 @@ DISPLAY_MOS_NAMES = {
     "pg1": "PGL", "pg2": "PGR",
     "pd1": "PDL", "pd2": "PDR",
 }
+
+
+def _safe_path_component(value: object, fallback: str) -> str:
+    """Return a Windows-safe, readable directory component."""
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value).strip())
+    text = re.sub(r"\s+", "_", text).strip(" ._")
+    return (text[:80] or fallback)
+
+
+def create_run_output_dir(base_dir: str | os.PathLike[str], wafer_id: object,
+                          analysis_name: str,
+                          timestamp: datetime | None = None) -> Path:
+    """Create a unique date/Wafer/time analysis directory and run manifest."""
+    instant = timestamp or datetime.now().astimezone()
+    wafer = _safe_path_component(wafer_id, "Unknown_Wafer")
+    analysis = _safe_path_component(analysis_name, "analysis")
+    parent = Path(base_dir) / instant.strftime("%Y-%m-%d") / wafer
+    stem = f'{instant.strftime("%H%M%S")}_{analysis}'
+    suffix = 1
+    while True:
+        candidate = parent / (stem if suffix == 1 else f"{stem}_{suffix:02d}")
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            suffix += 1
+    manifest = {
+        "wafer_id": str(wafer_id).strip() or "Unknown Wafer",
+        "analysis": analysis_name,
+        "created_local": instant.isoformat(timespec="seconds"),
+        "output_directory": str(candidate.resolve()),
+    }
+    (candidate / "run_info.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -3029,7 +3065,8 @@ def write_excel_sweep_outputs(entries: list[dict], out_dir: str | os.PathLike[st
 
 
 def analyze_excel_wat_sweep(path: str | os.PathLike[str], out_dir: str | os.PathLike[str], cfg: Config,
-                            targets: DatasheetTargets | None = None) -> Path:
+                            targets: DatasheetTargets | None = None,
+                            archive_run: bool = False) -> Path:
     """Analyze each imported model voltage and create one combined Excel sweep report."""
     validate_config(cfg)
     samples = read_wat_excel(path, cfg.nominal_vdd)
@@ -3045,6 +3082,11 @@ def analyze_excel_wat_sweep(path: str | os.PathLike[str], out_dir: str | os.Path
             status = "Analyzed"
         entries.append({"lot_wafer": sample.lot_wafer, "model_vdd_v": sample.model_vdd_v,
                         "statistics": sample.statistics, "analysis_status": status, "result": result})
+    if archive_run:
+        wafer_ids = sorted({sample.lot_wafer for sample in samples})
+        wafer_label = (wafer_ids[0] if len(wafer_ids) == 1 else
+                       f"{wafer_ids[0]}_plus_{len(wafer_ids) - 1}")
+        out_dir = create_run_output_dir(out_dir, wafer_label, "excel_vdd_sweep")
     return write_excel_sweep_outputs(entries, out_dir)
 
 
@@ -3054,22 +3096,22 @@ def run_analysis(csv_path: str, out_dir: str, cfg: Config, corner: str | None = 
     if Path(csv_path).suffix.lower() == ".xlsx":
         if corner:
             raise ValueError("--corner is not used for Excel model-VDD sweep import")
-        return [analyze_excel_wat_sweep(csv_path, Path(out_dir) / "excel_model_vdd_sweep", cfg, targets)]
+        return [analyze_excel_wat_sweep(csv_path, out_dir, cfg, targets, archive_run=True)]
     points = read_wat_csv(csv_path)
     if corner:
         points = [p for p in points if p.corner.lower() == corner.lower()]
         if not points:
             raise ValueError(f"corner not found: {corner}")
     reports = []
-    multi = len(points) > 1
     for p in points:
-        target = Path(out_dir)/p.corner if multi else Path(out_dir)
         if targets:
             cell = ThreeTWatCell(p.corner, MosWat(p.pu_vt, p.pu_ids),
                                  MosWat(p.pg_vt, p.pg_ids), MosWat(p.pd_vt, p.pd_ids))
-            reports.append(write_outputs(analyze_three_mos(cell, cfg, targets), target))
+            result = analyze_three_mos(cell, cfg, targets)
         else:
-            reports.append(write_outputs(analyze(p, cfg), target))
+            result = analyze(p, cfg)
+        target = create_run_output_dir(out_dir, p.corner, "6t_analysis")
+        reports.append(write_outputs(result, target))
     return reports
 
 
@@ -3139,7 +3181,8 @@ def _launch_legacy_gui() -> None:
                                  _positive(wat_values[f"{name}_ids"].get(),f"{name}_ids"))
             point=SixTWatCell(values["corner"].get().strip() or "Manual",**mos)
             status.set("分析中…"); root.update_idletasks()
-            report=write_outputs(analyze_six_mos(point,cfg),values["out"].get())
+            run_dir=create_run_output_dir(values["out"].get(),point.corner,"6t_analysis")
+            report=write_outputs(analyze_six_mos(point,cfg),run_dir)
             status.set(f"完成：{point.corner}；{report}")
             webbrowser.open(report.resolve().as_uri())
         except Exception as exc:
@@ -3441,6 +3484,9 @@ def launch_gui() -> None:
         selected = filedialog.askdirectory()
         if selected: values["out"].set(selected)
     ttk.Button(out_row, text="Choose…", style="Quiet.TButton", command=pick_out).pack(side="left", padx=(7, 0))
+    ttk.Label(right,
+              text="Each run is archived as YYYY-MM-DD / WaferID / HHMMSS_analysis.",
+              style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(0, 10))
 
     status = tk.StringVar(value="Ready to analyze")
     status_label = tk.Label(right, textvariable=status, bg=CARD, fg=SECONDARY,
@@ -3477,14 +3523,16 @@ def launch_gui() -> None:
                targets: DatasheetTargets, out_path: str) -> None:
         try:
             result = analyze_six_mos(cell, cfg, targets)
-            report = write_outputs(result, out_path)
+            run_dir = create_run_output_dir(out_path, cell.corner, "6t_analysis")
+            report = write_outputs(result, run_dir)
             result_queue.put((True, cell, report))
         except Exception as exc:
             result_queue.put((False, None, exc))
 
     def excel_worker(excel_path: str, cfg: Config, targets: DatasheetTargets, out_path: str) -> None:
         try:
-            report = analyze_excel_wat_sweep(excel_path, Path(out_path) / "excel_model_vdd_sweep", cfg, targets)
+            report = analyze_excel_wat_sweep(
+                excel_path, out_path, cfg, targets, archive_run=True)
             result_queue.put((True, None, report))
         except Exception as exc:
             result_queue.put((False, None, exc))
@@ -3496,7 +3544,7 @@ def launch_gui() -> None:
         progress.stop(); analyze_button.state(["!disabled"]); excel_analyze_button.state(["!disabled"])
         if ok:
             label = "Excel model-VDD sweep" if cell is None else cell.corner
-            status.set(f"Complete · {label} · HTML report opened")
+            status.set(f"Complete - {label}; saved to {Path(payload).parent}")
             status_label.configure(fg=GREEN)
             webbrowser.open(Path(payload).resolve().as_uri())
         else:
@@ -3818,10 +3866,12 @@ def launch_gui() -> None:
         validate_config(cfg)
         return points, cfg
 
-    def curve_worker(points: list[RsnmVccPoint], cfg: Config, out_path: Path) -> None:
+    def curve_worker(points: list[RsnmVccPoint], cfg: Config,
+                     out_path: Path, wafer_id: str) -> None:
         try:
             analysis = analyze_rsnm_vcc_curve(points, cfg)
-            report = write_rsnm_vcc_curve_outputs(analysis, out_path)
+            run_dir = create_run_output_dir(out_path, wafer_id, "rsnm_vdd_curve")
+            report = write_rsnm_vcc_curve_outputs(analysis, run_dir)
             curve_result_queue.put((True, analysis, report))
         except Exception as exc:
             curve_result_queue.put((False, None, exc))
@@ -3846,7 +3896,8 @@ def launch_gui() -> None:
                 summary = "Eye-closure VDD not bracketed by the entered rows"
                 curve_summary_label.configure(fg=SECONDARY)
             curve_summary.set(summary)
-            curve_status.set(f"Complete - {len(analysis['rows'])} VDD point(s); HTML and PNG saved")
+            curve_status.set(
+                f"Complete - {len(analysis['rows'])} VDD point(s); saved to {Path(payload).parent}")
             curve_status_label.configure(fg=GREEN)
             curve_open_button.state(["!disabled"])
             draw_curve_chart()
@@ -3868,8 +3919,10 @@ def launch_gui() -> None:
         curve_analyze_button.state(["disabled"])
         curve_open_button.state(["disabled"])
         curve_progress.start(10)
-        output_path = Path(values["out"].get()) / "rsnm_vcc_curve"
-        threading.Thread(target=curve_worker, args=(points, cfg, output_path), daemon=True).start()
+        wafer_id = values["corner"].get().strip() or "Manual"
+        output_path = Path(values["out"].get())
+        threading.Thread(target=curve_worker,
+                         args=(points, cfg, output_path, wafer_id), daemon=True).start()
         root.after(80, poll_curve_result)
 
     def open_curve_report() -> None:

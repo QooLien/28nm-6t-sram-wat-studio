@@ -1,6 +1,7 @@
 import csv
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from sram_wat_analyzer import (
@@ -8,7 +9,7 @@ from sram_wat_analyzer import (
     SixTWatCell, Sram6T, ThreeTWatCell,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, analyze_rsnm_vcc_curve, generic_28nm_assumption_rows,
-    load_gui_state, model_vdd_butterfly_svg, read_wat_csv, rsnm_vcc_curve_svg,
+    create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, read_wat_csv, rsnm_vcc_curve_svg,
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_outputs, write_rsnm_vcc_curve_outputs,
 )
@@ -19,6 +20,18 @@ class AnalyzerTests(unittest.TestCase):
         self.cfg = Config(grid_points=101)
         self.targets = DatasheetTargets(MosWat(.380, 45), MosWat(.370, 80), MosWat(.360, 120))
         self.cell = ThreeTWatCell("LOT_W01", MosWat(.385, 44), MosWat(.365, 82), MosWat(.355, 124))
+
+    def test_run_output_directory_uses_date_time_wafer_and_never_overwrites(self):
+        stamp = datetime(2026, 8, 1, 14, 30, 25)
+        with tempfile.TemporaryDirectory() as td:
+            first = create_run_output_dir(td, "LOT/W01:17", "6t analysis", stamp)
+            second = create_run_output_dir(td, "LOT/W01:17", "6t analysis", stamp)
+            self.assertEqual(first.relative_to(td).parts,
+                             ("2026-08-01", "LOT_W01_17", "143025_6t_analysis"))
+            self.assertEqual(second.name, "143025_6t_analysis_02")
+            manifest = (first / "run_info.json").read_text(encoding="utf-8")
+            self.assertIn('"wafer_id": "LOT/W01:17"', manifest)
+            self.assertIn('"created_local": "2026-08-01T14:30:25"', manifest)
 
     def test_read_snm_is_bounded(self):
         model = Sram6T(self.cell.representative(), self.cfg)
