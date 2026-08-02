@@ -177,14 +177,15 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((output / "analytical_read_snm.csv").exists())
             self.assertFalse((output / "analytical_read_snm_eq_3_36.csv").exists())
             self.assertTrue((output / "wat_electrical_snm_table.csv").exists())
-            self.assertTrue((output / "generic_28nm_assumptions.csv").exists())
+            self.assertTrue((output / "cell_geometry_reference.csv").exists())
+            self.assertFalse((output / "generic_28nm_assumptions.csv").exists())
             self.assertIn("Analytical Read SNM Reference", html)
             self.assertNotIn("PDF", html)
             self.assertNotIn("Figure 3.15", html)
             self.assertNotIn("Equation 3.36", html)
             self.assertIn("WAT Electrical Parameters", html)
             self.assertIn("No W/L, Cox, mobility", html)
-            self.assertIn("Generic 28 nm Default Assumptions", html)
+            self.assertIn("6T Cell Geometry Reference", html)
             self.assertIn("VTH,eff", html)
             self.assertIn("Read SNM Butterfly and Left/Right Mismatch", html)
             self.assertIn("Mismatch index", html)
@@ -221,15 +222,14 @@ class AnalyzerTests(unittest.TestCase):
             "WAT Vt + Idsat; no PDK/model-card-only parameters",
         )
 
-    def test_generic_defaults_are_explicit_and_do_not_override_wat(self):
+    def test_geometry_references_are_explicit_and_do_not_override_wat(self):
         result = analyze_three_mos(self.cell, self.cfg, self.targets)
         rows = {row["parameter"]: row for row in generic_28nm_assumption_rows(result)}
-        self.assertEqual(rows["Technology node"]["value"], 28)
         self.assertEqual(rows["Channel length L"]["value"], 28.0)
-        self.assertEqual(rows["Channel length L"]["active"], "NO")
-        self.assertEqual(rows["Beta"]["active"], "YES")
-        self.assertIn("WAT Vt and Idsat", rows["Beta"]["source"])
-        self.assertEqual(rows["Cox / mobility / tox / lambda"]["value"], "Not required")
+        self.assertEqual(rows["Channel length L"]["active"], "REFERENCE")
+        self.assertEqual(rows["Geometry Cell Ratio"]["value"], 1.4)
+        self.assertAlmostEqual(rows["Geometry Pull-up Ratio"]["value"], 1.4286, places=4)
+        self.assertEqual(len(rows), 6)
 
     def test_editable_technology_assumptions_propagate(self):
         cfg = Config(
@@ -253,6 +253,10 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(tech["nominal_temperature_c"], 30.0)
         self.assertEqual(tech["read_wordline_over_vdd"], 0.95)
         self.assertEqual(tech["read_bitline_over_vdd"], 0.98)
+
+    def test_geometry_reference_rejects_zero_width(self):
+        with self.assertRaisesRegex(ValueError, "PG width must be a positive"):
+            analyze_three_mos(self.cell, Config(grid_points=101, pg_width_nm=0.0), self.targets)
 
     def test_read_bias_assumptions_affect_read_snm(self):
         baseline = analyze_three_mos(self.cell, self.cfg, self.targets)["baseline_6t"]["metrics"]["read_snm_mv"]

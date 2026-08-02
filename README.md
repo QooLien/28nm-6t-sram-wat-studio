@@ -24,7 +24,7 @@ For a company intranet/offline PC, follow [INTRANET_PC_SETUP.md](INTRANET_PC_SET
 1. Enter the six independent PUL / PUR / PGL / PGR / PDL / PDR WAT Vt and Idsat values.
 2. Enter the corresponding PU / PG / PD WAT Target values.
 3. Set SRAM VDD and WAT calibration VDD.
-4. Review or replace the editable `Generic 28 nm Default Assumptions` values. A blank field automatically uses its generic default.
+4. Review or replace the four `6T Cell Geometry Reference` values: channel length and PU/PG/PD widths. A blank field automatically uses its generic default.
 5. Select `Analyze & Open HTML`.
 
 The **RSNM vs VDD Curve** tab is an independent workflow:
@@ -101,19 +101,16 @@ VTH,eff = mean(|Vt_PU|, Vt_PG, Vt_PD)
 
 It is reported separately from the geometric VTC result. If its real-valued mathematical domain is not satisfied, the result is shown as N/A.
 
-## Generic 28 nm editable defaults
+## 6T cell geometry reference
 
-Measured WAT values always take priority. These interface fields may be replaced when verified process information becomes available; leaving one blank restores its generic default:
+Measured WAT values always take priority. The interface keeps only these known geometry fields; leaving one blank restores its generic default:
 
-- SRAM VDD: 0.90 V
-- WAT calibration VDD: 0.90 V
-- Reference temperature: 25 °C
-- Reference channel length: 28 nm
-- Reference WPU / WPG / WPD: 70 / 100 / 140 nm
-- Read WL and precharged bitlines: VDD
-- Write WL / BL / BLB: VDD / 0 V / VDD
+- Channel length L: 28 nm
+- PU width: 70 nm
+- PG width: 100 nm
+- PD width: 140 nm
 
-Geometry and temperature are documented reference values. They do not override beta calibrated from WAT Vt and Idsat.
+The report also derives `Geometry Cell Ratio = WPD/WPG` and `Geometry Pull-up Ratio = WPG/WPU`. These are architecture references beside the electrical beta ratios. They do not override beta calibrated from WAT Vt and Idsat, because multiplying W/L into measured Idsat again would double-count device strength.
 
 ## Outputs
 
@@ -130,7 +127,7 @@ If two runs start during the same second, `_02`, `_03`, and so on are appended a
 - `read_snm_state_mismatch.csv`: upper-left/lower-right state margins, conservative Cell RSNM, signed delta and mismatch index
 - `wat_electrical_snm_table.csv`: WAT inputs, derived ratios, Read SNM and Write SNM proxy
 - `analytical_read_snm.csv`: analytical Read SNM parameters and result
-- `generic_28nm_assumptions.csv`: default parameter policy and active status
+- `cell_geometry_reference.csv`: L/W geometry values and derived ratio references
 - `wat_target_comparison.csv`: PU / PG / PD Vt and Idsat deltas
 - `sram_wat_results.json`: detailed model data
 - `images/01_read_snm_target_comparison.png`: Read VTC target comparison

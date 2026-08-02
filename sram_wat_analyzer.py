@@ -280,6 +280,15 @@ TECH_28NM = Tech28nm()
 
 def tech_from_config(cfg: Config) -> Tech28nm:
     """Resolve editable GUI assumptions, falling back to generic defaults."""
+    geometry = {
+        "Channel length L": cfg.channel_length_nm,
+        "PU width": cfg.pu_width_nm,
+        "PG width": cfg.pg_width_nm,
+        "PD width": cfg.pd_width_nm,
+    }
+    for label, value in geometry.items():
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{label} must be a positive finite value")
     return replace(
         TECH_28NM,
         node_nm=int(round(cfg.technology_node_nm)),
@@ -2425,43 +2434,23 @@ def wat_electrical_snm_rows(result: dict) -> list[dict]:
 
 
 def generic_28nm_assumption_rows(result: dict) -> list[dict]:
-    """Describe every non-WAT default and whether it affects active SNM math."""
-    cfg, tech = result["config"], result["technology"]
+    """Describe the maintained bitcell geometry and its ratio references."""
+    tech = result["technology"]
+    cell_ratio = tech["pd_width_nm"] / tech["pg_width_nm"]
+    pull_up_ratio = tech["pg_width_nm"] / tech["pu_width_nm"]
     return [
-        {"parameter": "Technology node", "value": tech["node_nm"], "unit": "nm",
-         "source": "Editable model parameter; generic default 28 nm", "used_by": "Model identity", "active": "YES"},
-        {"parameter": "Process family", "value": tech["process_family"], "unit": "-",
-         "source": "Generic engineering assumption", "used_by": "Scope label", "active": "YES"},
-        {"parameter": "SRAM VDD", "value": cfg["nominal_vdd"], "unit": "V",
-         "source": "Model setting; default 0.90 V", "used_by": "Read VTC and analytical RSNM", "active": "YES"},
-        {"parameter": "WAT calibration VDD", "value": cfg["wat_vdd"], "unit": "V",
-         "source": "Model setting; default 0.90 V", "used_by": "Beta proxy calibration", "active": "YES"},
         {"parameter": "Channel length L", "value": tech["channel_length_nm"], "unit": "nm",
-         "source": "Editable model parameter; generic default 28 nm", "used_by": "Architecture reference only", "active": "NO"},
+         "source": "User input; generic default 28 nm", "used_by": "6T geometry reference", "active": "REFERENCE"},
         {"parameter": "PU width", "value": tech["pu_width_nm"], "unit": "nm",
-         "source": "Editable model parameter; generic default 70 nm", "used_by": "Architecture reference only", "active": "NO"},
+         "source": "User input; generic default 70 nm", "used_by": "Pull-up geometry ratio", "active": "REFERENCE"},
         {"parameter": "PG width", "value": tech["pg_width_nm"], "unit": "nm",
-         "source": "Editable model parameter; generic default 100 nm", "used_by": "Architecture reference only", "active": "NO"},
+         "source": "User input; generic default 100 nm", "used_by": "Cell / pull-up geometry ratios", "active": "REFERENCE"},
         {"parameter": "PD width", "value": tech["pd_width_nm"], "unit": "nm",
-         "source": "Editable model parameter; generic default 140 nm", "used_by": "Architecture reference only", "active": "NO"},
-        {"parameter": "Nominal temperature", "value": tech["nominal_temperature_c"], "unit": "°C",
-         "source": "Editable model parameter; generic default 25 °C", "used_by": "Reference; no temperature coefficients", "active": "NO"},
-        {"parameter": "Read WL", "value": tech["read_wordline_over_vdd"], "unit": "×VDD",
-         "source": "Editable read-bias parameter; generic default 1.0", "used_by": "Read VTC", "active": "YES"},
-        {"parameter": "Read BL / BLB precharge", "value": tech["read_bitline_over_vdd"], "unit": "×VDD",
-         "source": "Editable read-bias parameter; generic default 1.0", "used_by": "Read VTC", "active": "YES"},
-        {"parameter": "Write WL", "value": tech["write_wordline_over_vdd"], "unit": "×VDD",
-         "source": "Editable write-bias parameter; generic default 1.0", "used_by": "Write VTC and WSNM proxy", "active": "YES"},
-        {"parameter": "Write BL", "value": tech["write_low_bitline_over_vdd"], "unit": "×VDD",
-         "source": "Editable write-bias parameter; generic default 0.0", "used_by": "Write VTC and WSNM proxy", "active": "YES"},
-        {"parameter": "Write BLB", "value": tech["write_high_bitline_over_vdd"], "unit": "×VDD",
-         "source": "Editable write-bias parameter; generic default 1.0", "used_by": "Write VTC", "active": "YES"},
-        {"parameter": "Beta", "value": tech["beta_policy"], "unit": "µA/V²",
-         "source": "Derived from WAT Vt and Idsat", "used_by": "All compact VTC equations", "active": "YES"},
-        {"parameter": "Common VTH", "value": tech["common_vth_policy"], "unit": "V",
-         "source": "Mapped from three measured WAT Vt values", "used_by": "Analytical Read SNM only", "active": "YES"},
-        {"parameter": "Cox / mobility / tox / lambda", "value": "Not required", "unit": "-",
-         "source": "Intentionally not guessed", "used_by": "Replaced by WAT beta calibration", "active": "NO"},
+         "source": "User input; generic default 140 nm", "used_by": "Cell geometry ratio", "active": "REFERENCE"},
+        {"parameter": "Geometry Cell Ratio", "value": round(cell_ratio, 4), "unit": "WPD/WPG",
+         "source": "Derived from entered widths", "used_by": "Reference beside WAT-calibrated beta ratio", "active": "REFERENCE"},
+        {"parameter": "Geometry Pull-up Ratio", "value": round(pull_up_ratio, 4), "unit": "WPG/WPU",
+         "source": "Derived from entered widths", "used_by": "Reference beside WAT-calibrated beta ratio", "active": "REFERENCE"},
     ]
 
 
@@ -3016,7 +3005,7 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         writer.writeheader(); writer.writerows(electrical_snm_rows)
 
     assumption_rows = generic_28nm_assumption_rows(result)
-    with open(out / "generic_28nm_assumptions.csv", "w", newline="", encoding="utf-8-sig") as assumption_file:
+    with open(out / "cell_geometry_reference.csv", "w", newline="", encoding="utf-8-sig") as assumption_file:
         writer = csv.DictWriter(assumption_file, fieldnames=list(assumption_rows[0]))
         writer.writeheader(); writer.writerows(assumption_rows)
 
@@ -3096,10 +3085,10 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         f'<td>{html.escape(str(row["value"]))}</td><td>{html.escape(str(row["unit"]))}</td>'
         f'<td>{html.escape(str(row["source"]))}</td><td>{html.escape(str(row["used_by"]))}</td>'
         f'<td>{row["active"]}</td></tr>' for row in assumption_rows)
-    assumption_section = f'''<section><h2>Generic 28 nm Default Assumptions</h2>
-    <p>Measured WAT Vt and Idsat always take priority. Parameters unavailable from WAT are filled only when the present formula needs them. Geometry and temperature are shown as generic references but are not silently used to replace WAT calibration.</p>
-    <table><thead><tr><th>Parameter</th><th>Default / policy</th><th>Unit</th><th>Source class</th><th>Used by</th><th>Active in SNM</th></tr></thead><tbody>{assumption_table_rows}</tbody></table>
-    <p><b>Important:</b> Cox, carrier mobility, oxide thickness and channel-length modulation are not guessed because the active compact model obtains effective beta directly from WAT Vt/Idsat. Adding arbitrary values for them would double-count device strength and make the result less defensible.</p></section>'''
+    assumption_section = f'''<section><h2>6T Cell Geometry Reference</h2>
+    <p>Channel length and PU/PG/PD widths are retained as known architecture references. The report derives geometry Cell Ratio = WPD/WPG and Pull-up Ratio = WPG/WPU from them.</p>
+    <table><thead><tr><th>Parameter</th><th>Value</th><th>Unit</th><th>Source class</th><th>Used by</th><th>Role</th></tr></thead><tbody>{assumption_table_rows}</tbody></table>
+    <p><b>Calculation policy:</b> VTC and SNM continue to use beta calibrated directly from measured WAT Vt/Idsat. Because the entered Idsat already represents measured device drive, W/L is not multiplied into beta a second time. Geometry ratios are comparison references unless future input supplies current normalized by device width.</p></section>'''
     object_section = ""
     if "cell" in result:
         mos_rows = "".join(
@@ -3135,7 +3124,7 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     {target_section}
     <section><h2>Model Settings</h2><table><tbody><tr><td>Technology node</td><td>28 nm generic compact model</td></tr><tr><td>SRAM analysis VDD</td><td>{cfg["nominal_vdd"]:.3f} V</td></tr><tr><td>WAT calibration VDD</td><td>{cfg["wat_vdd"]:.3f} V</td></tr></tbody></table></section>
     {object_section}
-    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>read_snm_state_mismatch.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>generic_28nm_assumptions.csv</code>, <code>analytical_read_snm.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/{png_name}</code>, <code>images/{butterfly_png_name}</code> and <code>images/{write_png_name}</code>.</p>
+    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>read_snm_state_mismatch.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>cell_geometry_reference.csv</code>, <code>analytical_read_snm.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/{png_name}</code>, <code>images/{butterfly_png_name}</code> and <code>images/{write_png_name}</code>.</p>
     </main></body></html>'''
     report = out / "sram_wat_report.html"
     report.write_text(document, encoding="utf-8")
@@ -3469,17 +3458,10 @@ def launch_gui() -> None:
         "wat_vdd": tk.StringVar(value=saved_text("numeric", "wat_vdd", config_defaults.wat_vdd)),
     }
     assumption_specs = (
-        ("technology_node_nm", "Technology node", "nm"),
         ("channel_length_nm", "Channel length L", "nm"),
         ("pu_width_nm", "PU width", "nm"),
         ("pg_width_nm", "PG width", "nm"),
         ("pd_width_nm", "PD width", "nm"),
-        ("nominal_temperature_c", "Nominal temperature", "°C"),
-        ("read_wordline_over_vdd", "Read WL / VDD", "×VDD"),
-        ("read_bitline_over_vdd", "Read BL / VDD", "×VDD"),
-        ("write_wordline_over_vdd", "Write WL / VDD", "×VDD"),
-        ("write_low_bitline_over_vdd", "Write BL / VDD", "×VDD"),
-        ("write_high_bitline_over_vdd", "Write BLB / VDD", "×VDD"),
     )
     assumption_values = {
         key: tk.StringVar(value=saved_text("assumptions", key, getattr(config_defaults, key)))
@@ -3648,7 +3630,7 @@ def launch_gui() -> None:
 
     assumption_header = ttk.Frame(right, style="Card.TFrame")
     assumption_header.pack(fill="x", pady=(15, 0))
-    ttk.Label(assumption_header, text="Generic 28 nm Default Assumptions",
+    ttk.Label(assumption_header, text="6T Cell Geometry Reference",
               style="Body.TLabel").pack(side="left")
 
     def restore_assumption_defaults() -> None:
@@ -3658,7 +3640,7 @@ def launch_gui() -> None:
     ttk.Button(assumption_header, text="Restore Defaults", style="Quiet.TButton",
                command=restore_assumption_defaults).pack(side="right")
     ttk.Label(right,
-              text="Replace a value when verified process information is available. A blank field uses the displayed generic default.",
+              text="Keep the known L and PU/PG/PD widths here. Blank fields use the generic 28 nm defaults; ratios are reported as references without double-counting measured Idsat.",
               style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(3, 5))
     assumption_grid = ttk.Frame(right, style="Card.TFrame")
     assumption_grid.pack(fill="x")
