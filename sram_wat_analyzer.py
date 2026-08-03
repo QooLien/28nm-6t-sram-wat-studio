@@ -429,6 +429,7 @@ def _fit_butterfly_squares(direct_curve: list[tuple[float, float]],
     states = (("upper_left", "Left node=0 / Right node=1"),
               ("lower_right", "Left node=1 / Right node=0"))
     squares = []
+    failed_lobes: list[str] = []
     for lobe, ((start, stop), (state_key, state_label)) in enumerate(
             zip(((0, split), (split, len(xs) - 1)), states), 1):
         best_side = 0.0
@@ -449,19 +450,21 @@ def _fit_butterfly_squares(direct_curve: list[tuple[float, float]],
                 elif right_index > left_index:
                     break
         if best_position is None:
-            return {"valid": False, "reason": f"No square found in lobe {lobe}",
-                    "snm_v": None, "snm_mv": None, "squares": squares}
+            failed_lobes.append(state_key)
+            best_position = (xs[start], bounds[start][1])
         squares.append({"lobe": lobe, "state_key": state_key, "state": state_label,
                         "x_v": best_position[0], "y_v": best_position[1],
-                        "side_v": best_side, "side_mv": 1000.0 * best_side})
+                        "side_v": best_side, "side_mv": 1000.0 * best_side,
+                        "fit_valid": state_key not in failed_lobes})
 
     upper_v, lower_v = squares[0]["side_v"], squares[1]["side_v"]
     mean_v = (upper_v + lower_v) / 2.0
     delta_v = upper_v - lower_v
     snm_v = min(upper_v, lower_v)
     return {
-        "valid": True,
-        "reason": "Independent two-eye maximum-square fit",
+        "valid": not failed_lobes,
+        "reason": ("Independent two-eye maximum-square fit" if not failed_lobes else
+                   "No positive square in: " + ", ".join(failed_lobes)),
         "definition": "Cell Read SNM is the smaller of the two state-dependent square sides",
         "mode": mode,
         "grid_points": len(xs),
@@ -476,8 +479,67 @@ def _fit_butterfly_squares(direct_curve: list[tuple[float, float]],
         "delta_snm_v": delta_v,
         "delta_snm_mv": 1000.0 * delta_v,
         "mismatch_index_pct": (abs(delta_v) / mean_v * 100.0 if mean_v > 0 else None),
+        "failed_state_keys": failed_lobes,
         "squares": squares,
     }
+
+
+def _fit_write_closing_eye(direct_curve: list[tuple[float, float]],
+                           mirrored_curve: list[tuple[float, float]],
+                           fallback: dict) -> dict:
+    """Fit the write-destabilized eye bounded by its two DC crossings.
+
+    During a BL sweep, the eye belonging to the state being overwritten is
+    bounded by a stable and a metastable crossing.  Restricting the square to
+    that interval prevents the fitter from jumping to the surviving state as
+    the write eye becomes small.  With one non-rail crossing the cell is still
+    in the undisturbed/read-like region, so the ordinary limiting square is
+    used.  With no sign-changing crossing, the write eye has closed.
+    """
+    xs = [point[0] for point in direct_curve]
+    differences = [direct_curve[index][1] - mirrored_curve[index][1]
+                   for index in range(len(xs))]
+    crossing_intervals = [
+        index for index in range(len(xs) - 1)
+        if differences[index] * differences[index + 1] < 0
+    ]
+    if not crossing_intervals:
+        return {"side_v": 0.0, "side_mv": 0.0, "fit_valid": False,
+                "crossing_count": 0, "reason": "Write-state eye is closed"}
+    if len(crossing_intervals) == 1:
+        side_v = float(fallback.get("snm_v") or 0.0)
+        return {"side_v": side_v, "side_mv": 1000.0 * side_v,
+                "fit_valid": side_v > 0, "crossing_count": 1,
+                "reason": "Read-like region; ordinary limiting square applies"}
+
+    # The first adjacent crossing pair bounds the write-destabilized eye for
+    # the BL-low / BLB-high polarity used here.
+    start = crossing_intervals[0]
+    stop = crossing_intervals[1] + 1
+    bounds = [(min(direct_curve[index][1], mirrored_curve[index][1]),
+               max(direct_curve[index][1], mirrored_curve[index][1]))
+              for index in range(len(xs))]
+    best_side = 0.0
+    best_position = None
+    for left_index in range(start, stop + 1):
+        minimum_upper = math.inf
+        maximum_lower = -math.inf
+        for right_index in range(left_index, stop + 1):
+            minimum_upper = min(minimum_upper, bounds[right_index][1])
+            maximum_lower = max(maximum_lower, bounds[right_index][0])
+            side = xs[right_index] - xs[left_index]
+            clearance = minimum_upper - maximum_lower
+            if side <= clearance + 1e-12:
+                if side > best_side:
+                    best_side = side
+                    best_position = (xs[left_index], maximum_lower)
+            elif right_index > left_index:
+                break
+    return {"side_v": best_side, "side_mv": 1000.0 * best_side,
+            "fit_valid": best_side > 0, "crossing_count": len(crossing_intervals),
+            "x_v": None if best_position is None else best_position[0],
+            "y_v": None if best_position is None else best_position[1],
+            "reason": "Maximum square inside the write-destabilized eye"}
 
 
 class Sram6T:
@@ -544,6 +606,48 @@ class Sram6T:
             low.append((vin, self.transfer_with_bitline(vin, vdd, low_bl, wl)))
             high.append((vin, self.transfer_with_bitline(vin, vdd, high_bl, wl)))
         return low, high
+
+    def write_butterfly(self, vdd: float, low_bitline: float,
+                        high_bitline: float | None = None,
+                        points: int = 401) -> dict:
+        """Return the full-cell write butterfly at one low-bitline voltage.
+
+        Coordinates are x=high-BLB storage node and y=low-BL storage node.
+        The low-BL inverter directly produces y=f_low(x); the high-BLB
+        inverter produces x=f_high(y), whose inverse is plotted on the
+        common y(x) axes.
+        """
+        high_bl = vdd if high_bitline is None else high_bitline
+        wl = self.cfg.write_wordline_over_vdd * vdd
+        n = max(21, int(points))
+        low_curve = [
+            (vdd * index / (n - 1),
+             self.transfer_with_bitline(vdd * index / (n - 1), vdd, low_bitline, wl))
+            for index in range(n)
+        ]
+        high_curve = [
+            (vdd * index / (n - 1),
+             self.transfer_with_bitline(vdd * index / (n - 1), vdd, high_bl, wl))
+            for index in range(n)
+        ]
+        mirrored_high = _inverse_vtc(high_curve)
+        fitted = _fit_butterfly_squares(low_curve, mirrored_high, vdd, "write")
+        closing_eye = _fit_write_closing_eye(low_curve, mirrored_high, fitted)
+        fitted.update({"snm_v": closing_eye["side_v"],
+                       "snm_mv": closing_eye["side_mv"],
+                       "write_closing_eye": closing_eye})
+        fitted.update({
+            "low_bitline_v": low_bitline,
+            "high_bitline_v": high_bl,
+            "wordline_v": wl,
+            "coordinate_definition": {
+                "x": "storage-node voltage on the high-BLB side",
+                "y": "storage-node voltage on the low-BL side",
+                "direct_vtc": "low-BL inverter: y=f_low(x)",
+                "mirrored_vtc": "inverse high-BLB inverter: y=f_high^-1(x)",
+            },
+        })
+        return fitted
 
     def vtc(self, vdd: float, mode: str = "hold", points: int | None = None) -> list[tuple[float, float]]:
         n = points or self.cfg.grid_points
@@ -788,6 +892,184 @@ class AsymmetricSram6T:
         return {"read_butterfly": fitted, "read_vtc": direct_plot,
                 "read_vtc_mirrored": mirrored_plot}
 
+    def write_butterfly(self, vdd: float, low_bitline: float,
+                        high_bitline: float | None = None,
+                        points: int = 401) -> dict:
+        """Write butterfly retaining all six left/right WAT objects."""
+        high_bl = vdd if high_bitline is None else high_bitline
+        wl = self.cfg.write_wordline_over_vdd * vdd
+        n = max(21, int(points))
+        low_curve = [
+            (vdd * index / (n - 1),
+             self.left.transfer_with_bitline(
+                 vdd * index / (n - 1), vdd, low_bitline, wl))
+            for index in range(n)
+        ]
+        high_curve = [
+            (vdd * index / (n - 1),
+             self.right.transfer_with_bitline(
+                 vdd * index / (n - 1), vdd, high_bl, wl))
+            for index in range(n)
+        ]
+        mirrored_high = _inverse_vtc(high_curve)
+        fitted = _fit_butterfly_squares(low_curve, mirrored_high, vdd, "write")
+        closing_eye = _fit_write_closing_eye(low_curve, mirrored_high, fitted)
+        fitted.update({"snm_v": closing_eye["side_v"],
+                       "snm_mv": closing_eye["side_mv"],
+                       "write_closing_eye": closing_eye})
+        fitted.update({
+            "low_bitline_v": low_bitline,
+            "high_bitline_v": high_bl,
+            "wordline_v": wl,
+            "coordinate_definition": {
+                "x": "right storage-node voltage (PUR/PGR/PDR, high-BLB side)",
+                "y": "left storage-node voltage (PUL/PGL/PDL, low-BL side)",
+                "direct_vtc": "left inverter: y=f_left(x), PGL tied to BL low",
+                "mirrored_vtc": "inverse right inverter: y=f_right^-1(x), PGR tied to BLB high",
+            },
+        })
+        return fitted
+
+
+def write_snm_vs_bitline(vdd: float,
+                         butterfly_at_bl: Callable[[float, int], dict],
+                         sweep_points: int = 37,
+                         fit_points: int = 401) -> dict:
+    """Sweep write BL and find the textbook SNM=0 write boundary.
+
+    BLB and WL are held at VDD by the supplied butterfly solver.  The write
+    direction is BL: VDD -> 0 V.  Cell WSNM at each point is the smaller of
+    the two state-dependent butterfly-square sides.  The write-trip BL
+    voltage is the open/closed-eye boundary; the required BL swing is
+    VDD-write_trip_bl.
+    """
+    if not math.isfinite(vdd) or vdd <= 0:
+        raise ValueError("VDD must be a positive finite value")
+    sweep_points = max(9, int(sweep_points))
+    fit_points = max(101, int(fit_points))
+    cache: dict[float, dict] = {}
+
+    def solve(bitline_v: float) -> dict:
+        key = round(min(vdd, max(0.0, bitline_v)), 12)
+        if key not in cache:
+            cache[key] = butterfly_at_bl(key, fit_points)
+        return cache[key]
+
+    def is_open(result: dict) -> bool:
+        return bool(result.get("snm_v", 0.0) > max(1e-9, vdd / fit_points / 2.0))
+
+    rows = []
+    for index in range(sweep_points):
+        bl = vdd * index / (sweep_points - 1)
+        fitted = solve(bl)
+        rows.append({
+            "write_bl_v": bl,
+            "cell_write_snm_mv": fitted.get("snm_mv", 0.0),
+            "upper_left_snm_mv": fitted.get("snm_upper_left_mv", 0.0),
+            "lower_right_snm_mv": fitted.get("snm_lower_right_mv", 0.0),
+            "eye_open": is_open(fitted),
+        })
+
+    closed_at_zero = not is_open(solve(0.0))
+    open_at_vdd = is_open(solve(vdd))
+    if closed_at_zero and open_at_vdd:
+        closed_bl, open_bl = 0.0, vdd
+        for _ in range(26):
+            mid = (closed_bl + open_bl) / 2.0
+            if is_open(solve(mid)):
+                open_bl = mid
+            else:
+                closed_bl = mid
+        write_trip = (closed_bl + open_bl) / 2.0
+        status = "VALID"
+        reason = "SNM=0 boundary bracketed between closed and open butterfly eyes"
+    elif not closed_at_zero:
+        write_trip = 0.0
+        status = "NO CLOSURE"
+        reason = "Butterfly eye remains open at BL=0 V"
+    else:
+        write_trip = None
+        status = "UNSTABLE"
+        reason = "Butterfly eye is already closed at BL=VDD"
+
+    return {
+        "method": "Textbook writeability: sweep BL from VDD to 0 V and locate SNM=0",
+        "vdd_v": vdd,
+        "wordline_v": vdd,
+        "high_bitline_v": vdd,
+        "write_direction": "BL: VDD to 0 V",
+        "status": status,
+        "reason": reason,
+        "write_trip_bl_v": write_trip,
+        "required_bl_swing_v": (vdd - write_trip if write_trip is not None else None),
+        "points": rows,
+    }
+
+
+def _vtc_diagonal_intersection(curve: list[tuple[float, float]]) -> tuple[float, float] | None:
+    """Return the interpolated crossing of a monotonic VTC and Vout=Vin."""
+    if len(curve) < 2:
+        return None
+    previous_x, previous_y = curve[0]
+    previous_delta = previous_y - previous_x
+    if abs(previous_delta) <= 1e-15:
+        return previous_x, previous_y
+    for x_value, y_value in curve[1:]:
+        delta = y_value - x_value
+        if abs(delta) <= 1e-15:
+            return x_value, y_value
+        if delta * previous_delta < 0:
+            denominator = previous_delta - delta
+            fraction = previous_delta / denominator if abs(denominator) > 1e-15 else 0.5
+            crossing_x = previous_x + fraction * (x_value - previous_x)
+            crossing_y = previous_y + fraction * (y_value - previous_y)
+            crossing = (crossing_x + crossing_y) / 2.0
+            return crossing, crossing
+        previous_x, previous_y, previous_delta = x_value, y_value, delta
+    return None
+
+
+def single_wat_write_snm_geometry(vdd: float,
+                                  high_side_curves: list[tuple[str, list[tuple[float, float]]]]) -> dict:
+    """Build the single-WAT graphical WSNM view used by the reference diagram.
+
+    With WL asserted and the retained storage-node side connected to its high
+    bitline, each broken-loop write VTC is intersected with Vout=Vin.  The
+    intersection voltage is drawn as the side of an origin-anchored square.
+    For independent left/right WAT objects, the smaller of the two write
+    polarities is reported and plotted.
+
+    This is intentionally kept separate from the SNM-versus-BL eye-closure
+    calculation: it is a compact graphical WAT estimate, not measured write
+    trip voltage or foundry sign-off WSNM.
+    """
+    candidates = []
+    for polarity, curve in high_side_curves:
+        crossing = _vtc_diagonal_intersection(curve)
+        candidates.append({
+            "write_polarity": polarity,
+            "curve": curve,
+            "intersection": crossing,
+            "wsnm_v": None if crossing is None else crossing[0],
+            "wsnm_mv": None if crossing is None else 1000.0 * crossing[0],
+        })
+    valid = [candidate for candidate in candidates if candidate["wsnm_v"] is not None]
+    limiting = min(valid, key=lambda candidate: candidate["wsnm_v"]) if valid else None
+    return {
+        "method": "Single-WAT write VTC diagonal-intersection geometry",
+        "vdd_v": vdd,
+        "valid": limiting is not None,
+        "reason": ("Limiting write polarity selected from the two 6T storage-node sides"
+                   if limiting is not None else "No VTC crossing with Vout=Vin"),
+        "write_polarity": None if limiting is None else limiting["write_polarity"],
+        "curve": [] if limiting is None else limiting["curve"],
+        "intersection": None if limiting is None else limiting["intersection"],
+        "wsnm_v": None if limiting is None else limiting["wsnm_v"],
+        "wsnm_mv": None if limiting is None else limiting["wsnm_mv"],
+        "polarity_results": candidates,
+        "square_definition": "origin-anchored square; upper-right corner lies on Vout=Vin and the selected write VTC",
+    }
+
 
 class WtZeroBitVminTest:
     """Object-oriented WT 0-bit Vmin flow for one mismatched 6T bitcell."""
@@ -941,14 +1223,31 @@ def analyze(wat: WatPoint, cfg: Config) -> dict:
     square_points = max(1201, cfg.grid_points)
     read_butterfly = model.butterfly_squares(cfg.nominal_vdd, "read", square_points)
     write_low_vtc, write_high_vtc = model.write_vtc_pair(cfg.nominal_vdd, 201)
+    write_geometry = single_wat_write_snm_geometry(
+        cfg.nominal_vdd,
+        [("symmetric 6T write polarity", write_high_vtc)],
+    )
+    write_sweep = write_snm_vs_bitline(
+        cfg.nominal_vdd,
+        lambda bitline_v, points: model.write_butterfly(
+            cfg.nominal_vdd, bitline_v,
+            cfg.write_high_bitline_over_vdd * cfg.nominal_vdd, points),
+    )
     read_vtc = model.vtc(cfg.nominal_vdd, "read", 201)
-    baseline = {"metrics": metric(model, cfg, read_butterfly),
+    baseline_metrics = metric(model, cfg, read_butterfly)
+    baseline_metrics.update({
+        "write_trip_bl_v": write_sweep["write_trip_bl_v"],
+        "required_bl_swing_v": write_sweep["required_bl_swing_v"],
+    })
+    baseline = {"metrics": baseline_metrics,
                 "analytical_read_snm_eq_3_36": model.analytical_read_snm_eq_3_36(cfg.nominal_vdd),
                 "read_butterfly": read_butterfly,
                 "read_vtc": read_vtc,
                 "read_vtc_mirrored": _inverse_vtc(read_vtc),
                 "write_vtc_low": write_low_vtc,
                 "write_vtc_high": write_high_vtc,
+                "single_wat_write_snm_geometry": write_geometry,
+                "write_snm_vs_bitline": write_sweep,
                 "read_trip_v": model.trip_point(cfg.nominal_vdd, "read")}
     report_config = {
         "wat_vdd": cfg.wat_vdd, "nominal_vdd": cfg.nominal_vdd,
@@ -1344,15 +1643,21 @@ def validate_datasheet_wat_target(cell: SixTWatCell | ThreeTWatCell,
 def _attach_target_model(result: dict, targets: DatasheetTargets | None, cfg: Config) -> None:
     """Attach a same-condition 6T model built from datasheet PU/PG/PD targets."""
     if targets is None:
-        result["target_6t"] = result["baseline_6t"]
+        result.pop("target_6t", None)
         result["snm_target_comparison"] = []
+        sweep = result["baseline_6t"]["write_snm_vs_bitline"]
+        result["write_trip_comparison"] = {
+            "lot_wafer_write_trip_bl_v": sweep["write_trip_bl_v"],
+            "target_write_trip_bl_v": None,
+            "lot_wafer_required_bl_swing_v": sweep["required_bl_swing_v"],
+            "target_required_bl_swing_v": None,
+        }
         analytical = result["baseline_6t"]["analytical_read_snm_eq_3_36"]
         result["analytical_read_snm_comparison"] = {
             "method": "High-Speed CMOS Circuit Technology, Section 3.4.2, Equation 3.36",
-            "current": analytical, "target": analytical,
-            "current_snm_mv": analytical["snm_mv"], "target_snm_mv": analytical["snm_mv"],
-            "delta_mv": 0.0 if analytical["snm_mv"] is not None else None,
-            "delta_pct": 0.0 if analytical["snm_mv"] is not None else None,
+            "current": analytical, "target": None,
+            "current_snm_mv": analytical["snm_mv"], "target_snm_mv": None,
+            "delta_mv": None, "delta_pct": None,
         }
         return
     target_wat = WatPoint(
@@ -1370,9 +1675,16 @@ def _attach_target_model(result: dict, targets: DatasheetTargets | None, cfg: Co
          "delta_mv": current_metrics[key] - target["metrics"][key],
          "delta_pct": ((current_metrics[key] / target["metrics"][key] - 1) * 100
                        if target["metrics"][key] else None)}
-        for label, key in (("Read SNM", "read_snm_mv"),
-                           ("Write SNM Proxy", "write_snm_proxy_mv"))
+        for label, key in (("Read SNM", "read_snm_mv"),)
     ]
+    current_write = result["baseline_6t"]["write_snm_vs_bitline"]
+    target_write = target["write_snm_vs_bitline"]
+    result["write_trip_comparison"] = {
+        "lot_wafer_write_trip_bl_v": current_write["write_trip_bl_v"],
+        "target_write_trip_bl_v": target_write["write_trip_bl_v"],
+        "lot_wafer_required_bl_swing_v": current_write["required_bl_swing_v"],
+        "target_required_bl_swing_v": target_write["required_bl_swing_v"],
+    }
     current_analytical = result["baseline_6t"]["analytical_read_snm_eq_3_36"]
     target_analytical = target["analytical_read_snm_eq_3_36"]
     current_value, target_value = current_analytical["snm_mv"], target_analytical["snm_mv"]
@@ -1518,10 +1830,40 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
         "method": "asymmetric cross-coupled 6T Read butterfly; cell RSNM uses the smaller state margin",
     }
     half_cell = cell_metric(cell, cfg)
-    asymmetric = AsymmetricSram6T(cell, cfg).read_butterfly(
+    asymmetric_model = AsymmetricSram6T(cell, cfg)
+    asymmetric = asymmetric_model.read_butterfly(
         cfg.nominal_vdd, max(1201, cfg.grid_points))
+    write_sweep = write_snm_vs_bitline(
+        cfg.nominal_vdd,
+        lambda bitline_v, points: asymmetric_model.write_butterfly(
+            cfg.nominal_vdd, bitline_v,
+            cfg.write_high_bitline_over_vdd * cfg.nominal_vdd, points),
+    )
+    vdd = cfg.nominal_vdd
+    wl = cfg.write_wordline_over_vdd * vdd
+    high_bl = cfg.write_high_bitline_over_vdd * vdd
+    points = 401
+    left_high_curve = [
+        (vdd * index / (points - 1),
+         asymmetric_model.left.transfer_with_bitline(
+             vdd * index / (points - 1), vdd, high_bl, wl))
+        for index in range(points)
+    ]
+    right_high_curve = [
+        (vdd * index / (points - 1),
+         asymmetric_model.right.transfer_with_bitline(
+             vdd * index / (points - 1), vdd, high_bl, wl))
+        for index in range(points)
+    ]
+    write_geometry = single_wat_write_snm_geometry(
+        vdd,
+        [("write QB=0; Q retained high", right_high_curve),
+         ("write Q=0; QB retained high", left_high_curve)],
+    )
     baseline = result["baseline_6t"]
     baseline.update(asymmetric)
+    baseline["write_snm_vs_bitline"] = write_sweep
+    baseline["single_wat_write_snm_geometry"] = write_geometry
     butterfly = asymmetric["read_butterfly"]
     baseline["metrics"].update({
         "read_snm_mv": butterfly["snm_mv"],
@@ -1530,6 +1872,8 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
         "read_snm_delta_mv": butterfly["delta_snm_mv"],
         "read_snm_mismatch_index_pct": butterfly["mismatch_index_pct"],
         "write_snm_proxy_mv": half_cell["write_snm_proxy_mv"],
+        "write_trip_bl_v": write_sweep["write_trip_bl_v"],
+        "required_bl_swing_v": write_sweep["required_bl_swing_v"],
         "cell_ratio_beta": half_cell["cell_ratio_beta"],
         "pull_up_ratio_beta": half_cell["pull_up_ratio_beta"],
         "cell_ratio_ids_proxy": half_cell["cell_ratio_ids_proxy"],
@@ -1696,6 +2040,194 @@ def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
         "fit_points": fit_points,
         "definition": "Estimated eye-closure VDD is a compact-model boundary, not measured WT Vmin",
     }
+
+
+def analyze_mismatch_rsnm_boundaries(cell: SixTWatCell, cfg: Config,
+                                     fit_points: int = 301,
+                                     scan_steps: int = 16,
+                                     bisection_steps: int = 14) -> dict:
+    """Find one-factor-at-a-time 6T Vt/Idsat values where either Read-SNM eye closes."""
+    validate_config(cfg)
+    fit_points = max(101, int(fit_points))
+    scan_steps = max(4, int(scan_steps))
+    bisection_steps = max(6, int(bisection_steps))
+    device_names = ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2")
+
+    def evaluate(candidate: SixTWatCell) -> dict:
+        # Evaluate the same physical state in both cell orientations.  Mapping
+        # the swapped-cell upper eye back to the original lower eye prevents a
+        # sequential lobe-fit failure from masking the opposite stored state.
+        primary = AsymmetricSram6T(candidate, cfg).read_butterfly(
+            cfg.nominal_vdd, fit_points)["read_butterfly"]
+        swapped = SixTWatCell(
+            candidate.corner, candidate.pu2, candidate.pu1,
+            candidate.pg2, candidate.pg1, candidate.pd2, candidate.pd1)
+        reverse = AsymmetricSram6T(swapped, cfg).read_butterfly(
+            cfg.nominal_vdd, fit_points)["read_butterfly"]
+        upper = primary.get("snm_upper_left_mv")
+        lower = reverse.get("snm_upper_left_mv")
+        failed = []
+        if upper is None or upper <= 0:
+            failed.append("upper_left")
+        if lower is None or lower <= 0:
+            failed.append("lower_right")
+        valid = not failed
+        return {"valid": valid, "upper_mv": upper, "lower_mv": lower,
+                "failed_state_keys": failed,
+                "reason": (primary.get("reason", "") + " | swapped: " +
+                           reverse.get("reason", ""))}
+
+    baseline = evaluate(cell)
+    if not baseline["valid"]:
+        raise ValueError("Baseline 6T inputs must have two valid Read-SNM eyes before boundary search")
+
+    def candidate_cell(device: str, parameter: str, value: float) -> SixTWatCell:
+        return cell.replace_mos(device, **{parameter: value})
+
+    def value_at(baseline_value: float, endpoint: float, parameter: str, fraction: float) -> float:
+        if parameter == "ids":
+            return baseline_value * ((endpoint / baseline_value) ** fraction)
+        return baseline_value + (endpoint - baseline_value) * fraction
+
+    rows: list[dict] = []
+    for device in device_names:
+        baseline_mos = getattr(cell, device)
+        for parameter, unit in (("vt", "V"), ("ids", "uA")):
+            baseline_value = getattr(baseline_mos, parameter)
+            if parameter == "vt":
+                endpoints = {
+                    "DECREASE": max(0.005, baseline_value * 0.02),
+                    "INCREASE": max(cfg.wat_vdd, cfg.nominal_vdd) * 1.25,
+                }
+            else:
+                endpoints = {
+                    "DECREASE": max(0.001, baseline_value * 0.002),
+                    "INCREASE": baseline_value * 20.0,
+                }
+            for direction, endpoint in endpoints.items():
+                previous_fraction = 0.0
+                previous_result = baseline
+                bracket = None
+                for step in range(1, scan_steps + 1):
+                    fraction = step / scan_steps
+                    value = value_at(baseline_value, endpoint, parameter, fraction)
+                    result = evaluate(candidate_cell(device, parameter, value))
+                    if not result["valid"]:
+                        bracket = [previous_fraction, fraction, previous_result, result]
+                        break
+                    previous_fraction, previous_result = fraction, result
+
+                boundary_value = None
+                boundary_cell = None
+                boundary_result = None
+                last_valid = previous_result
+                status = "NOT BRACKETED"
+                if bracket:
+                    valid_fraction, invalid_fraction, last_valid, boundary_result = bracket
+                    for _ in range(bisection_steps):
+                        middle = (valid_fraction + invalid_fraction) / 2.0
+                        value = value_at(baseline_value, endpoint, parameter, middle)
+                        result = evaluate(candidate_cell(device, parameter, value))
+                        if result["valid"]:
+                            valid_fraction, last_valid = middle, result
+                        else:
+                            invalid_fraction, boundary_result = middle, result
+                    boundary_fraction = (valid_fraction + invalid_fraction) / 2.0
+                    boundary_value = value_at(
+                        baseline_value, endpoint, parameter, boundary_fraction)
+                    boundary_cell = candidate_cell(device, parameter, boundary_value)
+                    status = "BOUNDARY FOUND"
+
+                failed_keys = boundary_result["failed_state_keys"] if boundary_result else []
+                failed_label = (" / ".join(key.replace("_", " ").title() for key in failed_keys)
+                                if failed_keys else None)
+                row = {
+                    "device": DISPLAY_MOS_NAMES[device],
+                    "parameter": "Vt" if parameter == "vt" else "Isat",
+                    "direction": direction,
+                    "baseline_value": baseline_value,
+                    "boundary_value": boundary_value,
+                    "unit": unit,
+                    "failed_state": failed_label,
+                    "upper_rsnm_mv": (0.0 if "upper_left" in failed_keys else
+                                      last_valid.get("upper_mv") if boundary_result else None),
+                    "lower_rsnm_mv": (0.0 if "lower_right" in failed_keys else
+                                      last_valid.get("lower_mv") if boundary_result else None),
+                    "status": status,
+                    "search_endpoint": endpoint,
+                }
+                source_cell = boundary_cell or cell
+                for source_name in device_names:
+                    source_mos = getattr(source_cell, source_name)
+                    label = DISPLAY_MOS_NAMES[source_name].lower()
+                    row[f"{label}_vt_v"] = source_mos.vt
+                    row[f"{label}_idsat_ua"] = source_mos.ids
+                rows.append(row)
+
+    return {
+        "lot_wafer": cell.corner,
+        "vdd_v": cfg.nominal_vdd,
+        "wat_vdd_v": cfg.wat_vdd,
+        "baseline_upper_rsnm_mv": baseline["upper_mv"],
+        "baseline_lower_rsnm_mv": baseline["lower_mv"],
+        "rows": rows,
+        "definition": ("One-factor-at-a-time boundary: all other 6T Vt/Idsat values remain "
+                       "at the entered Lot/Wafer baseline; RSNM=0 is a compact-model eye-closure estimate."),
+        "search_limits": {
+            "vt_v": "2% of baseline (minimum 0.005 V) to 1.25*max(WAT VDD, SRAM VDD)",
+            "idsat_ua": "0.2% to 2000% of baseline",
+        },
+    }
+
+
+def write_mismatch_boundary_outputs(analysis: dict,
+                                    out_dir: str | os.PathLike[str]) -> Path:
+    """Write CSV, JSON and HTML for the 6T mismatch Read-SNM boundary search."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    rows = analysis["rows"]
+    csv_path = out / "rsnm_mismatch_boundaries.csv"
+    fieldnames = list(rows[0]) if rows else []
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as target:
+        writer = csv.DictWriter(target, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    (out / "rsnm_mismatch_boundaries.json").write_text(
+        json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    body_rows = []
+    full_boundary_rows = []
+    for row in rows:
+        boundary = _fmt(row["boundary_value"], 5)
+        body_rows.append(
+            f'<tr><td>{row["device"]}</td><td>{row["parameter"]}</td>'
+            f'<td>{row["direction"].title()}</td><td>{row["baseline_value"]:.5g}</td>'
+            f'<td>{boundary}</td><td>{row["unit"]}</td>'
+            f'<td>{html.escape(row["failed_state"] or "N/A")}</td>'
+            f'<td>{_fmt(row["upper_rsnm_mv"], 2)}</td>'
+            f'<td>{_fmt(row["lower_rsnm_mv"], 2)}</td><td>{row["status"]}</td></tr>')
+        if row["status"] == "BOUNDARY FOUND":
+            device_cells = "".join(
+                f'<td>{row[f"{label}_vt_v"]:.5g}</td><td>{row[f"{label}_idsat_ua"]:.5g}</td>'
+                for label in ("pul", "pur", "pgl", "pgr", "pdl", "pdr"))
+            full_boundary_rows.append(
+                f'<tr><td>{row["device"]} {row["parameter"]} {row["direction"].title()}</td>'
+                f'<td>{html.escape(row["failed_state"] or "N/A")}</td>{device_cells}</tr>')
+    device_headers = "".join(
+        f'<th>{label.upper()} Vt (V)</th><th>{label.upper()} Isat (uA)</th>'
+        for label in ("pul", "pur", "pgl", "pgr", "pdl", "pdr"))
+    report = out / "rsnm_mismatch_boundary_report.html"
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Analysis - RSNM Mismatch Boundary</title>
+<style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1500px;margin:auto}}section{{background:#fff;border-radius:18px;padding:24px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:12px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3){{text-align:left}}th{{color:#6e6e73}}code{{background:#f2f2f7;padding:2px 6px;border-radius:5px}}</style></head><body><main>
+<h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · SRAM VDD={analysis["vdd_v"]:.3f} V</p>
+<section><h2>RSNM Mismatch Boundary</h2><p>{html.escape(analysis["definition"])}</p>
+<p>Baseline Upper RSNM={analysis["baseline_upper_rsnm_mv"]:.2f} mV · Lower RSNM={analysis["baseline_lower_rsnm_mv"]:.2f} mV</p>
+<table><thead><tr><th>Device</th><th>Parameter</th><th>Direction</th><th>Baseline</th><th>Boundary</th><th>Unit</th><th>First zero state</th><th>Upper RSNM (mV)</th><th>Lower RSNM (mV)</th><th>Status</th></tr></thead><tbody>{''.join(body_rows)}</tbody></table></section>
+<section><h2>Complete 6T Boundary Values</h2><p>Values other than the swept parameter remain at the entered baseline.</p>
+<div style="overflow-x:auto"><table><thead><tr><th>Sweep</th><th>First zero state</th>{device_headers}</tr></thead><tbody>{''.join(full_boundary_rows)}</tbody></table></div>
+<p>Raw files: <code>rsnm_mismatch_boundaries.csv</code>, <code>rsnm_mismatch_boundaries.json</code>.</p></section>
+</main></body></html>''', encoding="utf-8")
+    return report
 
 
 def analyze_write_trip_margin_curve(points: list[RsnmVccPoint], cfg: Config,
@@ -2047,8 +2579,8 @@ def bar_svg(items: list[dict], key: str, title: str, unit: str, width: int = 900
 def snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
     """Read VTC comparison using Vin on X and Vout on Y, both in volts."""
     current = result["baseline_6t"]
-    target = result.get("target_6t", current)
-    vdd = result["config"]["nominal_vdd"]
+    has_target = bool(result.get("datasheet_targets") and result.get("target_6t"))
+    target = result.get("target_6t") if has_target else None
     axis_max = SNM_PLOT_AXIS_MAX_V
     lot_label_raw = str(result["wat"]["corner"])
     lot_label = html.escape(lot_label_raw)
@@ -2060,17 +2592,19 @@ def snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
                 plot_top + (1.0 - vout / axis_max) * plot_h)
 
     current_value = current["metrics"]["read_snm_mv"]
-    target_value = target["metrics"]["read_snm_mv"]
-    delta = current_value - target_value
+    target_value = target["metrics"]["read_snm_mv"] if target else None
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Read SNM Lot/Wafer versus target VTC comparison" style="font-family:Calibri,Arial,sans-serif">',
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-        '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Read SNM Target Comparison</text>',
+        f'<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">{"Read SNM Target Comparison" if has_target else "Read SNM Analysis"}</text>',
         f'<path d="M54 82 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="88" fill="#3A3A3C" font-size="17">{lot_label} WAT VTC</text>',
         f'<path d="M270 82 h34" stroke="#007AFF" stroke-width="4" stroke-dasharray="10 7"/><text x="314" y="88" fill="#3A3A3C" font-size="17">{lot_label} mirrored VTC</text>',
-        '<path d="M570 82 h34" stroke="#FF9500" stroke-width="4"/><text x="614" y="88" fill="#3A3A3C" font-size="17">WAT Target VTC</text>',
-        '<path d="M842 82 h34" stroke="#FF9500" stroke-width="4" stroke-dasharray="10 7"/><text x="886" y="88" fill="#3A3A3C" font-size="17">WAT Target mirrored VTC</text>',
     ]
+    if has_target:
+        parts += [
+            '<path d="M570 82 h34" stroke="#FF9500" stroke-width="4"/><text x="614" y="88" fill="#3A3A3C" font-size="17">WAT Target VTC</text>',
+            '<path d="M842 82 h34" stroke="#FF9500" stroke-width="4" stroke-dasharray="10 7"/><text x="886" y="88" fill="#3A3A3C" font-size="17">WAT Target mirrored VTC</text>',
+        ]
     for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
         px, py = xy(voltage, voltage)
         parts += [
@@ -2078,21 +2612,25 @@ def snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
             f'<text x="{px:.1f}" y="{plot_top+plot_h+27}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
             f'<text x="{plot_left-12}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
         ]
-    for data, color in ((current, "#007AFF"), (target, "#FF9500")):
+    datasets = [(current, "#007AFF")] + ([(target, "#FF9500")] if target else [])
+    for data, color in datasets:
         direct_curve, mirrored_curve = _read_vtc_pair(data)
         direct = " ".join(f'{xy(vin,vout)[0]:.1f},{xy(vin,vout)[1]:.1f}' for vin, vout in direct_curve)
         mirrored = " ".join(f'{xy(vin,vout)[0]:.1f},{xy(vin,vout)[1]:.1f}' for vin, vout in mirrored_curve)
         parts += [f'<polyline points="{direct}" fill="none" stroke="{color}" stroke-width="4"/>',
                   f'<polyline points="{mirrored}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="10 7" opacity=".9"/>']
     analytical_current = analytical.get("current_snm_mv")
-    analytical_target = analytical.get("target_snm_mv")
+    analytical_target = analytical.get("target_snm_mv") if has_target else None
     analytical_text = (f'Analytical RSNM: {lot_label_raw} {analytical_current:.1f} mV · WAT Target {analytical_target:.1f} mV'
                        if analytical_current is not None and analytical_target is not None
                        else 'Analytical RSNM: N/A for this input set')
+    if analytical_current is not None and not has_target:
+        analytical_text = f'Analytical RSNM: {lot_label_raw} {analytical_current:.1f} mV'
     parts += [
         f'<text x="{plot_left+plot_w-8}" y="{plot_top+30}" text-anchor="end" fill="#007AFF" font-size="18" font-weight="700">{lot_label} {current_value:.1f} mV</text>',
-        f'<text x="{plot_left+plot_w-8}" y="{plot_top+58}" text-anchor="end" fill="#C56A00" font-size="18" font-weight="700">WAT Target {target_value:.1f} mV</text>',
-        f'<text x="{plot_left+plot_w-8}" y="{plot_top+86}" text-anchor="end" fill="#1D1D1F" font-size="17" font-weight="700">Delta {delta:+.1f} mV</text>',
+        *([f'<text x="{plot_left+plot_w-8}" y="{plot_top+58}" text-anchor="end" fill="#C56A00" font-size="18" font-weight="700">WAT Target {target_value:.1f} mV</text>',
+           f'<text x="{plot_left+plot_w-8}" y="{plot_top+86}" text-anchor="end" fill="#1D1D1F" font-size="17" font-weight="700">Delta {current_value-target_value:+.1f} mV</text>']
+          if target_value is not None else []),
         f'<text x="{plot_left+plot_w-8}" y="{plot_top+114}" text-anchor="end" fill="#5856D6" font-size="16" font-weight="700">{html.escape(analytical_text)}</text>',
         f'<text x="{plot_left+plot_w/2}" y="{height-50}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
         f'<text x="48" y="{plot_top+plot_h/2}" transform="rotate(-90 48 {plot_top+plot_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>',
@@ -2101,7 +2639,7 @@ def snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
     return "".join(parts)
 
 
-def write_snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
+def _legacy_write_vtc_svg(result: dict, width: int = 1440, height: int = 720) -> str:
     """Write-condition VTC comparison: BL low side versus mirrored BLB high side."""
     current = result["baseline_6t"]
     target = result.get("target_6t", current)
@@ -2121,7 +2659,7 @@ def write_snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
         '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Write SNM Target Comparison</text>',
         f'<path d="M54 82 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="88" fill="#3A3A3C" font-size="17">{lot_label} BL-low VTC</text>',
-        f'<path d="M270 82 h34" stroke="#007AFF" stroke-width="4" stroke-dasharray="10 7"/><text x="314" y="88" fill="#3A3A3C" font-size="17">{lot_label} mirrored BLB-high VTC</text>',
+        f'<path d="M270 82 h34" stroke="#AF52DE" stroke-width="4" stroke-dasharray="10 7"/><text x="314" y="88" fill="#3A3A3C" font-size="17">{lot_label} mirrored BLB-high VTC</text>',
         '<path d="M650 82 h34" stroke="#FF9500" stroke-width="4"/><text x="694" y="88" fill="#3A3A3C" font-size="17">WAT Target write VTC pair</text>',
     ]
     for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
@@ -2129,11 +2667,12 @@ def write_snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -
         parts += [f'<path d="M{px:.1f} {top} V{top+ph} M{left} {py:.1f} H{left+pw}" stroke="#E5E5EA" stroke-width="1"/>',
                   f'<text x="{px:.1f}" y="{top+ph+27}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
                   f'<text x="{left-12}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>']
-    for data, color in ((current, "#007AFF"), (target, "#FF9500")):
+    for data, color, mirror_color in ((current, "#007AFF", "#AF52DE"),
+                                      (target, "#FF9500", "#FF2D55")):
         low = " ".join(f'{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}' for x, y in data["write_vtc_low"])
         high = " ".join(f'{xy(y, x)[0]:.1f},{xy(y, x)[1]:.1f}' for x, y in data["write_vtc_high"])
         parts += [f'<polyline points="{low}" fill="none" stroke="{color}" stroke-width="4"/>',
-                  f'<polyline points="{high}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="10 7" opacity=".9"/>']
+                  f'<polyline points="{high}" fill="none" stroke="{mirror_color}" stroke-width="4" stroke-dasharray="10 7" opacity=".95"/>']
     parts += [
         f'<text x="{left+pw-8}" y="{top+30}" text-anchor="end" fill="#007AFF" font-size="18" font-weight="700">{lot_label} WSNM proxy {current_value:.1f} mV</text>',
         f'<text x="{left+pw-8}" y="{top+58}" text-anchor="end" fill="#C56A00" font-size="18" font-weight="700">WAT Target {target_value:.1f} mV</text>',
@@ -2146,16 +2685,160 @@ def write_snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -
     return "".join(parts)
 
 
+def write_snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
+    """Textbook writeability chart: butterfly SNM versus swept write BL."""
+    current = result["baseline_6t"]
+    has_target = bool(result.get("datasheet_targets") and result.get("target_6t"))
+    target = result.get("target_6t") if has_target else None
+    cfg, wat = result["config"], result["wat"]
+    vdd = cfg["nominal_vdd"]
+    lot_label = html.escape(str(wat["corner"]))
+    axis_max = SNM_PLOT_AXIS_MAX_V
+    left, top, pw, ph = 145, 155, 1140, 430
+    current_sweep = current["write_snm_vs_bitline"]
+    target_sweep = target["write_snm_vs_bitline"] if target else None
+    values = [row["cell_write_snm_mv"]
+              for sweep in ([current_sweep] + ([target_sweep] if target_sweep else []))
+              for row in sweep["points"]]
+    y_max = max(50.0, math.ceil(max(values, default=0.0) * 1.20 / 50.0) * 50.0)
+
+    def xy(bitline_v: float, snm_mv: float) -> tuple[float, float]:
+        return (left + bitline_v / axis_max * pw,
+                top + (1.0 - snm_mv / y_max) * ph)
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Write SNM versus write bitline voltage" style="font-family:Calibri,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<defs><marker id="writeArrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#6E6E73"/></marker></defs>',
+        '<text x="54" y="48" fill="#1D1D1F" font-size="30" font-weight="700">Write SNM versus Write-Bitline Voltage</text>',
+        '<text x="54" y="78" fill="#6E6E73" font-size="16">WL=VDD and BLB=VDD; BL is swept from VDD toward 0 V. The write boundary occurs when the limiting butterfly SNM reaches 0.</text>',
+        f'<path d="M54 112 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="118" fill="#3A3A3C" font-size="17">{lot_label} WAT model</text>',
+    ]
+    if has_target:
+        parts.append('<path d="M325 112 h34" stroke="#FF9500" stroke-width="4"/><text x="369" y="118" fill="#3A3A3C" font-size="17">WAT Target model</text>')
+    for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
+        px, _ = xy(voltage, 0.0)
+        parts += [f'<path d="M{px:.1f} {top} V{top+ph}" stroke="#E5E5EA" stroke-width="1"/>',
+                  f'<text x="{px:.1f}" y="{top+ph+27}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>']
+    for index in range(6):
+        value = y_max * index / 5.0
+        _, py = xy(0.0, value)
+        parts += [f'<path d="M{left} {py:.1f} H{left+pw}" stroke="#E5E5EA" stroke-width="1"/>',
+                  f'<text x="{left-12}" y="{py+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{value:.0f}</text>']
+
+    sweep_datasets = [(current_sweep, "#007AFF")] + ([(target_sweep, "#FF9500")] if target_sweep else [])
+    for sweep, color in sweep_datasets:
+        curve = " ".join(
+            f'{xy(row["write_bl_v"], row["cell_write_snm_mv"])[0]:.1f},'
+            f'{xy(row["write_bl_v"], row["cell_write_snm_mv"])[1]:.1f}'
+            for row in sweep["points"])
+        parts.append(f'<polyline points="{curve}" fill="none" stroke="{color}" stroke-width="4" stroke-linejoin="round"/>')
+        trip = sweep.get("write_trip_bl_v")
+        if trip is not None:
+            trip_x, zero_y = xy(trip, 0.0)
+            parts += [
+                f'<path d="M{trip_x:.1f} {top} V{top+ph}" stroke="{color}" stroke-width="2" stroke-dasharray="7 6" opacity=".85"/>',
+                f'<circle cx="{trip_x:.1f}" cy="{zero_y:.1f}" r="7" fill="#FFFFFF" stroke="{color}" stroke-width="4"/>',
+            ]
+
+    def sweep_text(label: str, sweep: dict) -> str:
+        trip = sweep.get("write_trip_bl_v")
+        swing = sweep.get("required_bl_swing_v")
+        if trip is None or swing is None:
+            return f'{label} Write Trip BL N/A'
+        return f'{label} Write Trip BL {trip:.4f} V; required swing {swing:.4f} V'
+
+    vdd_x, arrow_y = xy(vdd, y_max * 0.08)
+    zero_x, _ = xy(0.0, y_max * 0.08)
+    parts += [
+        f'<text x="{left+pw-8}" y="{top+30}" text-anchor="end" fill="#007AFF" font-size="17" font-weight="700">{sweep_text(lot_label, current_sweep)}</text>',
+        *([f'<text x="{left+pw-8}" y="{top+58}" text-anchor="end" fill="#C56A00" font-size="17" font-weight="700">{sweep_text("WAT Target", target_sweep)}</text>'] if target_sweep else []),
+        f'<path d="M{vdd_x:.1f} {arrow_y:.1f} H{zero_x+18:.1f}" stroke="#6E6E73" stroke-width="2" marker-end="url(#writeArrow)"/>',
+        f'<text x="{(vdd_x+zero_x)/2:.1f}" y="{arrow_y-10:.1f}" text-anchor="middle" fill="#6E6E73" font-size="15">Write direction: BL decreases from VDD to 0 V</text>',
+        f'<text x="{left+pw/2}" y="{height-58}" text-anchor="middle" fill="#1D1D1F" font-size="20">Write BL Voltage (V)</text>',
+        f'<text x="48" y="{top+ph/2}" transform="rotate(-90 48 {top+ph/2})" text-anchor="middle" fill="#1D1D1F" font-size="20">Limiting Write SNM (mV)</text>',
+        '<text x="720" y="700" text-anchor="middle" fill="#6E6E73" font-size="15">Compact WAT-calibrated estimate. The write-trip boundary is the BL voltage where the smaller 6T butterfly eye closes.</text>',
+        '</svg>',
+    ]
+    return "".join(parts)
+
+
+def single_wat_write_snm_geometry_svg(result: dict,
+                                       width: int = 1120,
+                                       height: int = 820) -> str:
+    """Single 6T WAT write VTC with the reference-style WSNM square."""
+    geometry = result["baseline_6t"]["single_wat_write_snm_geometry"]
+    cfg, wat = result["config"], result["wat"]
+    axis_max = SNM_PLOT_AXIS_MAX_V
+    left, top, size = 190, 170, 560
+
+    def xy(x_value: float, y_value: float) -> tuple[float, float]:
+        return (left + x_value / axis_max * size,
+                top + (1.0 - y_value / axis_max) * size)
+
+    lot_label = html.escape(str(wat["corner"]))
+    polarity = html.escape(str(geometry.get("write_polarity") or "N/A"))
+    curve = geometry.get("curve", [])
+    curve_points = " ".join(f'{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}' for x, y in curve)
+    wsnm_v = geometry.get("wsnm_v")
+    wsnm_mv = geometry.get("wsnm_mv")
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="Single WAT Write SNM geometry" style="font-family:Calibri,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="54" y="52" fill="#1D1D1F" font-size="32" font-weight="700">6T Single-WAT Write SNM</text>',
+        f'<text x="54" y="84" fill="#6E6E73" font-size="17">{lot_label}; one write-condition VTC from the WAT-calibrated 6T model</text>',
+        '<path d="M54 116 h38" stroke="#007AFF" stroke-width="5"/><text x="104" y="123" fill="#3A3A3C" font-size="18">Write-condition VTC</text>',
+        '<rect x="350" y="101" width="27" height="27" fill="#FFF6E8" stroke="#FF9500" stroke-width="3"/><text x="390" y="123" fill="#3A3A3C" font-size="18">WSNM geometry</text>',
+    ]
+    for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
+        px, py = xy(voltage, voltage)
+        parts += [
+            f'<path d="M{px:.1f} {top} V{top+size} M{left} {py:.1f} H{left+size}" stroke="#E5E5EA" stroke-width="1"/>',
+            f'<text x="{px:.1f}" y="{top+size+30}" text-anchor="middle" fill="#6E6E73" font-size="17">{voltage:.2f}</text>',
+            f'<text x="{left-14}" y="{py+6:.1f}" text-anchor="end" fill="#6E6E73" font-size="17">{voltage:.2f}</text>',
+        ]
+    parts.append(f'<polyline points="{curve_points}" fill="none" stroke="#007AFF" stroke-width="5" stroke-linejoin="round"/>')
+    if wsnm_v is not None and wsnm_mv is not None:
+        origin_x, origin_y = xy(0.0, 0.0)
+        corner_x, corner_y = xy(wsnm_v, wsnm_v)
+        side_px = wsnm_v / axis_max * size
+        parts += [
+            f'<rect x="{origin_x:.1f}" y="{corner_y:.1f}" width="{side_px:.1f}" height="{side_px:.1f}" fill="#FFF6E8" fill-opacity=".72" stroke="#FF9500" stroke-width="4"/>',
+            f'<path d="M{origin_x:.1f} {origin_y:.1f} L{corner_x:.1f} {corner_y:.1f}" stroke="#FF9500" stroke-width="3"/>',
+            f'<circle cx="{corner_x:.1f}" cy="{corner_y:.1f}" r="7" fill="#FFFFFF" stroke="#FF9500" stroke-width="4"/>',
+            f'<text x="{origin_x+side_px/2:.1f}" y="{corner_y+side_px/2-8:.1f}" text-anchor="middle" fill="#9A4D00" font-size="19" font-weight="700">WSNM</text>',
+            f'<text x="{origin_x+side_px/2:.1f}" y="{corner_y+side_px/2+18:.1f}" text-anchor="middle" fill="#9A4D00" font-size="18" font-weight="700">{wsnm_mv:.1f} mV</text>',
+        ]
+    else:
+        parts.append(f'<text x="{left+size/2}" y="{top+size/2}" text-anchor="middle" fill="#FF3B30" font-size="24" font-weight="700">No valid VTC / diagonal crossing</text>')
+    parts += [
+        f'<text x="{left+size/2}" y="{height-12}" text-anchor="middle" fill="#1D1D1F" font-size="22">Vin (V)</text>',
+        f'<text x="70" y="{top+size/2}" transform="rotate(-90 70 {top+size/2})" text-anchor="middle" fill="#1D1D1F" font-size="22">Vout (V)</text>',
+        f'<text x="790" y="220" fill="#1D1D1F" font-size="18" font-weight="700">Write bias</text>',
+        f'<text x="790" y="252" fill="#3A3A3C" font-size="17">WL = {cfg["write_wordline_over_vdd"]:.2f} x VDD</text>',
+        f'<text x="790" y="282" fill="#3A3A3C" font-size="17">BL = {cfg["write_low_bitline_over_vdd"]:.2f} x VDD</text>',
+        f'<text x="790" y="312" fill="#3A3A3C" font-size="17">BLB = {cfg["write_high_bitline_over_vdd"]:.2f} x VDD</text>',
+        f'<text x="790" y="354" fill="#1D1D1F" font-size="18" font-weight="700">Limiting polarity</text>',
+        f'<text x="790" y="385" fill="#3A3A3C" font-size="15">{polarity}</text>',
+        '<text x="790" y="445" fill="#6E6E73" font-size="15">The square side is the VTC</text>',
+        '<text x="790" y="468" fill="#6E6E73" font-size="15">intersection with Vout = Vin.</text>',
+        '<text x="790" y="514" fill="#6E6E73" font-size="15">Compact WAT model estimate;</text>',
+        '<text x="790" y="537" fill="#6E6E73" font-size="15">not measured WT sign-off.</text>',
+        '</svg>',
+    ]
+    return "".join(parts)
+
+
 def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -> str:
     """Read butterfly plots with independently fitted maximum squares."""
     current = result["baseline_6t"]
-    target = result.get("target_6t", current)
+    has_target = bool(result.get("datasheet_targets") and result.get("target_6t"))
+    target = result.get("target_6t") if has_target else None
     lot_label = str(result["wat"]["corner"])
     axis_max = SNM_PLOT_AXIS_MAX_V
-    panels = (
-        (lot_label, current, "#007AFF"),
-        ("WAT Target", target, "#FF9500"),
-    )
+    panels = [(lot_label, current, "#007AFF")]
+    if target:
+        panels.append(("WAT Target", target, "#FF9500"))
     margin_x, gap = 60, 64
     panel_w = (width - 2 * margin_x - gap) / 2
     plot_top, plot_h = 158, 480
@@ -2168,7 +2851,8 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
         '<rect x="600" y="68" width="24" height="24" fill="none" stroke="#34C759" stroke-width="3"/><text x="636" y="88" fill="#3A3A3C" font-size="17">Maximum squares 1 and 2</text>',
     ]
     for index, (title, data, color) in enumerate(panels):
-        x0 = margin_x + index * (panel_w + gap)
+        x0 = ((width - 670) / 2 if len(panels) == 1
+              else margin_x + index * (panel_w + gap))
         # Equal X/Y pixel scale keeps a voltage square visually square.
         plot_left, plot_w = x0 + 95, 480
 
@@ -2437,7 +3121,8 @@ def wat_electrical_snm_rows(result: dict) -> list[dict]:
             "idsat_pd_over_pg": values["pd_ids"] / values["pg_ids"],
             "idsat_pg_over_pu": values["pg_ids"] / values["pu_ids"],
             "read_snm_geometric_mv": modeled["metrics"]["read_snm_mv"],
-            "write_snm_proxy_mv": modeled["metrics"]["write_snm_proxy_mv"],
+            "write_trip_bl_v": modeled["write_snm_vs_bitline"]["write_trip_bl_v"],
+            "required_bl_swing_v": modeled["write_snm_vs_bitline"]["required_bl_swing_v"],
             "read_snm_eq_3_36_mv": analytical.get("snm_mv"),
             "eq_3_36_status": "VALID" if analytical.get("valid") else "N/A",
             "eq_3_36_reason": analytical.get("reason", ""),
@@ -2904,6 +3589,7 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     """Write the focused Read SNM current-versus-target HTML report."""
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
+    has_target = bool(result.get("datasheet_targets") and result.get("target_6t"))
 
     # These files belonged to the removed WT/Vmin workflow; do not leave stale results behind.
     for name in ("sram_wat_results.csv", "wt_test_0bit_vmin.csv", "parameter_judgment.csv",
@@ -2912,6 +3598,11 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         path = out / name
         if path.exists():
             path.unlink()
+    if not has_target:
+        for name in ("snm_target_comparison.csv", "wat_target_comparison.csv"):
+            path = out / name
+            if path.exists():
+                path.unlink()
     for path in image_dir.iterdir():
         if path.is_file() and path.suffix.lower() in {".png", ".svg", ".csv"}:
             path.unlink()
@@ -2926,8 +3617,10 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     png_name = "01_read_snm_target_comparison.png"
     butterfly_svg_name = "02_read_snm_butterfly.svg"
     butterfly_png_name = "02_read_snm_butterfly.png"
-    write_svg_name = "03_write_snm_target_comparison.svg"
-    write_png_name = "03_write_snm_target_comparison.png"
+    write_svg_name = "03_write_snm_vs_bitline.svg"
+    write_png_name = "03_write_snm_vs_bitline.png"
+    geometry_svg_name = "04_single_wat_write_snm_geometry.svg"
+    geometry_png_name = "04_single_wat_write_snm_geometry.png"
     svg_path = image_dir / svg_name
     svg_path.write_text(snm_overview_svg(result), encoding="utf-8")
     drawing = svg2rlg(str(svg_path))
@@ -2948,16 +3641,15 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         raise RuntimeError("Could not render Write SNM target comparison")
     renderPM.drawToFile(write_drawing, str(image_dir / write_png_name), fmt="PNG", dpi=180,
                         backend="rlPyCairo")
+    geometry_svg_path = image_dir / geometry_svg_name
+    geometry_svg_path.write_text(single_wat_write_snm_geometry_svg(result), encoding="utf-8")
+    geometry_drawing = svg2rlg(str(geometry_svg_path))
+    if geometry_drawing is None:
+        raise RuntimeError("Could not render single-WAT Write SNM geometry")
+    renderPM.drawToFile(geometry_drawing, str(image_dir / geometry_png_name), fmt="PNG", dpi=180,
+                        backend="rlPyCairo")
 
     comparison_rows = result.get("snm_target_comparison", [])
-    if not comparison_rows:
-        metrics = result["baseline_6t"]["metrics"]
-        comparison_rows = [
-            {"mode": label, "current_snm_mv": metrics[key], "target_snm_mv": metrics[key],
-             "delta_mv": 0.0, "delta_pct": 0.0}
-            for label, key in (("Read SNM", "read_snm_mv"),
-                               ("Write SNM Proxy", "write_snm_proxy_mv"))
-        ]
     comparison_export_rows = [{
         "mode": row["mode"],
         "lot_wafer_snm_mv": row["current_snm_mv"],
@@ -2965,13 +3657,52 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         "lot_wafer_minus_target_mv": row["delta_mv"],
         "difference_pct": row["delta_pct"],
     } for row in comparison_rows]
-    with open(out / "snm_target_comparison.csv", "w", newline="", encoding="utf-8-sig") as target_file:
-        writer = csv.DictWriter(target_file, fieldnames=list(comparison_export_rows[0]))
-        writer.writeheader(); writer.writerows(comparison_export_rows)
+    if comparison_export_rows:
+        with open(out / "snm_target_comparison.csv", "w", newline="", encoding="utf-8-sig") as target_file:
+            writer = csv.DictWriter(target_file, fieldnames=list(comparison_export_rows[0]))
+            writer.writeheader(); writer.writerows(comparison_export_rows)
+
+    write_sweep_rows = []
+    write_datasets = [("Lot/Wafer", result["baseline_6t"])]
+    if has_target:
+        write_datasets.append(("WAT Target", result["target_6t"]))
+    for dataset, modeled in write_datasets:
+        sweep = modeled["write_snm_vs_bitline"]
+        for row in sweep["points"]:
+            write_sweep_rows.append({
+                "dataset": dataset,
+                "sram_vdd_v": sweep["vdd_v"],
+                "write_bl_v": row["write_bl_v"],
+                "limiting_write_snm_mv": row["cell_write_snm_mv"],
+                "eye_open": row["eye_open"],
+                "write_trip_bl_v": sweep["write_trip_bl_v"],
+                "required_bl_swing_v": sweep["required_bl_swing_v"],
+                "method": sweep["method"],
+            })
+    with open(out / "write_snm_vs_bitline.csv", "w", newline="", encoding="utf-8-sig") as write_file:
+        writer = csv.DictWriter(write_file, fieldnames=list(write_sweep_rows[0]))
+        writer.writeheader(); writer.writerows(write_sweep_rows)
+
+    geometry = result["baseline_6t"]["single_wat_write_snm_geometry"]
+    geometry_rows = [{
+        "lot_wafer": result["wat"]["corner"],
+        "write_polarity": geometry.get("write_polarity"),
+        "sram_vdd_v": geometry.get("vdd_v"),
+        "vin_v": x_value,
+        "vout_v": y_value,
+        "wsnm_mv": geometry.get("wsnm_mv"),
+        "method": geometry.get("method"),
+    } for x_value, y_value in geometry.get("curve", [])]
+    if geometry_rows:
+        with open(out / "single_wat_write_snm_geometry.csv", "w", newline="", encoding="utf-8-sig") as geometry_file:
+            writer = csv.DictWriter(geometry_file, fieldnames=list(geometry_rows[0]))
+            writer.writeheader(); writer.writerows(geometry_rows)
 
     state_rows = []
-    for label, data in (("Lot/Wafer", result["baseline_6t"]),
-                        ("WAT Target", result.get("target_6t", result["baseline_6t"]))):
+    state_datasets = [("Lot/Wafer", result["baseline_6t"])]
+    if has_target:
+        state_datasets.append(("WAT Target", result["target_6t"]))
+    for label, data in state_datasets:
         butterfly = data["read_butterfly"]
         squares = butterfly["squares"]
         upper = butterfly.get("snm_upper_left_mv", squares[0]["side_mv"])
@@ -2991,7 +3722,7 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
 
     analytical = result.get("analytical_read_snm_comparison", {})
     analytical_rows = []
-    for dataset in ("current", "target"):
+    for dataset in (("current", "target") if has_target else ("current",)):
         values = analytical.get(dataset, {})
         analytical_rows.append({
             "dataset": "Lot/Wafer" if dataset == "current" else "WAT Target",
@@ -3032,17 +3763,23 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
 
     manifest_rows = [
         {"filename": png_name, "format": "PNG", "role": "Primary image", "device": "6T CELL",
-         "description": "Read SNM Lot/Wafer WAT versus WAT Target curves"},
+         "description": ("Read SNM Lot/Wafer WAT versus WAT Target curves" if has_target
+                         else "Read SNM Lot/Wafer WAT curves; Target reference disabled")},
         {"filename": svg_name, "format": "SVG", "role": "Scalable chart source", "device": "6T CELL",
-         "description": "Read SNM Lot/Wafer WAT versus WAT Target curves"},
+         "description": ("Read SNM Lot/Wafer WAT versus WAT Target curves" if has_target
+                         else "Read SNM Lot/Wafer WAT curves; Target reference disabled")},
         {"filename": butterfly_png_name, "format": "PNG", "role": "Read SNM butterfly", "device": "6T CELL",
          "description": "Read VTC with maximum squares 1 and 2 for Lot/Wafer and Target"},
         {"filename": butterfly_svg_name, "format": "SVG", "role": "Scalable Read SNM butterfly source", "device": "6T CELL",
          "description": "Read VTC with maximum squares 1 and 2 for Lot/Wafer and Target"},
-        {"filename": write_png_name, "format": "PNG", "role": "Write SNM comparison", "device": "6T CELL",
-         "description": "Write VTC pair and bitline-noise WSNM proxy for Lot/Wafer and WAT Target"},
-        {"filename": write_svg_name, "format": "SVG", "role": "Scalable Write SNM comparison source", "device": "6T CELL",
-         "description": "Write VTC pair and bitline-noise WSNM proxy for Lot/Wafer and WAT Target"},
+        {"filename": write_png_name, "format": "PNG", "role": "Textbook Write SNM versus BL", "device": "6T CELL",
+         "description": "Limiting 6T butterfly SNM versus swept write BL; SNM=0 identifies Write Trip BL"},
+        {"filename": write_svg_name, "format": "SVG", "role": "Scalable Write SNM versus BL source", "device": "6T CELL",
+         "description": "Limiting 6T butterfly SNM versus swept write BL; SNM=0 identifies Write Trip BL"},
+        {"filename": geometry_png_name, "format": "PNG", "role": "Single-WAT Write SNM geometry", "device": "6T CELL",
+         "description": "One WAT-calibrated 6T write VTC with origin-anchored WSNM square and diagonal"},
+        {"filename": geometry_svg_name, "format": "SVG", "role": "Scalable single-WAT Write SNM geometry source", "device": "6T CELL",
+         "description": "One WAT-calibrated 6T write VTC with origin-anchored WSNM square and diagonal"},
     ]
     with open(image_dir / "image_manifest.csv", "w", newline="", encoding="utf-8-sig") as manifest:
         writer = csv.DictWriter(manifest, fieldnames=list(manifest_rows[0]))
@@ -3063,6 +3800,13 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         f'<tr><td>{row["mode"]}</td><td>{row["current_snm_mv"]:.2f}</td>'
         f'<td>{row["target_snm_mv"]:.2f}</td><td>{row["delta_mv"]:+.2f}</td>'
         f'<td>{_fmt(row["delta_pct"], 2)}%</td></tr>' for row in comparison_rows)
+    if has_target:
+        read_overview_section = f'''<section><h2>Read SNM Target Comparison</h2><p>The plotted curves use the WAT-calibrated compact VTC model. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V. Limiting squares are not drawn in this comparison view.</p>
+        <img src="images/{png_name}" alt="Read SNM Lot/Wafer WAT versus WAT Target comparison">
+        <table><thead><tr><th>Mode</th><th>Lot/Wafer SNM (mV)</th><th>WAT Target SNM (mV)</th><th>Lot/Wafer - WAT Target (mV)</th><th>Difference (%)</th></tr></thead><tbody>{snm_rows}</tbody></table></section>'''
+    else:
+        read_overview_section = f'''<section><h2>Read SNM Analysis</h2><p>WAT Target reference is disabled. This chart contains only the Lot/Wafer WAT-calibrated VTC and mirrored VTC. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V.</p>
+        <img src="images/{png_name}" alt="Read SNM Lot/Wafer WAT analysis"></section>'''
     state_table_rows = "".join(
         f'<tr><td>{row["dataset"]}</td><td>{row["upper_left_state_snm_mv"]:.2f}</td>'
         f'<td>{row["lower_right_state_snm_mv"]:.2f}</td><td>{row["cell_read_snm_min_mv"]:.2f}</td>'
@@ -3086,12 +3830,12 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         f'<td>{row["q_beta_pu_over_pg"]:.4f}</td><td>{row["r_beta_pd_over_pg"]:.4f}</td>'
         f'<td>{row["idsat_pd_over_pg"]:.4f}</td><td>{row["idsat_pg_over_pu"]:.4f}</td>'
         f'<td>{row["read_snm_geometric_mv"]:.2f}</td>'
-        f'<td>{row["write_snm_proxy_mv"]:.2f}</td>'
+        f'<td>{_fmt(row["write_trip_bl_v"], 4)}</td><td>{_fmt(row["required_bl_swing_v"], 4)}</td>'
         f'<td>{_fmt(row["read_snm_eq_3_36_mv"], 2)}</td><td>{row["eq_3_36_status"]}</td></tr>'
         for row in electrical_snm_rows)
     electrical_snm_section = f'''<section><h2>WAT Electrical Parameters → SNM Table</h2>
     <p>This table uses only electrical values that can be entered from WAT measurement: PU/PG/PD Vt and Idsat at the stated WAT VDD. The β values, q/r and current ratios are mathematical proxies derived from those measurements. No W/L, Cox, mobility, BSIM coefficients, parasitics or other PDK/model-card-only parameters are required.</p>
-    <div class="table-scroll"><table><thead><tr><th>Dataset</th><th>PU Vt<br>(V)</th><th>PU Idsat<br>(µA)</th><th>PG Vt<br>(V)</th><th>PG Idsat<br>(µA)</th><th>PD Vt<br>(V)</th><th>PD Idsat<br>(µA)</th><th>q<br>βPU/βPG</th><th>r<br>βPD/βPG</th><th>Idsat<br>PD/PG</th><th>Idsat<br>PG/PU</th><th>Read SNM<br>(mV)</th><th>Write SNM<br>Proxy (mV)</th><th>Analytical<br>RSNM (mV)</th><th>Analytical<br>Status</th></tr></thead><tbody>{electrical_snm_table_rows}</tbody></table></div>
+    <div class="table-scroll"><table><thead><tr><th>Dataset</th><th>PU Vt<br>(V)</th><th>PU Idsat<br>(µA)</th><th>PG Vt<br>(V)</th><th>PG Idsat<br>(µA)</th><th>PD Vt<br>(V)</th><th>PD Idsat<br>(µA)</th><th>q<br>βPU/βPG</th><th>r<br>βPD/βPG</th><th>Idsat<br>PD/PG</th><th>Idsat<br>PG/PU</th><th>Read SNM<br>(mV)</th><th>Write Trip BL<br>(V)</th><th>Required BL Swing<br>(V)</th><th>Analytical<br>RSNM (mV)</th><th>Analytical<br>Status</th></tr></thead><tbody>{electrical_snm_table_rows}</tbody></table></div>
     <p><b>Interpretation:</b> geometric Read SNM comes from the WAT-calibrated butterfly curves; the analytical RSNM is an independent long-channel reference. These are correlation and trend metrics, not foundry sign-off values.</p></section>'''
     assumption_table_rows = "".join(
         f'<tr><td>{html.escape(str(row["parameter"]))}</td>'
@@ -3111,6 +3855,22 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
         <table><thead><tr><th>MOS object</th><th>Vt (V)</th><th>Isat / Ids (µA)</th></tr></thead><tbody>{mos_rows}</tbody></table></section>'''
 
     cfg, wat = result["config"], result["wat"]
+    write_summary_datasets = [("Lot/Wafer", result["baseline_6t"]["write_snm_vs_bitline"])]
+    if has_target:
+        write_summary_datasets.append(("WAT Target", result["target_6t"]["write_snm_vs_bitline"]))
+    write_summary_rows = "".join(
+        f'<tr><td>{label}</td><td>{sweep["status"]}</td>'
+        f'<td>{_fmt(sweep["write_trip_bl_v"], 4)}</td>'
+        f'<td>{_fmt(sweep["required_bl_swing_v"], 4)}</td></tr>'
+        for label, sweep in write_summary_datasets)
+    geometry = result["baseline_6t"]["single_wat_write_snm_geometry"]
+    geometry_value = _fmt(geometry.get("wsnm_mv"), 1)
+    geometry_polarity = html.escape(str(geometry.get("write_polarity") or "N/A"))
+    scope_reference_text = (
+        "Blue curves use Lot/Wafer WAT inputs; orange curves use the enabled PU/PG/PD WAT Target reference."
+        if has_target else
+        "WAT Target reference is disabled; all charts and tables use Lot/Wafer WAT inputs only."
+    )
     document = f'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HV28 SRAM Analysis</title>
     <style>
     :root{{font:100%/1.5 Calibri,"Microsoft JhengHei",Arial,sans-serif;color:#1d1d1f;background:#f5f5f7}}
@@ -3122,22 +3882,26 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     @media(prefers-reduced-transparency:reduce){{.summary,section{{background:#fff;backdrop-filter:none;border-color:#d2d2d7}}}} @media(prefers-contrast:more){{.summary,section{{background:#fff;border:2px solid #1d1d1f}}}}
     </style></head><body><main>
     <h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode", "Grouped"))}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
-    <div class="summary"><b>Analysis scope:</b> Read SNM plus write-condition SNM proxy. Blue curves use the measured Lot/Wafer WAT inputs; orange curves use the entered PU/PG/PD WAT targets.</div>
-    <section><h2>Read SNM Target Comparison</h2><p>The plotted curves use the WAT-calibrated compact VTC model. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V. Limiting squares are not drawn in this comparison view.</p>
-    <img src="images/{png_name}" alt="Read SNM Lot/Wafer WAT versus WAT Target comparison">
-    <table><thead><tr><th>Mode</th><th>Lot/Wafer SNM (mV)</th><th>WAT Target SNM (mV)</th><th>Lot/Wafer − WAT Target (mV)</th><th>Difference (%)</th></tr></thead><tbody>{snm_rows}</tbody></table></section>
+    <div class="summary"><b>Analysis scope:</b> Read SNM plus textbook-based writeability. Write BL is swept from VDD to 0 V, and the Write Trip BL boundary is where the limiting 6T butterfly SNM reaches zero. {scope_reference_text}</div>
+    {read_overview_section}
     <section><h2>Read SNM Butterfly and Left/Right Mismatch</h2><p>The measured 6T model keeps PUL/PGL/PDL and PUR/PGR/PDR independent. The upper-left and lower-right eyes represent opposite stored states. Cell RSNM is the smaller state margin; a larger difference or mismatch index indicates stronger left/right imbalance. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V.</p>
     <img src="images/{butterfly_png_name}" alt="Asymmetric Read SNM butterfly with two state margins">
     <table><thead><tr><th>Dataset</th><th>Upper-left state SNM (mV)</th><th>Lower-right state SNM (mV)</th><th>Cell RSNM = min (mV)</th><th>Upper - Lower (mV)</th><th>Mismatch index</th></tr></thead><tbody>{state_table_rows}</tbody></table></section>
-    <section><h2>Write SNM Target Comparison</h2><p>Write condition uses the configured WL, a low write bitline and a high complementary bitline. The two VTCs are intentionally asymmetric. Vin and Vout axes are fixed at 0 to 1.20 V. Write SNM is reported as the maximum tolerated rise on the nominally-low write bitline while the access device can still overcome the pull-up device; it is a WAT-calibrated write-margin proxy, not a geometric butterfly-square or sign-off WSNM.</p>
-    <img src="images/{write_png_name}" alt="Write SNM target comparison"></section>
+    <section><h2>Write SNM versus Write-Bitline Voltage</h2><p>Following the textbook writeability method, WL and BLB are held at VDD while BL is swept from VDD toward 0 V. At every BL point the two write-condition VTCs are rebuilt, the state being overwritten is tracked, and its maximum butterfly square is calculated. Write Trip BL is the boundary where that eye closes and SNM becomes zero. A higher Write Trip BL and a smaller required BL swing indicate easier writing in this model.</p>
+    <img src="images/{write_png_name}" alt="Write SNM versus swept write bitline voltage">
+    <table><thead><tr><th>Dataset</th><th>Status</th><th>Write Trip BL (V)</th><th>Required BL Swing (VDD - trip) (V)</th></tr></thead><tbody>{write_summary_rows}</tbody></table>
+    <p>This is a compact WAT-calibrated estimate based on the textbook concept; it is not foundry BSIM or measured WT sign-off.</p></section>
+    <section><h2>Single-WAT Write SNM Geometry</h2><p>This view uses only the entered Lot/Wafer 6T WAT set. Under write bias, the two possible storage-node polarities are evaluated and the limiting VTC is plotted. The orange square follows the supplied reference concept: its upper-right corner is the intersection of the write-condition VTC and Vout=Vin, and its side is reported as the graphical WSNM estimate. The axes use Vin and Vout, consistent with the Read SNM charts.</p>
+    <img src="images/{geometry_png_name}" alt="Single 6T WAT Write SNM geometry">
+    <table><thead><tr><th>Lot/Wafer</th><th>Limiting write polarity</th><th>Graphical WSNM (mV)</th><th>SRAM VDD (V)</th></tr></thead><tbody><tr><td>{html.escape(str(wat["corner"]))}</td><td>{geometry_polarity}</td><td>{geometry_value}</td><td>{cfg["nominal_vdd"]:.3f}</td></tr></tbody></table>
+    <p>This geometry is an easy-to-read compact-model indicator. Keep the SNM-versus-BL chart above as the separate write-trip / eye-closure result.</p></section>
     {electrical_snm_section}
     {assumption_section}
     {analytical_section}
     {target_section}
     <section><h2>Model Settings</h2><table><tbody><tr><td>Technology node</td><td>28 nm generic compact model</td></tr><tr><td>SRAM analysis VDD</td><td>{cfg["nominal_vdd"]:.3f} V</td></tr><tr><td>WAT calibration VDD</td><td>{cfg["wat_vdd"]:.3f} V</td></tr></tbody></table></section>
     {object_section}
-    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>read_snm_state_mismatch.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>cell_geometry_reference.csv</code>, <code>analytical_read_snm.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts: <code>images/{png_name}</code>, <code>images/{butterfly_png_name}</code> and <code>images/{write_png_name}</code>.</p>
+    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>write_snm_vs_bitline.csv</code>, <code>single_wat_write_snm_geometry.csv</code>, <code>read_snm_state_mismatch.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>cell_geometry_reference.csv</code>, <code>analytical_read_snm.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts are stored in <code>images/</code>.</p>
     </main></body></html>'''
     report = out / "sram_wat_report.html"
     report.write_text(document, encoding="utf-8")
@@ -3448,6 +4212,15 @@ def launch_gui() -> None:
         group_values = saved_state.get(group, {})
         return str(group_values.get(key, default)) if isinstance(group_values, dict) else str(default)
 
+    def saved_bool(group: str, key: str, default: bool) -> bool:
+        group_values = saved_state.get(group, {})
+        if not isinstance(group_values, dict):
+            return default
+        value = group_values.get(key, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
     values = {
         "out": tk.StringVar(value=saved_text("values", "out", Path.cwd() / "output")),
         "corner": tk.StringVar(value=saved_text("values", "corner", "DEMO28_TT_W01")),
@@ -3465,6 +4238,8 @@ def launch_gui() -> None:
         vt, ids = target_defaults[dev]
         target_values[f"{dev}_vt"] = tk.StringVar(value=saved_text("targets", f"{dev}_vt", vt))
         target_values[f"{dev}_ids"] = tk.StringVar(value=saved_text("targets", f"{dev}_ids", ids))
+    use_wat_target_reference = tk.BooleanVar(
+        value=saved_bool("options", "use_wat_target_reference", True))
     config_defaults = Config()
     numeric = {
         "nominal_vdd": tk.StringVar(value=saved_text("numeric", "nominal_vdd", config_defaults.nominal_vdd)),
@@ -3494,9 +4269,11 @@ def launch_gui() -> None:
     bitcell_tab = ttk.Frame(notebook, style="Root.TFrame")
     curve_tab = ttk.Frame(notebook, style="Root.TFrame")
     write_margin_tab = ttk.Frame(notebook, style="Root.TFrame")
+    mismatch_boundary_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
     notebook.add(curve_tab, text="RSNM vs VDD Curve")
     notebook.add(write_margin_tab, text="Write Trip Margin")
+    notebook.add(mismatch_boundary_tab, text="RSNM Mismatch Boundary")
 
     content = ttk.Frame(bitcell_tab, style="Root.TFrame"); content.pack(fill="both", expand=True)
     content.columnconfigure(0, weight=7); content.columnconfigure(1, weight=4); content.rowconfigure(0, weight=1)
@@ -3617,20 +4394,53 @@ def launch_gui() -> None:
     ttk.Label(right, text="Analysis", style="Section.TLabel").pack(anchor="w")
     ttk.Label(right, text="Compare the entered Lot/Wafer WAT with WAT Target Read SNM curves.", style="Meta.TLabel").pack(anchor="w", pady=(2, 12))
 
-    ttk.Label(right, text="WAT Target", style="Body.TLabel").pack(anchor="w")
-    ttk.Label(right, text="Comparison reference only; the model remains calibrated from measured WAT.",
+    target_header = ttk.Frame(right, style="Card.TFrame")
+    target_header.pack(fill="x")
+    ttk.Label(target_header, text="WAT Target", style="Body.TLabel").pack(side="left")
+    ttk.Checkbutton(target_header, text="Use as reference",
+                    variable=use_wat_target_reference).pack(side="right")
+    target_reference_note = tk.StringVar()
+    footer_reference_text = tk.StringVar()
+    output_scope_note = tk.StringVar()
+    ttk.Label(right, textvariable=target_reference_note,
               style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(2, 5))
     target_grid = ttk.Frame(right, style="Card.TFrame"); target_grid.pack(fill="x", pady=(0, 12))
     ttk.Label(target_grid, text="Type", style="Meta.TLabel").grid(row=0, column=0, sticky="w")
     ttk.Label(target_grid, text="Vt (V)", style="Meta.TLabel").grid(row=0, column=1, sticky="w", padx=(8, 0))
     ttk.Label(target_grid, text="Isat (µA)", style="Meta.TLabel").grid(row=0, column=2, sticky="w", padx=(8, 0))
+    target_entries: list[ttk.Entry] = []
     for row, (name, color) in enumerate((("PU", RED), ("PG", GREEN), ("PD", BLUE)), 1):
         tk.Label(target_grid, text=name, bg=CARD, fg=color,
                  font=("Calibri", 10, "bold")).grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Entry(target_grid, textvariable=target_values[f"{name.lower()}_vt"], width=9,
-                  style="Apple.TEntry").grid(row=row, column=1, padx=(8, 0), pady=3)
-        ttk.Entry(target_grid, textvariable=target_values[f"{name.lower()}_ids"], width=10,
-                  style="Apple.TEntry").grid(row=row, column=2, padx=(8, 0), pady=3)
+        vt_entry = ttk.Entry(target_grid, textvariable=target_values[f"{name.lower()}_vt"], width=9,
+                             style="Apple.TEntry")
+        ids_entry = ttk.Entry(target_grid, textvariable=target_values[f"{name.lower()}_ids"], width=10,
+                              style="Apple.TEntry")
+        vt_entry.grid(row=row, column=1, padx=(8, 0), pady=3)
+        ids_entry.grid(row=row, column=2, padx=(8, 0), pady=3)
+        target_entries.extend((vt_entry, ids_entry))
+
+    def sync_target_reference_state(*_args) -> None:
+        enabled = use_wat_target_reference.get()
+        for entry in target_entries:
+            entry.state(["!disabled"] if enabled else ["disabled"])
+        target_reference_note.set(
+            "Enabled: build a separate Target model and include comparison curves / deltas."
+            if enabled else
+            "Disabled: retain the entered values, but analyze and report Lot/Wafer only."
+        )
+        footer_reference_text.set(
+            "Read / Write SNM · Lot/Wafer vs WAT Target" if enabled
+            else "Read / Write SNM · Lot/Wafer only"
+        )
+        output_scope_note.set(
+            "Output: Read SNM butterfly plus write-condition VTC and WSNM comparisons against WAT Target."
+            if enabled else
+            "Output: Lot/Wafer Read SNM butterfly plus write-condition VTC and WSNM; no Target comparison."
+        )
+
+    use_wat_target_reference.trace_add("write", sync_target_reference_state)
+    sync_target_reference_state()
 
     ttk.Label(right, text="Model settings", style="Body.TLabel").pack(anchor="w", pady=(2, 0))
     config_grid = ttk.Frame(right, style="Card.TFrame"); config_grid.pack(fill="x")
@@ -3664,7 +4474,7 @@ def launch_gui() -> None:
         ttk.Label(assumption_grid, text=unit, style="Meta.TLabel").grid(row=row, column=2, sticky="w")
     assumption_grid.columnconfigure(0, weight=1)
     ttk.Label(right,
-              text="Output: Read SNM butterfly plus write-condition VTC and WSNM proxy comparisons against WAT Target.",
+              textvariable=output_scope_note,
               style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(7, 0))
 
     ttk.Separator(right).pack(fill="x", pady=16)
@@ -3697,7 +4507,7 @@ def launch_gui() -> None:
     progress.pack(fill="x", pady=(0, 12))
     result_queue: queue.Queue = queue.Queue()
 
-    def collect_inputs() -> tuple[SixTWatCell, Config, DatasheetTargets]:
+    def collect_inputs() -> tuple[SixTWatCell, Config, DatasheetTargets | None]:
         resolved_assumptions: dict[str, float] = {}
         for key, _label, _unit in assumption_specs:
             raw = assumption_values[key].get().strip()
@@ -3713,15 +4523,17 @@ def launch_gui() -> None:
                              _positive(wat_values[f"{name}_ids"].get(), f"{name}_ids"))
                 for name in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2")}
         cell = SixTWatCell(corner, **mos6)
-        targets = DatasheetTargets(**{
-            name: MosWat(_positive(target_values[f"{name}_vt"].get(), f"{name} target Vt"),
-                         _positive(target_values[f"{name}_ids"].get(), f"{name} target Isat"))
-            for name in ("pu", "pg", "pd")
-        })
+        targets = None
+        if use_wat_target_reference.get():
+            targets = DatasheetTargets(**{
+                name: MosWat(_positive(target_values[f"{name}_vt"].get(), f"{name} target Vt"),
+                             _positive(target_values[f"{name}_ids"].get(), f"{name} target Isat"))
+                for name in ("pu", "pg", "pd")
+            })
         return cell, cfg, targets
 
     def worker(cell: SixTWatCell, cfg: Config,
-               targets: DatasheetTargets, out_path: str) -> None:
+               targets: DatasheetTargets | None, out_path: str) -> None:
         try:
             result = analyze_six_mos(cell, cfg, targets)
             run_dir = create_run_output_dir(out_path, cell.corner, "6t_analysis")
@@ -3730,7 +4542,7 @@ def launch_gui() -> None:
         except Exception as exc:
             result_queue.put((False, None, exc))
 
-    def excel_worker(excel_path: str, cfg: Config, targets: DatasheetTargets, out_path: str) -> None:
+    def excel_worker(excel_path: str, cfg: Config, targets: DatasheetTargets | None, out_path: str) -> None:
         try:
             report = analyze_excel_wat_sweep(
                 excel_path, out_path, cfg, targets, archive_run=True)
@@ -3782,7 +4594,8 @@ def launch_gui() -> None:
         threading.Thread(target=excel_worker, args=(excel_path, cfg, targets, values["out"].get()), daemon=True).start()
         root.after(80, poll_result)
 
-    ttk.Label(right_footer, text="Read / Write SNM · Lot/Wafer vs WAT Target", style="Meta.TLabel").pack(pady=(0, 7))
+    ttk.Label(right_footer, textvariable=footer_reference_text,
+              style="Meta.TLabel").pack(pady=(0, 7))
     analyze_button = ttk.Button(right_footer, text="Analyze & Open HTML", style="Accent.TButton", command=execute)
     analyze_button.pack(fill="x")
     excel_analyze_button = ttk.Button(right_footer, text="Analyze Excel VDD Sweep", style="Quiet.TButton", command=execute_excel_sweep)
@@ -4308,11 +5121,163 @@ def launch_gui() -> None:
     wtm_open_button.pack(fill="x", pady=(7, 0))
     wtm_open_button.state(["disabled"])
 
+    # One-factor-at-a-time Vt/Idsat boundary search for the two Read-SNM eyes.
+    mismatch_boundary_tab.columnconfigure(0, weight=1)
+    mismatch_boundary_tab.rowconfigure(0, weight=1)
+    mismatch_card = ttk.Frame(mismatch_boundary_tab, style="Card.TFrame", padding=20)
+    mismatch_card.grid(row=0, column=0, sticky="nsew")
+    mismatch_card.columnconfigure(0, weight=1)
+    mismatch_card.rowconfigure(4, weight=1)
+    ttk.Label(mismatch_card, text="6T Vt / Isat RSNM=0 Boundaries",
+              style="ChartTitle.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        mismatch_card,
+        text=("Uses the six independent MOS values from the 6T tab. One Vt or Isat is swept "
+              "at a time while the other eleven values remain fixed."),
+        style="Meta.TLabel", wraplength=1000).grid(row=1, column=0, sticky="w", pady=(3, 4))
+    ttk.Label(
+        mismatch_card,
+        text=("Boundary means the first Upper or Lower Read-SNM eye reaches 0 in this compact model. "
+              "It is a sensitivity reference, not a simultaneous six-parameter process limit."),
+        style="Meta.TLabel", wraplength=1000).grid(row=2, column=0, sticky="w", pady=(0, 10))
+
+    mismatch_summary = tk.StringVar(value="Analyze the current 6T inputs to estimate mismatch boundaries.")
+    mismatch_summary_label = tk.Label(
+        mismatch_card, textvariable=mismatch_summary, bg=CARD, fg=SECONDARY,
+        font=("Calibri", 10, "bold"), anchor="w", justify="left")
+    mismatch_summary_label.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+
+    mismatch_table_frame = ttk.Frame(mismatch_card, style="Card.TFrame")
+    mismatch_table_frame.grid(row=4, column=0, sticky="nsew")
+    mismatch_table_frame.columnconfigure(0, weight=1)
+    mismatch_table_frame.rowconfigure(0, weight=1)
+    mismatch_columns = (
+        "device", "parameter", "direction", "baseline", "boundary", "unit",
+        "failed_state", "upper", "lower", "status",
+    )
+    mismatch_tree = ttk.Treeview(
+        mismatch_table_frame, columns=mismatch_columns, show="headings", height=18)
+    headings = {
+        "device": "Device", "parameter": "Parameter", "direction": "Direction",
+        "baseline": "Baseline", "boundary": "Boundary", "unit": "Unit",
+        "failed_state": "First zero state", "upper": "Upper (mV)",
+        "lower": "Lower (mV)", "status": "Status",
+    }
+    widths = {"device": 70, "parameter": 75, "direction": 85, "baseline": 85,
+              "boundary": 95, "unit": 55, "failed_state": 125, "upper": 90,
+              "lower": 90, "status": 125}
+    for column in mismatch_columns:
+        mismatch_tree.heading(column, text=headings[column])
+        mismatch_tree.column(column, width=widths[column], minwidth=50,
+                             anchor="w" if column in ("device", "parameter", "direction",
+                                                       "failed_state", "status") else "e")
+    mismatch_y_scroll = ttk.Scrollbar(
+        mismatch_table_frame, orient="vertical", command=mismatch_tree.yview)
+    mismatch_x_scroll = ttk.Scrollbar(
+        mismatch_table_frame, orient="horizontal", command=mismatch_tree.xview)
+    mismatch_tree.configure(yscrollcommand=mismatch_y_scroll.set,
+                            xscrollcommand=mismatch_x_scroll.set)
+    mismatch_tree.grid(row=0, column=0, sticky="nsew")
+    mismatch_y_scroll.grid(row=0, column=1, sticky="ns")
+    mismatch_x_scroll.grid(row=1, column=0, sticky="ew")
+
+    mismatch_status = tk.StringVar(value="Ready to analyze mismatch boundaries")
+    mismatch_status_label = tk.Label(
+        mismatch_card, textvariable=mismatch_status, bg=CARD, fg=SECONDARY,
+        font=("Calibri", 9), anchor="w", justify="left")
+    mismatch_status_label.grid(row=5, column=0, sticky="ew", pady=(10, 5))
+    mismatch_progress = ttk.Progressbar(
+        mismatch_card, mode="indeterminate", style="Apple.Horizontal.TProgressbar")
+    mismatch_progress.grid(row=6, column=0, sticky="ew", pady=(0, 8))
+    mismatch_result_queue: queue.Queue = queue.Queue()
+    mismatch_report_path: Path | None = None
+
+    def mismatch_worker(cell: SixTWatCell, cfg: Config,
+                        out_path: Path, wafer_id: str) -> None:
+        try:
+            analysis = analyze_mismatch_rsnm_boundaries(cell, cfg)
+            run_dir = create_run_output_dir(out_path, wafer_id, "rsnm_mismatch_boundary")
+            report = write_mismatch_boundary_outputs(analysis, run_dir)
+            mismatch_result_queue.put((True, analysis, report))
+        except Exception as exc:
+            mismatch_result_queue.put((False, None, exc))
+
+    def poll_mismatch_result() -> None:
+        nonlocal mismatch_report_path
+        try:
+            ok, analysis, payload = mismatch_result_queue.get_nowait()
+        except queue.Empty:
+            root.after(80, poll_mismatch_result)
+            return
+        mismatch_progress.stop()
+        mismatch_analyze_button.state(["!disabled"])
+        if ok:
+            mismatch_report_path = Path(payload)
+            mismatch_tree.delete(*mismatch_tree.get_children())
+            found = 0
+            for row in analysis["rows"]:
+                found += row["status"] == "BOUNDARY FOUND"
+                mismatch_tree.insert("", "end", values=(
+                    row["device"], row["parameter"], row["direction"].title(),
+                    f'{row["baseline_value"]:.5g}', _fmt(row["boundary_value"], 5),
+                    row["unit"], row["failed_state"] or "N/A",
+                    _fmt(row["upper_rsnm_mv"], 2), _fmt(row["lower_rsnm_mv"], 2),
+                    row["status"],
+                ))
+            mismatch_summary.set(
+                f'Baseline Upper {analysis["baseline_upper_rsnm_mv"]:.1f} mV / '
+                f'Lower {analysis["baseline_lower_rsnm_mv"]:.1f} mV · '
+                f'{found} of {len(analysis["rows"])} directions bracketed')
+            mismatch_summary_label.configure(fg=TEXT)
+            mismatch_status.set(f"Complete - saved to {mismatch_report_path.parent}")
+            mismatch_status_label.configure(fg=GREEN)
+            mismatch_open_button.state(["!disabled"])
+        else:
+            mismatch_status.set("Mismatch boundary analysis could not be completed")
+            mismatch_status_label.configure(fg=RED)
+            messagebox.showerror("RSNM mismatch boundary", str(payload))
+
+    def execute_mismatch_analysis() -> None:
+        try:
+            cell, cfg, _targets = collect_inputs()
+        except Exception as exc:
+            mismatch_status.set("Check the shared 6T input values")
+            mismatch_status_label.configure(fg=RED)
+            messagebox.showerror("Invalid 6T input", str(exc))
+            return
+        mismatch_status.set("Sweeping 6T Vt / Isat boundaries...")
+        mismatch_status_label.configure(fg=BLUE)
+        mismatch_analyze_button.state(["disabled"])
+        mismatch_open_button.state(["disabled"])
+        mismatch_progress.start(10)
+        wafer_id = values["corner"].get().strip() or "Manual"
+        threading.Thread(
+            target=mismatch_worker,
+            args=(cell, cfg, Path(values["out"].get()), wafer_id), daemon=True).start()
+        root.after(80, poll_mismatch_result)
+
+    def open_mismatch_report() -> None:
+        if mismatch_report_path and mismatch_report_path.exists():
+            webbrowser.open(mismatch_report_path.resolve().as_uri())
+
+    mismatch_actions = ttk.Frame(mismatch_card, style="Card.TFrame")
+    mismatch_actions.grid(row=7, column=0, sticky="ew")
+    mismatch_analyze_button = ttk.Button(
+        mismatch_actions, text="Analyze RSNM=0 Boundaries",
+        style="Accent.TButton", command=execute_mismatch_analysis)
+    mismatch_analyze_button.pack(side="left", fill="x", expand=True)
+    mismatch_open_button = ttk.Button(
+        mismatch_actions, text="Open HTML Result", style="Quiet.TButton",
+        command=open_mismatch_report)
+    mismatch_open_button.pack(side="left", padx=(8, 0))
+    mismatch_open_button.state(["disabled"])
+
     def persist_and_close() -> None:
         state = {
             "values": {key: variable.get() for key, variable in values.items()},
             "wat": {key: variable.get() for key, variable in wat_values.items()},
             "targets": {key: variable.get() for key, variable in target_values.items()},
+            "options": {"use_wat_target_reference": use_wat_target_reference.get()},
             "numeric": {key: variable.get() for key, variable in numeric.items()},
             "assumptions": {key: variable.get() for key, variable in assumption_values.items()},
             "rsnm_vcc_rows": [

@@ -4,7 +4,7 @@ Python-only generic 28 nm 6T SRAM WAT compact-model analysis. No SPICE or foundr
 
 The active workflow is focused on:
 
-- Read SNM and write-condition SNM proxy
+- Read SNM and textbook-based Write SNM versus write-bitline sweep
 - Lot/Wafer WAT versus WAT Target VTC comparison
 - Read butterfly maximum-square extraction
 - Independent upper-left / lower-right Read-SNM mismatch analysis
@@ -12,6 +12,7 @@ The active workflow is focused on:
 - PU / PG / PD Vt and Idsat comparison
 - Manual grouped-PU/PG/PD RSNM-versus-VDD curve analysis and eye-closure estimation
 - Write Trip Margin versus VDD trend analysis and estimated write boundary
+- Independent Upper/Lower RSNM=0 mismatch-boundary search for all six MOS Vt/Idsat inputs
 
 Hold SNM and Vmin comparison are not included in the active report.
 
@@ -39,6 +40,8 @@ Each row's Idsat is treated as measured at that row's VDD. The program recalibra
 
 The **Write Trip Margin** tab reuses the same manual VDD / PU / PG / PD rows so Read and Write trends are based on identical WAT inputs. It calculates the maximum rise allowed on the nominally-low write bitline while PG can still overcome PU, then estimates the boundary between zero and positive write margin. The tab independently generates HTML, PNG, SVG, CSV and JSON results. This boundary is a compact-model reference and is not measured `Select_Write Vmin`.
 
+The **RSNM Mismatch Boundary** tab sweeps PUL/PUR/PGL/PGR/PDL/PDR Vt and Isat one parameter at a time. It reports whether the Upper or Lower Read-SNM eye reaches 0 first and exports the complete six-device Vt/Idsat set at each bracketed boundary. Values that are not being swept remain fixed at the entered Lot/Wafer baseline, so these results are sensitivity references rather than simultaneous multidimensional process limits.
+
 ## Read SNM chart convention
 
 All active SNM charts use standard inverter VTC coordinates:
@@ -60,11 +63,16 @@ This preserves PUL/PGL/PDL versus PUR/PGR/PDR mismatch instead of averaging the 
 
 The generic Read condition defaults to `WL = BL = BLB = VDD`; the WL/VDD and BL/VDD ratios can be edited in the interface.
 
-## Write SNM proxy
+## Textbook-based Write SNM
 
-Write condition defaults to `WL = VDD`, `BL = 0 V`, and `BLB = VDD`. The write VTC pair is intentionally asymmetric: the direct curve uses the low write bitline and the mirrored curve uses the high complementary bitline.
+The main 6T report follows the textbook writeability concept. `WL` and `BLB` are held at `VDD`, while the write bitline `BL` is swept from `VDD` toward `0 V`. At every BL point the tool rebuilds the two write-condition VTCs and calculates the maximum square inside the eye belonging to the state being overwritten.
 
-The reported Write SNM is a bitline-noise-margin proxy: the maximum rise allowed on the nominally-low write bitline while PG can still overcome PU at the hold inverter trip point. It supports WAT Target comparison and trend analysis; it is not a geometric butterfly-square metric or foundry sign-off WSNM.
+```text
+Write Trip BL = BL voltage where the write-state butterfly eye closes (SNM = 0)
+Required BL Swing = VDD - Write Trip BL
+```
+
+A higher Write Trip BL and a smaller required BL swing indicate easier writing in this compact model. The result is calibrated from WAT Vt/Idsat and is intended for correlation and target comparison, not foundry BSIM or measured WT sign-off.
 
 ## WAT-calibrated device model
 
@@ -125,9 +133,11 @@ output/YYYY-MM-DD/WaferID/HHMMSS_analysis-name/
 If two runs start during the same second, `_02`, `_03`, and so on are appended automatically. Windows-invalid characters in the Lot/Wafer ID are replaced with underscores. Each run also includes `run_info.json` with the original Wafer ID, local creation time, analysis type and absolute output directory.
 
 - `sram_wat_report.html`: main interactive report
-- `snm_target_comparison.csv`: Read SNM and Write SNM proxy, Lot/Wafer versus WAT Target
+- `snm_target_comparison.csv`: Read SNM, Lot/Wafer versus WAT Target
+- `write_snm_vs_bitline.csv`: BL sweep, limiting write-state SNM, Write Trip BL and required BL swing
+- `single_wat_write_snm_geometry.csv`: one Lot/Wafer 6T write-condition VTC and its diagonal-intersection WSNM estimate
 - `read_snm_state_mismatch.csv`: upper-left/lower-right state margins, conservative Cell RSNM, signed delta and mismatch index
-- `wat_electrical_snm_table.csv`: WAT inputs, derived ratios, Read SNM and Write SNM proxy
+- `wat_electrical_snm_table.csv`: WAT inputs, derived ratios, Read SNM, Write Trip BL and required BL swing
 - `analytical_read_snm.csv`: analytical Read SNM parameters and result
 - `cell_geometry_reference.csv`: L/W geometry values and derived ratio references
 - `wat_target_comparison.csv`: PU / PG / PD Vt and Idsat deltas
@@ -136,8 +146,10 @@ If two runs start during the same second, `_02`, `_03`, and so on are appended a
 - `images/01_read_snm_target_comparison.svg`: scalable chart source
 - `images/02_read_snm_butterfly.png`: Read butterfly maximum-square chart
 - `images/02_read_snm_butterfly.svg`: scalable butterfly source
-- `images/03_write_snm_target_comparison.png`: write-condition VTC and WSNM proxy comparison
-- `images/03_write_snm_target_comparison.svg`: scalable chart source
+- `images/03_write_snm_vs_bitline.png`: textbook Write SNM-versus-BL comparison
+- `images/03_write_snm_vs_bitline.svg`: scalable chart source
+- `images/04_single_wat_write_snm_geometry.png`: single-WAT 6T write VTC with origin-anchored WSNM square
+- `images/04_single_wat_write_snm_geometry.svg`: scalable single-WAT WSNM chart source
 - `images/image_manifest.csv`: image manifest
 
 The manual curve tab uses the same dated archive structure with the `rsnm_vdd_curve` analysis name:
@@ -151,6 +163,13 @@ The manual curve tab uses the same dated archive structure with the `rsnm_vdd_cu
 ## Formula guide
 
 The WAT Vt/Idsat conversion, Read SNM, analytical RSNM, and Write Margin Test equations are explained in Traditional Chinese in the [HV28 SRAM Analysis Formula Guide (PDF)](https://github.com/QooLien/28nm-6t-sram-wat-studio/releases/download/v1.5.0/HV28_SRAM_Analysis_Formula_Guide.pdf). The reproducible source is `generate_formula_guide_zh.py`.
+
+## Presentation decks
+
+- `output/HV28_SRAM_Core_Formulas_Chinese_v5.pptx`: Traditional Chinese explanation of WAT-to-beta conversion, Cell/Pull-up Ratio, RSNM and WSNM.
+- `output/HV28_SRAM_Core_Formulas_English_v5.pptx`: English version of the same presentation.
+
+The Write-SNM figure uses a blue solid line for the original write VTC, a purple dashed line for the mirrored VTC, a dark-gray dashed line for `Vout = Vin`, and orange geometry for the WSNM square and diagonal crossings.
 
 ## WAT CSV
 
@@ -184,6 +203,8 @@ W01       | 0.900         | 380         | 45             | ... | 356         | 1
 ```
 
 Accepted MOS names are PUL/PUR/PGL/PGR/PDL/PDR, PU1/PU2/PG1/PG2/PD1/PD2, or the conventional M2/M4/M5/M6/M1/M3 names. When sheets named PU, PG and PD are present, the loader combines all three automatically. The application saves manual 6T inputs, manual RSNM/VDD rows, targets, model settings, assumptions, output folder and last selected Excel path in `.hv28_sram_analysis_state.json` when it closes; this local state file is not committed to Git.
+
+The **WAT Target → Use as reference** checkbox controls whether Target values participate in analysis. When disabled, the entered Target values remain saved, but charts, HTML tables and CSV outputs contain Lot/Wafer results only; no duplicated Target curve or zero-delta comparison is generated.
 
 ## Engineering limitation
 
