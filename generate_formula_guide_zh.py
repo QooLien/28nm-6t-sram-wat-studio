@@ -51,6 +51,18 @@ GRID = colors.HexColor("#CBD6E2")
 NOTE_BG = colors.HexColor("#FFF6E4")
 NOTE_BORDER = colors.HexColor("#E4A73A")
 
+# Academic equation typography: Times New Roman for Latin letters/numbers,
+# with STIX retained only as the compatible fallback for mathematical glyphs.
+matplotlib.rcParams.update({
+    "mathtext.fontset": "custom",
+    "mathtext.rm": "Times New Roman",
+    "mathtext.it": "Times New Roman:italic",
+    "mathtext.bf": "Times New Roman:bold",
+    "mathtext.sf": "Times New Roman",
+    "mathtext.tt": "Times New Roman",
+    "mathtext.cal": "STIXGeneral",
+})
+
 
 def register_fonts() -> None:
     if not MSJH.exists() or not MSJH_BOLD.exists():
@@ -63,9 +75,9 @@ def register_fonts() -> None:
 
 
 def math_png(name: str, expression: str, font_size: float = 11.0) -> Path:
-    """Render one equation using STIX math typography at publication resolution."""
+    """Render one equation with Times New Roman academic typography."""
     path = TEMP_DIR / f"{name}.png"
-    prop = FontProperties(family="STIXGeneral", size=font_size)
+    prop = FontProperties(family="Times New Roman", size=font_size)
     fig = plt.figure(figsize=(1, 1), dpi=360)
     fig.patch.set_alpha(0)
     fig.text(0, 0, f"${expression}$", fontproperties=prop, color="#12344D")
