@@ -163,6 +163,8 @@ class AnalyzerTests(unittest.TestCase):
             self.assertNotIn("SNM squares in both butterfly lobes", svg)
             butterfly_svg = (image_dir / "02_read_snm_butterfly.svg").read_text(encoding="utf-8")
             self.assertIn("Maximum squares 1 and 2", butterfly_svg)
+            self.assertNotIn("Geometric RSNM", butterfly_svg)
+            self.assertNotIn("Analytical RSNM", butterfly_svg)
             self.assertIn("cell RSNM is the smaller value", butterfly_svg)
             self.assertIn("QB=0 / Q=1", butterfly_svg)
             self.assertIn("QB=1 / Q=0", butterfly_svg)

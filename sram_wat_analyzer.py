@@ -2150,13 +2150,11 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
     """Read butterfly plots with independently fitted maximum squares."""
     current = result["baseline_6t"]
     target = result.get("target_6t", current)
-    analytical = result.get("analytical_read_snm_comparison", {})
     lot_label = str(result["wat"]["corner"])
-    vdd = result["config"]["nominal_vdd"]
     axis_max = SNM_PLOT_AXIS_MAX_V
     panels = (
-        (lot_label, current, "#007AFF", analytical.get("current_snm_mv")),
-        ("WAT Target", target, "#FF9500", analytical.get("target_snm_mv")),
+        (lot_label, current, "#007AFF"),
+        ("WAT Target", target, "#FF9500"),
     )
     margin_x, gap = 60, 64
     panel_w = (width - 2 * margin_x - gap) / 2
@@ -2168,9 +2166,8 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
         '<path d="M54 82 h34" stroke="#3A3A3C" stroke-width="4"/><text x="98" y="88" fill="#3A3A3C" font-size="17">Right inverter VTC</text>',
         '<path d="M285 82 h34" stroke="#3A3A3C" stroke-width="4" stroke-dasharray="10 7"/><text x="329" y="88" fill="#3A3A3C" font-size="17">Inverse left inverter VTC</text>',
         '<rect x="600" y="68" width="24" height="24" fill="none" stroke="#34C759" stroke-width="3"/><text x="636" y="88" fill="#3A3A3C" font-size="17">Maximum squares 1 and 2</text>',
-        '<text x="970" y="88" fill="#5856D6" font-size="17">Analytical RSNM shown as an independent reference</text>',
     ]
-    for index, (title, data, color, analytical_value) in enumerate(panels):
+    for index, (title, data, color) in enumerate(panels):
         x0 = margin_x + index * (panel_w + gap)
         # Equal X/Y pixel scale keeps a voltage square visually square.
         plot_left, plot_w = x0 + 95, 480
@@ -2179,8 +2176,8 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
             return (plot_left + x_value / axis_max * plot_w,
                     plot_top + (1.0 - y_value / axis_max) * plot_h)
 
-        parts += [f'<text x="{x0:.1f}" y="126" fill="#1D1D1F" font-size="25" font-weight="700">{html.escape(title)}</text>',
-                  f'<text x="{x0+panel_w:.1f}" y="126" text-anchor="end" fill="{color}" font-size="18" font-weight="700">Geometric RSNM {data["read_butterfly"]["snm_mv"]:.1f} mV</text>']
+        parts.append(
+            f'<text x="{x0:.1f}" y="126" fill="#1D1D1F" font-size="25" font-weight="700">{html.escape(title)}</text>')
         for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
             px, py = xy(voltage, voltage)
             parts += [f'<path d="M{px:.1f} {plot_top} V{plot_top+plot_h} M{plot_left} {py:.1f} H{plot_left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
@@ -2207,13 +2204,11 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
             arrow_x = min(left + side_px_x + 16, plot_left + plot_w - 8)
             parts += [f'<path d="M{arrow_x:.1f} {top+3:.1f} V{top+side_px_y-3:.1f} M{arrow_x-5:.1f} {top+3:.1f} H{arrow_x+5:.1f} M{arrow_x-5:.1f} {top+side_px_y-3:.1f} H{arrow_x+5:.1f}" stroke="#34C759" stroke-width="2"/>']
 
-        eq_text = f'Analytical RSNM {analytical_value:.1f} mV' if analytical_value is not None else 'Analytical RSNM N/A'
         butterfly = data["read_butterfly"]
         state_text = (f'Upper {butterfly.get("snm_upper_left_mv", squares[0]["side_mv"]):.1f} mV · '
                       f'Lower {butterfly.get("snm_lower_right_mv", squares[1]["side_mv"]):.1f} mV · '
                       f'Asymmetry {_fmt(butterfly.get("mismatch_index_pct"), 1)}%')
         parts += [f'<text x="{x0:.1f}" y="{plot_top+plot_h+60}" fill="#3A3A3C" font-size="15" font-weight="700">{state_text}</text>',
-                  f'<text x="{x0+panel_w:.1f}" y="{plot_top+plot_h+82}" text-anchor="end" fill="#5856D6" font-size="16" font-weight="700">{eq_text}</text>',
                   f'<text x="{plot_left+plot_w/2:.1f}" y="{height-62}" text-anchor="middle" fill="#1D1D1F" font-size="18">Vin (V)</text>',
                   f'<text x="{x0+45:.1f}" y="{plot_top+plot_h/2:.1f}" transform="rotate(-90 {x0+45:.1f} {plot_top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="18">Vout (V)</text>']
     parts.append(f'<text x="720" y="{height-14}" text-anchor="middle" fill="#6E6E73" font-size="15">Upper and lower margins represent opposite stored states; cell RSNM is the smaller value.</text></svg>')
