@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, MosWat, RsnmVccPoint,
@@ -10,7 +11,8 @@ from sram_wat_analyzer import (
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, analyze_rsnm_vcc_curve, analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
-    create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, read_wat_csv, rsnm_vcc_curve_svg,
+    create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, open_output_directory,
+    read_wat_csv, rsnm_vcc_curve_svg,
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_outputs, write_rsnm_vcc_curve_outputs,
     write_trip_margin_curve_svg, write_write_trip_margin_outputs,
@@ -34,6 +36,20 @@ class AnalyzerTests(unittest.TestCase):
             manifest = (first / "run_info.json").read_text(encoding="utf-8")
             self.assertIn('"wafer_id": "LOT/W01:17"', manifest)
             self.assertIn('"created_local": "2026-08-01T14:30:25"', manifest)
+
+    def test_open_output_directory_creates_and_opens_selected_folder(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "new output"
+            with mock.patch("sram_wat_analyzer.sys.platform", "win32"), \
+                    mock.patch("sram_wat_analyzer.os.startfile") as startfile:
+                opened = open_output_directory(target)
+            self.assertEqual(opened, target.resolve())
+            self.assertTrue(target.is_dir())
+            startfile.assert_called_once_with(str(target.resolve()))
+
+    def test_open_output_directory_rejects_blank_path(self):
+        with self.assertRaisesRegex(ValueError, "Choose an output folder"):
+            open_output_directory("  ")
 
     def test_read_snm_is_bounded(self):
         model = Sram6T(self.cell.representative(), self.cfg)

@@ -17,6 +17,7 @@ import math
 import os
 import re
 import statistics as statlib
+import subprocess
 import sys
 import webbrowser
 from dataclasses import asdict, dataclass, replace
@@ -78,6 +79,23 @@ DISPLAY_MOS_NAMES = {
     "pg1": "PGL", "pg2": "PGR",
     "pd1": "PDL", "pd2": "PDR",
 }
+
+
+def open_output_directory(path: str | os.PathLike[str]) -> Path:
+    """Create and open the selected output directory in the system file manager."""
+    raw_path = str(path).strip()
+    if not raw_path:
+        raise ValueError("Choose an output folder first.")
+    output_dir = Path(raw_path).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir.resolve()
+    if sys.platform == "win32":
+        os.startfile(str(output_dir))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(output_dir)])
+    else:
+        subprocess.Popen(["xdg-open", str(output_dir)])
+    return output_dir
 
 
 def _safe_path_component(value: object, fallback: str) -> str:
@@ -3662,6 +3680,16 @@ def launch_gui() -> None:
         selected = filedialog.askdirectory()
         if selected: values["out"].set(selected)
     ttk.Button(out_row, text="Choose…", style="Quiet.TButton", command=pick_out).pack(side="left", padx=(7, 0))
+
+    def open_out() -> None:
+        try:
+            opened = open_output_directory(values["out"].get())
+            status.set(f"Opened output folder: {opened}")
+            status_label.configure(fg=SECONDARY)
+        except Exception as exc:
+            messagebox.showerror("Output folder", str(exc))
+
+    ttk.Button(out_row, text="Open Folder", style="Quiet.TButton", command=open_out).pack(side="left", padx=(7, 0))
     ttk.Label(right,
               text="Each run is archived as YYYY-MM-DD / WaferID / HHMMSS_analysis.",
               style="Meta.TLabel", wraplength=350).pack(anchor="w", pady=(0, 10))

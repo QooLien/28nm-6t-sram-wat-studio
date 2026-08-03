@@ -27,6 +27,8 @@ For a company intranet/offline PC, follow [INTRANET_PC_SETUP.md](INTRANET_PC_SET
 4. Review or replace the four `6T Cell Geometry Reference` values: channel length and PU/PG/PD widths. A blank field automatically uses its generic default.
 5. Select `Analyze & Open HTML`.
 
+Use `Open Folder` beside `Report destination` to open the selected output directory. If the directory does not exist yet, the application creates it first.
+
 The **RSNM vs VDD Curve** tab is an independent workflow:
 
 1. Enter at least two VDD rows with grouped PU / PG / PD Vt and Idsat values.
