@@ -148,7 +148,7 @@ The manual curve tab uses the same dated archive structure with the `rsnm_vdd_cu
 
 ## Formula guide
 
-The current WAT-calibrated device, Read SNM, analytical RSNM, and Write SNM proxy equations are collected in the [HV28 SRAM Analysis Formula Guide (PDF)](https://github.com/QooLien/28nm-6t-sram-wat-studio/releases/download/v1.5.0/HV28_SRAM_Analysis_Formula_Guide.pdf).
+The WAT Vt/Idsat conversion, Read SNM, analytical RSNM, and Write Margin Test equations are explained in Traditional Chinese in the [HV28 SRAM Analysis Formula Guide (PDF)](https://github.com/QooLien/28nm-6t-sram-wat-studio/releases/download/v1.5.0/HV28_SRAM_Analysis_Formula_Guide.pdf). The reproducible source is `generate_formula_guide_zh.py`.
 
 ## WAT CSV
 
