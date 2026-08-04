@@ -946,6 +946,60 @@ class AsymmetricSram6T:
         return fitted
 
 
+def write_wsnm_states(vdd: float, left: Sram6T, right: Sram6T,
+                      cfg: Config, points: int = 1201) -> dict:
+    """Build separate W0/W1 diagonal-intersection Write-SNM estimates.
+
+    Under either write polarity, the node on the high bitline side is the
+    retained inverter. Its write-biased VTC intersects Vout=Vin at the side of
+    an origin-anchored square. This is the graphical WSNM convention used for
+    W0/W1 comparison; it avoids treating the intentionally closed overwrite
+    eye at BL=0 as a zero write margin.
+    """
+    if vdd <= 0:
+        raise ValueError("VDD must be positive for WSNM analysis")
+    n = max(201, int(points))
+    wl = cfg.write_wordline_over_vdd * vdd
+    low_bl = cfg.write_low_bitline_over_vdd * vdd
+    high_bl = cfg.write_high_bitline_over_vdd * vdd
+
+    def vtc(model: Sram6T, bitline: float) -> list[tuple[float, float]]:
+        return [
+            (vdd * index / (n - 1),
+             model.transfer_with_bitline(vdd * index / (n - 1), vdd, bitline, wl))
+            for index in range(n)
+        ]
+
+    def state(label: str, retained_model: Sram6T, forced_node: str) -> dict:
+        curve = vtc(retained_model, high_bl)
+        intersection = _vtc_diagonal_intersection(curve)
+        wsnm_v = None if intersection is None else intersection[0]
+        return {
+            "label": label,
+            "forced_node": forced_node,
+            "curve": curve,
+            "intersection": intersection,
+            "snm_v": wsnm_v,
+            "snm_mv": None if wsnm_v is None else 1000.0 * wsnm_v,
+            "valid": wsnm_v is not None,
+            "write_bias": {"wordline_v": wl, "bl_v": low_bl, "blb_v": high_bl},
+        }
+
+    write_0 = state("W0", right, "Q=0")
+    write_1 = state("W1", left, "QB=0")
+    values = [item["snm_mv"] for item in (write_0, write_1)
+              if item.get("snm_mv") is not None]
+    return {
+        "method": "W0/W1 retained-side VTC diagonal-intersection WSNM extraction",
+        "vdd_v": vdd,
+        "write_0": write_0,
+        "write_1": write_1,
+        "cell_wsnm_mv": min(values) if values else None,
+        "limiting_state": ("W0" if write_0.get("snm_mv", math.inf) <= write_1.get("snm_mv", math.inf)
+                           else "W1"),
+    }
+
+
 def write_snm_vs_bitline(vdd: float,
                          butterfly_at_bl: Callable[[float, int], dict],
                          sweep_points: int = 37,
@@ -1235,21 +1289,20 @@ def analyze(wat: WatPoint, cfg: Config) -> dict:
     model = Sram6T(wat, cfg)
     square_points = max(1201, cfg.grid_points)
     read_butterfly = model.butterfly_squares(cfg.nominal_vdd, "read", square_points)
-    write_low_vtc, write_high_vtc = model.write_vtc_pair(cfg.nominal_vdd, 201)
+    write_states = write_wsnm_states(cfg.nominal_vdd, model, model, cfg, square_points)
     read_vtc = model.vtc(cfg.nominal_vdd, "read", 201)
     baseline_metrics = metric(model, cfg, read_butterfly)
+    baseline_metrics.update({
+        "write_snm_w0_mv": write_states["write_0"]["snm_mv"],
+        "write_snm_w1_mv": write_states["write_1"]["snm_mv"],
+        "write_snm_mv": write_states["cell_wsnm_mv"],
+    })
     baseline = {"metrics": baseline_metrics,
                 "analytical_read_snm_eq_3_36": model.analytical_read_snm_eq_3_36(cfg.nominal_vdd),
                 "read_butterfly": read_butterfly,
                 "read_vtc": read_vtc,
                 "read_vtc_mirrored": _inverse_vtc(read_vtc),
-                "write_butterfly": {
-                    "direct_vtc": write_low_vtc,
-                    "mirrored_vtc": _inverse_vtc(write_high_vtc),
-                    "wordline_v": cfg.write_wordline_over_vdd * cfg.nominal_vdd,
-                    "low_bitline_v": cfg.write_low_bitline_over_vdd * cfg.nominal_vdd,
-                    "high_bitline_v": cfg.write_high_bitline_over_vdd * cfg.nominal_vdd,
-                },
+                "write_wsnm": write_states,
                 "read_trip_v": model.trip_point(cfg.nominal_vdd, "read")}
     report_config = {
         "wat_vdd": cfg.wat_vdd, "nominal_vdd": cfg.nominal_vdd,
@@ -1941,31 +1994,10 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
     asymmetric = asymmetric_model.read_butterfly(
         cfg.nominal_vdd, max(1201, cfg.grid_points))
     vdd = cfg.nominal_vdd
-    wl = cfg.write_wordline_over_vdd * vdd
-    low_bl = cfg.write_low_bitline_over_vdd * vdd
-    high_bl = cfg.write_high_bitline_over_vdd * vdd
-    points = 401
-    left_low_curve = [
-        (vdd * index / (points - 1),
-         asymmetric_model.left.transfer_with_bitline(
-             vdd * index / (points - 1), vdd, low_bl, wl))
-        for index in range(points)
-    ]
-    right_high_curve = [
-        (vdd * index / (points - 1),
-         asymmetric_model.right.transfer_with_bitline(
-             vdd * index / (points - 1), vdd, high_bl, wl))
-        for index in range(points)
-    ]
     baseline = result["baseline_6t"]
     baseline.update(asymmetric)
-    baseline["write_butterfly"] = {
-        "direct_vtc": left_low_curve,
-        "mirrored_vtc": _inverse_vtc(right_high_curve),
-        "wordline_v": wl,
-        "low_bitline_v": low_bl,
-        "high_bitline_v": high_bl,
-    }
+    baseline["write_wsnm"] = write_wsnm_states(
+        vdd, asymmetric_model.left, asymmetric_model.right, cfg, max(1201, cfg.grid_points))
     butterfly = asymmetric["read_butterfly"]
     baseline["metrics"].update({
         "read_snm_mv": butterfly["snm_mv"],
@@ -1973,6 +2005,9 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
         "read_snm_lower_right_mv": butterfly["snm_lower_right_mv"],
         "read_snm_delta_mv": butterfly["delta_snm_mv"],
         "read_snm_mismatch_index_pct": butterfly["mismatch_index_pct"],
+        "write_snm_w0_mv": baseline["write_wsnm"]["write_0"]["snm_mv"],
+        "write_snm_w1_mv": baseline["write_wsnm"]["write_1"]["snm_mv"],
+        "write_snm_mv": baseline["write_wsnm"]["cell_wsnm_mv"],
         "cell_ratio_beta": half_cell["cell_ratio_beta"],
         "pull_up_ratio_beta": half_cell["pull_up_ratio_beta"],
         "cell_ratio_ids_proxy": half_cell["cell_ratio_ids_proxy"],
@@ -2736,6 +2771,74 @@ def snm_overview_svg(result: dict, width: int = 1440, height: int = 720) -> str:
         '<text x="720" y="700" text-anchor="middle" fill="#6E6E73" font-size="15">Read bias uses the configured WL and BL/BLB levels. Axis values are actual volts.</text></svg>',
     ]
     return "".join(parts)
+
+
+def write_wsnm_states_svg(result: dict, width: int = 1440, height: int = 820) -> str:
+    """Render W0 and W1 write-SNM panels with their state-specific squares."""
+    current = result["baseline_6t"]["write_wsnm"]
+    has_target = bool(result.get("datasheet_targets") and result.get("target_6t"))
+    target = result.get("target_6t", {}).get("write_wsnm") if has_target else None
+    cfg, wat = result["config"], result["wat"]
+    axis_max = SNM_PLOT_AXIS_MAX_V
+    # Keep the drawing scale identical on both axes so the WSNM marker is a
+    # physical square as well as a voltage square.
+    margin_x, gap, panel_w = 95, 150, 500
+    top, size = 160, 500
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="W0 W1 Write SNM analysis" style="font-family:Calibri,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="54" y="50" fill="#1D1D1F" font-size="32" font-weight="700">W0 / W1 Write SNM Analysis</text>',
+        f'<path d="M54 86 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="92" fill="#3A3A3C" font-size="17">{html.escape(str(wat["corner"]))} retained-side VTC</text>',
+        '<path d="M390 86 h34" stroke="#3A3A3C" stroke-width="3" stroke-dasharray="8 6"/><text x="434" y="92" fill="#3A3A3C" font-size="17">Vout = Vin</text>',
+        '<rect x="610" y="74" width="20" height="20" fill="#EFFAF2" stroke="#34C759" stroke-width="3"/><text x="642" y="92" fill="#3A3A3C" font-size="17">WSNM square</text>',
+        '<path d="M840 86 h34" stroke="#FF9500" stroke-width="4"/><text x="884" y="92" fill="#3A3A3C" font-size="17">WAT Target retained-side VTC</text>' if target else '',
+    ]
+
+    for panel_index, (state_key, title, condition) in enumerate((
+            ("write_0", "W0: write Q = 0", "BL=0, BLB=VDD, WL=VDD"),
+            ("write_1", "W1: write QB = 0", "BL=VDD, BLB=0, WL=VDD"))):
+        panel_left = margin_x + panel_index * (panel_w + gap)
+        current_state = current[state_key]
+        target_state = target[state_key] if target else None
+
+        def xy(vin: float, vout: float) -> tuple[float, float]:
+            return (panel_left + vin / axis_max * panel_w,
+                    top + (1.0 - vout / axis_max) * size)
+
+        parts += [
+            f'<text x="{panel_left}" y="128" fill="#1D1D1F" font-size="23" font-weight="700">{title}</text>',
+            f'<text x="{panel_left}" y="151" fill="#6E6E73" font-size="15">{condition}</text>',
+        ]
+        for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
+            px, py = xy(voltage, voltage)
+            parts += [f'<path d="M{px:.1f} {top} V{top+size} M{panel_left} {py:.1f} H{panel_left+panel_w}" stroke="#E5E5EA" stroke-width="1"/>',
+                      f'<text x="{px:.1f}" y="{top+size+27}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>']
+        polyline = " ".join(f'{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}' for x, y in current_state["curve"])
+        parts.append(f'<polyline points="{polyline}" fill="none" stroke="#007AFF" stroke-width="4"/>')
+        if target_state:
+            polyline = " ".join(f'{xy(x, y)[0]:.1f},{xy(x, y)[1]:.1f}' for x, y in target_state["curve"])
+            parts.append(f'<polyline points="{polyline}" fill="none" stroke="#FF9500" stroke-width="3" opacity=".88"/>')
+        intersection = current_state.get("intersection")
+        if intersection is not None:
+            side = current_state["snm_v"]
+            x0, y0 = xy(0.0, side)
+            side_px = side / axis_max * panel_w
+            side_py = side / axis_max * size
+            parts += [f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{side_px:.1f}" height="{side_py:.1f}" fill="#EFFAF2" fill-opacity=".70" stroke="#34C759" stroke-width="3"/>',
+                      f'<path d="M{x0:.1f} {top+size:.1f} L{x0+side_px:.1f} {y0:.1f}" stroke="#34C759" stroke-width="2"/>',
+                      f'<text x="{x0+side_px/2:.1f}" y="{y0+side_py/2+5:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{current_state["snm_mv"]:.1f} mV</text>']
+        parts.append(f'<path d="M{xy(0,0)[0]:.1f} {xy(0,0)[1]:.1f} L{xy(axis_max,axis_max)[0]:.1f} {xy(axis_max,axis_max)[1]:.1f}" stroke="#3A3A3C" stroke-width="3" stroke-dasharray="8 6"/>')
+        current_value = current_state["snm_mv"]
+        target_value = target_state["snm_mv"] if target_state else None
+        metric_text = f'Lot/Wafer WSNM = {current_value:.1f} mV'
+        if target_value is not None:
+            metric_text += f'   |   Target = {target_value:.1f} mV   |   Δ = {current_value-target_value:+.1f} mV'
+        parts += [f'<text x="{panel_left+panel_w/2:.1f}" y="{top+size+60}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">{metric_text}</text>',
+                  f'<text x="{panel_left+panel_w/2:.1f}" y="{top+size+92}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>']
+        parts.append(f'<text x="{panel_left-42}" y="{top+size/2}" transform="rotate(-90 {panel_left-42} {top+size/2})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>')
+    parts += [f'<text x="720" y="780" text-anchor="middle" fill="#6E6E73" font-size="15">Cell WSNM = min(WSNM_W0, WSNM_W1). Write-state margin is evaluated separately for both data polarities.</text>', '</svg>']
+    return "".join(part for part in parts if part)
 
 
 def write_butterfly_svg(result: dict, width: int = 1440, height: int = 720) -> str:
@@ -3735,7 +3838,8 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     for name in ("sram_wat_results.csv", "wt_test_0bit_vmin.csv", "parameter_judgment.csv",
                  "wat_target_validation_rows.csv", "wat_target_validation_summary.csv",
                  "wat_target_parameter_evidence.csv", "analytical_read_snm_eq_3_36.csv",
-                 "write_snm_vs_bitline.csv", "single_wat_write_snm_geometry.csv"):
+                 "write_snm_vs_bitline.csv", "single_wat_write_snm_geometry.csv",
+                 "write_butterfly_curve.csv"):
         path = out / name
         if path.exists():
             path.unlink()
@@ -3758,8 +3862,8 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     png_name = "01_read_snm_target_comparison.png"
     butterfly_svg_name = "02_read_snm_butterfly.svg"
     butterfly_png_name = "02_read_snm_butterfly.png"
-    write_svg_name = "03_write_butterfly_curve.svg"
-    write_png_name = "03_write_butterfly_curve.png"
+    write_svg_name = "03_w0_w1_wsnm_analysis.svg"
+    write_png_name = "03_w0_w1_wsnm_analysis.png"
     svg_path = image_dir / svg_name
     svg_path.write_text(snm_overview_svg(result), encoding="utf-8")
     drawing = svg2rlg(str(svg_path))
@@ -3774,10 +3878,10 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     renderPM.drawToFile(butterfly_drawing, str(image_dir / butterfly_png_name),
                         fmt="PNG", dpi=180, backend="rlPyCairo")
     write_svg_path = image_dir / write_svg_name
-    write_svg_path.write_text(write_butterfly_svg(result), encoding="utf-8")
+    write_svg_path.write_text(write_wsnm_states_svg(result), encoding="utf-8")
     write_drawing = svg2rlg(str(write_svg_path))
     if write_drawing is None:
-        raise RuntimeError("Could not render Write Butterfly Curve")
+        raise RuntimeError("Could not render W0/W1 Write SNM analysis")
     renderPM.drawToFile(write_drawing, str(image_dir / write_png_name), fmt="PNG", dpi=180,
                         backend="rlPyCairo")
 
@@ -3794,20 +3898,22 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
             writer = csv.DictWriter(target_file, fieldnames=list(comparison_export_rows[0]))
             writer.writeheader(); writer.writerows(comparison_export_rows)
 
-    write_butterfly_rows = []
+    write_snm_rows = []
     for dataset, modeled in [("Lot/Wafer", result["baseline_6t"])] + ([("WAT Target", result["target_6t"])] if has_target else []):
-        curves = modeled["write_butterfly"]
-        for (vin, direct_vout), (_, mirrored_vout) in zip(curves["direct_vtc"], curves["mirrored_vtc"]):
-            write_butterfly_rows.append({
-                "dataset": dataset, "sram_vdd_v": result["config"]["nominal_vdd"],
-                "vin_v": vin, "bl_low_vtc_vout_v": direct_vout,
-                "mirrored_blb_high_vtc_vout_v": mirrored_vout,
-                "wordline_v": curves["wordline_v"], "bl_v": curves["low_bitline_v"],
-                "blb_v": curves["high_bitline_v"],
-            })
-    with open(out / "write_butterfly_curve.csv", "w", newline="", encoding="utf-8-sig") as write_file:
-        writer = csv.DictWriter(write_file, fieldnames=list(write_butterfly_rows[0]))
-        writer.writeheader(); writer.writerows(write_butterfly_rows)
+        for state_key, state_label in (("write_0", "W0"), ("write_1", "W1")):
+            state = modeled["write_wsnm"][state_key]
+            for vin, vout in state["curve"]:
+                write_snm_rows.append({
+                    "dataset": dataset, "write_state": state_label,
+                    "sram_vdd_v": result["config"]["nominal_vdd"], "vin_v": vin,
+                    "retained_side_vtc_vout_v": vout,
+                    "wsnm_mv": state["snm_mv"], "cell_wsnm_mv": modeled["write_wsnm"]["cell_wsnm_mv"],
+                    "wordline_v": state["write_bias"]["wordline_v"],
+                    "bl_v": state["write_bias"]["bl_v"], "blb_v": state["write_bias"]["blb_v"],
+                })
+    with open(out / "w0_w1_wsnm_analysis.csv", "w", newline="", encoding="utf-8-sig") as write_file:
+        writer = csv.DictWriter(write_file, fieldnames=list(write_snm_rows[0]))
+        writer.writeheader(); writer.writerows(write_snm_rows)
 
     state_rows = []
     state_datasets = [("Lot/Wafer", result["baseline_6t"])]
@@ -3883,10 +3989,10 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
          "description": "Read VTC with maximum squares 1 and 2 for Lot/Wafer and Target"},
         {"filename": butterfly_svg_name, "format": "SVG", "role": "Scalable Read SNM butterfly source", "device": "6T CELL",
          "description": "Read VTC with maximum squares 1 and 2 for Lot/Wafer and Target"},
-        {"filename": write_png_name, "format": "PNG", "role": "Write butterfly curve", "device": "6T CELL",
-         "description": "Write-biased direct and mirrored 6T VTCs; no write-SNM square is fitted"},
-        {"filename": write_svg_name, "format": "SVG", "role": "Scalable write butterfly source", "device": "6T CELL",
-         "description": "Write-biased direct and mirrored 6T VTCs; no write-SNM square is fitted"},
+        {"filename": write_png_name, "format": "PNG", "role": "W0/W1 Write SNM analysis", "device": "6T CELL",
+         "description": "Separate write-zero and write-one VTC pairs with their maximum WSNM squares"},
+        {"filename": write_svg_name, "format": "SVG", "role": "Scalable W0/W1 Write SNM source", "device": "6T CELL",
+         "description": "Separate write-zero and write-one VTC pairs with their maximum WSNM squares"},
     ]
     with open(image_dir / "image_manifest.csv", "w", newline="", encoding="utf-8-sig") as manifest:
         writer = csv.DictWriter(manifest, fieldnames=list(manifest_rows[0]))
@@ -3977,20 +4083,20 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     @media(prefers-reduced-transparency:reduce){{.summary,section{{background:#fff;backdrop-filter:none;border-color:#d2d2d7}}}} @media(prefers-contrast:more){{.summary,section{{background:#fff;border:2px solid #1d1d1f}}}}
     </style></head><body><main>
     <h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode", "Grouped"))}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
-    <div class="summary"><b>Analysis scope:</b> Read SNM plus a write-biased 6T butterfly curve. The write chart shows the BL-low and mirrored BLB-high VTC pair only; it does not fit a noise-margin square. {scope_reference_text}</div>
+    <div class="summary"><b>Analysis scope:</b> Read SNM plus state-specific W0/W1 Write SNM. Each write polarity is evaluated independently; Cell WSNM is the smaller of W0 and W1. {scope_reference_text}</div>
     {read_overview_section}
     <section><h2>Read SNM Butterfly and Left/Right Mismatch</h2><p>The measured 6T model keeps PUL/PGL/PDL and PUR/PGR/PDR independent. The upper-left and lower-right eyes represent opposite stored states. Cell RSNM is the smaller state margin; a larger difference or mismatch index indicates stronger left/right imbalance. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V.</p>
     <img src="images/{butterfly_png_name}" alt="Asymmetric Read SNM butterfly with two state margins">
     <table><thead><tr><th>Dataset</th><th>Upper-left state SNM (mV)</th><th>Lower-right state SNM (mV)</th><th>Cell RSNM = min (mV)</th><th>Upper - Lower (mV)</th><th>Mismatch index</th></tr></thead><tbody>{state_table_rows}</tbody></table></section>
-    <section><h2>Write Butterfly Curve</h2><p>Under write bias, WL and BLB are held at the configured high level while BL is held at the configured low level. The direct BL-low VTC and inverse BLB-high VTC are plotted together on Vin/Vout axes. This chart is for visualizing write-state disturbance and WAT Target differences; no fitted square or bitline sweep is calculated.</p>
-    <img src="images/{write_png_name}" alt="6T write butterfly curve"></section>
+    <section><h2>W0 / W1 Write SNM Analysis</h2><p>W0 writes Q=0 with BL=0 and BLB=VDD; W1 writes QB=0 with BL=VDD and BLB=0. The two VTC pairs are evaluated independently on Vin/Vout axes. Each panel reports its own limiting WSNM square; Cell WSNM is the smaller W0/W1 result.</p>
+    <img src="images/{write_png_name}" alt="W0 and W1 Write SNM analysis"></section>
     {electrical_snm_section}
     {assumption_section}
     {analytical_section}
     {target_section}
     <section><h2>Model Settings</h2><table><tbody><tr><td>Technology node</td><td>28 nm generic compact model</td></tr><tr><td>SRAM analysis VDD</td><td>{cfg["nominal_vdd"]:.3f} V</td></tr><tr><td>WAT calibration VDD</td><td>{cfg["wat_vdd"]:.3f} V</td></tr></tbody></table></section>
     {object_section}
-    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>write_butterfly_curve.csv</code>, <code>read_snm_state_mismatch.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>cell_geometry_reference.csv</code>, <code>analytical_read_snm.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts are stored in <code>images/</code>.</p>
+    <p>Raw data: <code>snm_target_comparison.csv</code>, <code>w0_w1_wsnm_analysis.csv</code>, <code>read_snm_state_mismatch.csv</code>, <code>wat_electrical_snm_table.csv</code>, <code>cell_geometry_reference.csv</code>, <code>analytical_read_snm.csv</code>, <code>wat_target_comparison.csv</code>, <code>sram_wat_results.json</code>. Standalone charts are stored in <code>images/</code>.</p>
     </main></body></html>'''
     report = out / "sram_wat_report.html"
     report.write_text(document, encoding="utf-8")
@@ -4547,13 +4653,13 @@ def launch_gui() -> None:
             "Disabled: retain the entered values, but analyze and report Lot/Wafer only."
         )
         footer_reference_text.set(
-            "Read SNM / Write Butterfly · Lot/Wafer vs WAT Target" if enabled
-            else "Read SNM / Write Butterfly · Lot/Wafer only"
+            "Read SNM / W0-W1 WSNM · Lot/Wafer vs WAT Target" if enabled
+            else "Read SNM / W0-W1 WSNM · Lot/Wafer only"
         )
         output_scope_note.set(
-            "Output: Read SNM butterfly plus write-condition butterfly curves against WAT Target."
+            "Output: Read SNM butterfly plus W0/W1 Write SNM comparisons against WAT Target."
             if enabled else
-            "Output: Lot/Wafer Read SNM butterfly plus write-condition butterfly curves; no Target comparison."
+            "Output: Lot/Wafer Read SNM butterfly plus W0/W1 Write SNM; no Target comparison."
         )
 
     use_wat_target_reference.trace_add("write", sync_target_reference_state)
@@ -4688,7 +4794,7 @@ def launch_gui() -> None:
             status.set("Check the highlighted input values")
             status_label.configure(fg=RED)
             messagebox.showerror("Invalid input", str(exc)); return
-        status.set("Analyzing 6T Independent · Read SNM and Write Butterfly curves…")
+        status.set("Analyzing 6T Independent · Read SNM and W0/W1 Write SNM…")
         status_label.configure(fg=BLUE)
         analyze_button.state(["disabled"]); progress.start(10)
         threading.Thread(target=worker, args=(cell, cfg, targets, values["out"].get()), daemon=True).start()

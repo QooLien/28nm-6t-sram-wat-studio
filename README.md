@@ -4,7 +4,7 @@ Python-only generic 28 nm 6T SRAM WAT compact-model analysis. No SPICE or foundr
 
 The active workflow is focused on:
 
-- Read SNM and write-biased 6T butterfly VTC comparison
+- Read SNM and separate W0/W1 Write SNM analysis
 - Lot/Wafer WAT versus WAT Target VTC comparison
 - Read butterfly maximum-square extraction
 - Independent upper-left / lower-right Read-SNM mismatch analysis
@@ -63,16 +63,27 @@ This preserves PUL/PGL/PDL versus PUR/PGR/PDR mismatch instead of averaging the 
 
 The generic Read condition defaults to `WL = BL = BLB = VDD`; the WL/VDD and BL/VDD ratios can be edited in the interface.
 
-## Write Butterfly Curve
+## W0 / W1 Write SNM
 
-The main 6T report holds `WL` and `BLB` at the configured high write bias and `BL` at the configured low write bias. It plots the direct BL-low inverter VTC and the inverse BLB-high inverter VTC using the same actual-voltage coordinates as Read SNM:
+The main 6T report evaluates both write polarities separately using the same actual-voltage coordinates as Read SNM:
 
 ```text
 X-axis = Vin (V)
 Y-axis = Vout (V)
 ```
 
-This is a WAT-calibrated visual comparison of write-state disturbance and WAT Target differences. It deliberately does not fit a write noise-margin square, sweep BL, or derive a write-trip boundary.
+```text
+W0: BL = 0,   BLB = VDD, WL = VDD  → write Q = 0
+W1: BL = VDD, BLB = 0,   WL = VDD  → write QB = 0
+```
+
+For each state, the retained-side write VTC is intersected with `Vout = Vin`. The intersection voltage defines the side of an origin-anchored WSNM square and is reported as `WSNM_W0` or `WSNM_W1`.
+
+```text
+Cell WSNM = min(WSNM_W0, WSNM_W1)
+```
+
+This captures polarity-dependent writeability caused by PUL/PGL/PDL versus PUR/PGR/PDR mismatch. It is a WAT-calibrated compact-model comparison, not measured WT sign-off.
 
 ## WAT-calibrated device model
 
@@ -140,7 +151,7 @@ If two runs start during the same second, `_02`, `_03`, and so on are appended a
 
 - `sram_wat_report.html`: main interactive report
 - `snm_target_comparison.csv`: Read SNM, Lot/Wafer versus WAT Target
-- `write_butterfly_curve.csv`: write-biased direct and mirrored VTC data
+- `w0_w1_wsnm_analysis.csv`: W0/W1 write VTC data and state-specific WSNM
 - `read_snm_state_mismatch.csv`: upper-left/lower-right state margins, conservative Cell RSNM, signed delta and mismatch index
 - `wat_electrical_snm_table.csv`: WAT inputs, derived ratios, Read SNM and analytical RSNM
 - `analytical_read_snm.csv`: analytical Read SNM parameters and result
@@ -151,7 +162,7 @@ If two runs start during the same second, `_02`, `_03`, and so on are appended a
 - `images/01_read_snm_target_comparison.svg`: scalable chart source
 - `images/02_read_snm_butterfly.png`: Read butterfly maximum-square chart
 - `images/02_read_snm_butterfly.svg`: scalable butterfly source
-- `images/03_write_butterfly_curve.png`: write-biased 6T butterfly VTC comparison
+- `images/03_w0_w1_wsnm_analysis.png`: W0/W1 write-SNM panels and state-specific squares
 - `images/03_write_butterfly_curve.svg`: scalable chart source
 - `images/image_manifest.csv`: image manifest
 
@@ -172,7 +183,7 @@ The WAT Vt/Idsat conversion, Read SNM, analytical RSNM, and Write Margin Test eq
 - `output/HV28_SRAM_Core_Formulas_Chinese_v5.pptx`: Traditional Chinese explanation of WAT-to-beta conversion, Cell/Pull-up Ratio and RSNM.
 - `output/HV28_SRAM_Core_Formulas_English_v5.pptx`: English version of the same presentation.
 
-The Write Butterfly figure uses a blue solid line for the original write VTC, a purple dashed line for the mirrored VTC, and a dark-gray dashed line for `Vout = Vin`.
+The W0/W1 Write-SNM figure uses blue/purple curves for Lot/Wafer VTC pairs, green maximum-square markers, and orange/red curves for the optional WAT Target reference.
 
 ## WAT CSV
 
