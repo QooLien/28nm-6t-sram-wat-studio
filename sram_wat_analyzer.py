@@ -357,17 +357,32 @@ def read_wat_csv(path: str | os.PathLike[str]) -> list[WatPoint]:
 
 
 class Device:
-    """Square-law device calibrated so Idsat(wat_vdd) equals WAT Ids."""
+    """WAT-calibrated square-law device with a smooth threshold transition."""
+
+    # Generic 28 nm compact-model smoothing voltage.  This is not a PDK
+    # subthreshold model; it simply avoids the discontinuous on/off threshold
+    # of the previous educational square-law implementation.
+    VOV_SMOOTHING_V = 0.035
 
     def __init__(self, vt: float, ids_ua: float, wat_vdd: float):
         self.vt = abs(vt)
         self.ids = ids_ua
-        overdrive = max(wat_vdd - self.vt, 0.05)
+        overdrive = max(self._effective_overdrive(wat_vdd - self.vt), 0.05)
         self.beta = 2.0 * ids_ua / (overdrive * overdrive)  # uA/V^2
 
+    @classmethod
+    def _effective_overdrive(cls, raw_overdrive: float) -> float:
+        """Numerically stable softplus version of max(VGS - VT, 0)."""
+        scaled = raw_overdrive / cls.VOV_SMOOTHING_V
+        if scaled >= 40.0:
+            return raw_overdrive
+        if scaled <= -40.0:
+            return cls.VOV_SMOOTHING_V * math.exp(scaled)
+        return cls.VOV_SMOOTHING_V * math.log1p(math.exp(scaled))
+
     def current(self, vgs: float, vds: float) -> float:
-        vov = vgs - self.vt
-        if vov <= 0 or vds <= 0:
+        vov = self._effective_overdrive(vgs - self.vt)
+        if vds <= 0:
             return 0.0
         if vds < vov:
             return self.beta * (vov * vds - 0.5 * vds * vds)

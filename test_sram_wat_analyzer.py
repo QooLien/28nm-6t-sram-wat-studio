@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from sram_wat_analyzer import (
-    AsymmetricSram6T, Config, DatasheetTargets, MosWat, RsnmVccPoint,
+    AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, analyze_mismatch_rsnm_boundaries, analyze_rsnm_vcc_curve,
@@ -26,6 +26,16 @@ class AnalyzerTests(unittest.TestCase):
         self.cfg = Config(grid_points=101)
         self.targets = DatasheetTargets(MosWat(.380, 45), MosWat(.370, 80), MosWat(.360, 120))
         self.cell = ThreeTWatCell("LOT_W01", MosWat(.385, 44), MosWat(.365, 82), MosWat(.355, 124))
+
+    def test_smooth_overdrive_keeps_current_continuous_near_threshold(self):
+        device = Device(.385, 44.0, .90)
+        below = device.current(.384, .90)
+        at_threshold = device.current(.385, .90)
+        above = device.current(.386, .90)
+        self.assertGreater(below, 0.0)
+        self.assertLess(below, at_threshold)
+        self.assertLess(at_threshold, above)
+        self.assertAlmostEqual(device.current(.90, .90), 44.0, places=7)
 
     def test_run_output_directory_uses_date_time_wafer_and_never_overwrites(self):
         stamp = datetime(2026, 8, 1, 14, 30, 25)

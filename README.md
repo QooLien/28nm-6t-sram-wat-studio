@@ -83,7 +83,13 @@ VOV,WAT = max(WAT_VDD - |Vt|, 0.05)
 beta_proxy = 2 * Idsat / VOV,WAT^2
 ```
 
-The square-law device current is then evaluated with the WAT-calibrated beta proxy. This avoids guessing Cox, mobility, oxide thickness or channel-length modulation.
+The square-law device current uses the same WAT-calibrated beta proxy. For DC VTC solving, the hard threshold is replaced by a 25 mV softplus transition:
+
+```text
+VOV,eff = 0.035 · ln(1 + exp((VGS - |Vt|) / 0.035))
+```
+
+This keeps the VTC continuous as VDD approaches Vt and reduces artificial right-angle corners in low-VDD RSNM plots. It is a numerical smoothing approximation, not a foundry subthreshold/BSIM model.
 
 ## Geometric Read SNM
 
