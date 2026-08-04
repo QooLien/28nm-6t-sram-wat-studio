@@ -13,10 +13,10 @@ from sram_wat_analyzer import (
     analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, open_output_directory,
-    read_wat_csv, rsnm_vcc_curve_svg,
+    read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_mismatch_boundary_outputs,
-    write_outputs, write_rsnm_vcc_curve_outputs,
+    write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
     write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
 
@@ -95,45 +95,27 @@ class AnalyzerTests(unittest.TestCase):
             report = write_outputs(result, output)
             overview = (output / "images" / "01_read_snm_target_comparison.svg").read_text(
                 encoding="utf-8")
-            write_svg = (output / "images" / "03_write_snm_vs_bitline.svg").read_text(
+            write_svg = (output / "images" / "03_write_butterfly_curve.svg").read_text(
                 encoding="utf-8")
             html_text = report.read_text(encoding="utf-8")
             self.assertIn("Read SNM Analysis", overview)
             self.assertNotIn("WAT Target VTC", overview)
-            self.assertNotIn("WAT Target model", write_svg)
+            self.assertNotIn("WAT Target VTC pair", write_svg)
             self.assertIn("WAT Target reference is disabled", html_text)
             self.assertFalse((output / "snm_target_comparison.csv").exists())
             self.assertFalse((output / "wat_target_comparison.csv").exists())
-            with (output / "write_snm_vs_bitline.csv").open(
+            with (output / "write_butterfly_curve.csv").open(
                     newline="", encoding="utf-8-sig") as source:
                 self.assertEqual({row["dataset"] for row in csv.DictReader(source)},
                                  {"Lot/Wafer"})
 
-    def test_textbook_write_snm_sweep_closes_and_is_monotonic(self):
+    def test_write_butterfly_contains_the_direct_and_mirrored_vtcs(self):
         result = analyze_three_mos(self.cell, self.cfg, self.targets)
-        sweep = result["baseline_6t"]["write_snm_vs_bitline"]
-        self.assertEqual(sweep["status"], "VALID")
-        self.assertGreater(sweep["write_trip_bl_v"], 0.0)
-        self.assertLess(sweep["write_trip_bl_v"], self.cfg.nominal_vdd)
-        self.assertAlmostEqual(
-            sweep["required_bl_swing_v"],
-            self.cfg.nominal_vdd - sweep["write_trip_bl_v"], places=10)
-        values = [row["cell_write_snm_mv"] for row in sweep["points"]]
-        self.assertTrue(all(a <= b + 1e-9 for a, b in zip(values, values[1:])))
-        self.assertEqual(values[0], 0.0)
-        self.assertGreater(values[-1], 0.0)
-
-    def test_single_wat_write_snm_geometry_uses_vtc_diagonal_crossing(self):
-        result = analyze_six_mos(self.cell.to_six_t(), self.cfg, self.targets)
-        geometry = result["baseline_6t"]["single_wat_write_snm_geometry"]
-        self.assertTrue(geometry["valid"])
-        self.assertGreater(geometry["wsnm_v"], 0.0)
-        self.assertLess(geometry["wsnm_v"], self.cfg.nominal_vdd)
-        self.assertAlmostEqual(geometry["intersection"][0], geometry["intersection"][1], places=10)
-        self.assertAlmostEqual(geometry["wsnm_mv"], geometry["wsnm_v"] * 1000.0, places=8)
-        polarity_values = [row["wsnm_v"] for row in geometry["polarity_results"]
-                           if row["wsnm_v"] is not None]
-        self.assertAlmostEqual(geometry["wsnm_v"], min(polarity_values), places=10)
+        curves = result["baseline_6t"]["write_butterfly"]
+        self.assertEqual(len(curves["direct_vtc"]), len(curves["mirrored_vtc"]))
+        self.assertGreater(len(curves["direct_vtc"]), 100)
+        self.assertEqual(curves["low_bitline_v"], 0.0)
+        self.assertAlmostEqual(curves["high_bitline_v"], self.cfg.nominal_vdd)
 
     def test_pdf_equation_3_36_with_given_wat_values(self):
         current = WatPoint("CURRENT", .35, 29.2, .27, 40.3, .27, 47.6)
@@ -209,7 +191,7 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("Complete 6T Boundary Values", html_text)
             self.assertIn("PUL Vt (V)", html_text)
 
-    def test_html_png_and_csv_include_read_and_write_snm(self):
+    def test_html_png_and_csv_include_read_and_write_butterfly(self):
         result = analyze_three_mos(self.cell, self.cfg, self.targets)
         with tempfile.TemporaryDirectory() as td:
             output = Path(td) / "output"
@@ -222,12 +204,10 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((image_dir / "01_read_snm_target_comparison.svg").exists())
             self.assertTrue((image_dir / "02_read_snm_butterfly.png").exists())
             self.assertTrue((image_dir / "02_read_snm_butterfly.svg").exists())
-            self.assertTrue((image_dir / "03_write_snm_vs_bitline.png").exists())
-            self.assertTrue((image_dir / "03_write_snm_vs_bitline.svg").exists())
-            self.assertTrue((image_dir / "04_single_wat_write_snm_geometry.png").exists())
-            self.assertTrue((image_dir / "04_single_wat_write_snm_geometry.svg").exists())
-            self.assertEqual(len(list(image_dir.glob("*.png"))), 4)
-            self.assertEqual(len(list(image_dir.glob("*.svg"))), 4)
+            self.assertTrue((image_dir / "03_write_butterfly_curve.png").exists())
+            self.assertTrue((image_dir / "03_write_butterfly_curve.svg").exists())
+            self.assertEqual(len(list(image_dir.glob("*.png"))), 3)
+            self.assertEqual(len(list(image_dir.glob("*.svg"))), 3)
             svg = (image_dir / "01_read_snm_target_comparison.svg").read_text(encoding="utf-8")
             self.assertIn("LOT_W01 WAT VTC", svg)
             self.assertNotIn("Lot/Wafer WAT VTC", svg)
@@ -252,32 +232,27 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("Vout (V)", butterfly_svg)
             self.assertIn("1.20", butterfly_svg)
             self.assertNotIn("Figure 3.15", butterfly_svg)
-            write_svg = (image_dir / "03_write_snm_vs_bitline.svg").read_text(encoding="utf-8")
-            self.assertIn("Write SNM versus Write-Bitline Voltage", write_svg)
-            self.assertIn("Write Trip BL", write_svg)
-            self.assertIn("Limiting Write SNM (mV)", write_svg)
-            self.assertNotIn("WSNM proxy", write_svg)
-            geometry_svg = (image_dir / "04_single_wat_write_snm_geometry.svg").read_text(encoding="utf-8")
-            self.assertIn("6T Single-WAT Write SNM", geometry_svg)
-            self.assertIn("WSNM geometry", geometry_svg)
-            self.assertIn("Vin (V)", geometry_svg)
-            self.assertIn("Vout (V)", geometry_svg)
-            self.assertNotIn("QB (V)", geometry_svg)
+            write_svg = (image_dir / "03_write_butterfly_curve.svg").read_text(encoding="utf-8")
+            self.assertIn("6T Write Butterfly Curve", write_svg)
+            self.assertIn("mirrored BLB-high VTC", write_svg)
+            self.assertIn("Vout = Vin", write_svg)
+            self.assertNotIn("WSNM", write_svg)
             html = report.read_text(encoding="utf-8")
             self.assertIn("Read SNM Target Comparison", html)
             self.assertIn("Lot/Wafer SNM", html)
             self.assertNotIn("Current SNM", html)
             self.assertNotIn("Hold SNM", html)
-            self.assertIn("Write SNM versus Write-Bitline Voltage", html)
-            self.assertIn("Write Trip BL", html)
-            self.assertNotIn("Write SNM Proxy", html)
+            self.assertIn("Write Butterfly Curve", html)
+            self.assertNotIn("Write Trip BL", html)
+            self.assertNotIn("WSNM", html)
             self.assertNotIn("WT Test 0-Bit Vmin", html)
             self.assertNotIn("Vmin", html)
             self.assertFalse((output / "wt_test_0bit_vmin.csv").exists())
             self.assertFalse((output / "sram_wat_results.csv").exists())
             self.assertTrue((output / "snm_target_comparison.csv").exists())
-            self.assertTrue((output / "write_snm_vs_bitline.csv").exists())
-            self.assertTrue((output / "single_wat_write_snm_geometry.csv").exists())
+            self.assertTrue((output / "write_butterfly_curve.csv").exists())
+            self.assertFalse((output / "write_snm_vs_bitline.csv").exists())
+            self.assertFalse((output / "single_wat_write_snm_geometry.csv").exists())
             self.assertTrue((output / "read_snm_state_mismatch.csv").exists())
             self.assertTrue((output / "analytical_read_snm.csv").exists())
             self.assertFalse((output / "analytical_read_snm_eq_3_36.csv").exists())
@@ -418,6 +393,31 @@ class AnalyzerTests(unittest.TestCase):
             state_path = Path(td) / "state.json"
             save_gui_state({"values": {"corner": "W02"}}, state_path)
             self.assertEqual(load_gui_state(state_path)["values"]["corner"], "W02")
+
+    def test_single_6t_wat_excel_round_trip(self):
+        from openpyxl import load_workbook
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "single_6t.xlsx"
+            written = write_single_6t_wat_excel(path, self.cell.to_six_t(), 0.9)
+            self.assertEqual(written, path)
+            workbook = load_workbook(path, read_only=False, data_only=False)
+            self.assertEqual(workbook.sheetnames, ["6T WAT Input", "Instructions"])
+            sheet = workbook["6T WAT Input"]
+            self.assertEqual(sheet.auto_filter.ref, "A1:I7")
+            self.assertEqual(sheet.freeze_panes, "A2")
+            self.assertEqual([cell.value for cell in sheet[1]], [
+                "Lot/Wafer", "Model VDD", "VDD Unit", "MOS", "Vt", "Vt Unit",
+                "Idsat", "Idsat Unit", "Notes",
+            ])
+            self.assertEqual([sheet.cell(row=row, column=4).value for row in range(2, 8)],
+                             ["PUL", "PUR", "PGL", "PGR", "PDL", "PDR"])
+            workbook.close()
+            samples = read_wat_excel(path)
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(samples[0].lot_wafer, self.cell.corner)
+            self.assertAlmostEqual(samples[0].model_vdd_v, 0.9)
+            self.assertAlmostEqual(samples[0].cell.pg2.ids, self.cell.pg.ids)
 
     def test_excel_repeated_wafer_sites_are_aggregated_with_coverage(self):
         headers = ["Lot/Wafer", "Site", "Model VDD", "MOS", "Vt", "Vt Unit",

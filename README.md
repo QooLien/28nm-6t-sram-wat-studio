@@ -4,7 +4,7 @@ Python-only generic 28 nm 6T SRAM WAT compact-model analysis. No SPICE or foundr
 
 The active workflow is focused on:
 
-- Read SNM and textbook-based Write SNM versus write-bitline sweep
+- Read SNM and write-biased 6T butterfly VTC comparison
 - Lot/Wafer WAT versus WAT Target VTC comparison
 - Read butterfly maximum-square extraction
 - Independent upper-left / lower-right Read-SNM mismatch analysis
@@ -63,16 +63,16 @@ This preserves PUL/PGL/PDL versus PUR/PGR/PDR mismatch instead of averaging the 
 
 The generic Read condition defaults to `WL = BL = BLB = VDD`; the WL/VDD and BL/VDD ratios can be edited in the interface.
 
-## Textbook-based Write SNM
+## Write Butterfly Curve
 
-The main 6T report follows the textbook writeability concept. `WL` and `BLB` are held at `VDD`, while the write bitline `BL` is swept from `VDD` toward `0 V`. At every BL point the tool rebuilds the two write-condition VTCs and calculates the maximum square inside the eye belonging to the state being overwritten.
+The main 6T report holds `WL` and `BLB` at the configured high write bias and `BL` at the configured low write bias. It plots the direct BL-low inverter VTC and the inverse BLB-high inverter VTC using the same actual-voltage coordinates as Read SNM:
 
 ```text
-Write Trip BL = BL voltage where the write-state butterfly eye closes (SNM = 0)
-Required BL Swing = VDD - Write Trip BL
+X-axis = Vin (V)
+Y-axis = Vout (V)
 ```
 
-A higher Write Trip BL and a smaller required BL swing indicate easier writing in this compact model. The result is calibrated from WAT Vt/Idsat and is intended for correlation and target comparison, not foundry BSIM or measured WT sign-off.
+This is a WAT-calibrated visual comparison of write-state disturbance and WAT Target differences. It deliberately does not fit a write noise-margin square, sweep BL, or derive a write-trip boundary.
 
 ## WAT-calibrated device model
 
@@ -134,10 +134,9 @@ If two runs start during the same second, `_02`, `_03`, and so on are appended a
 
 - `sram_wat_report.html`: main interactive report
 - `snm_target_comparison.csv`: Read SNM, Lot/Wafer versus WAT Target
-- `write_snm_vs_bitline.csv`: BL sweep, limiting write-state SNM, Write Trip BL and required BL swing
-- `single_wat_write_snm_geometry.csv`: one Lot/Wafer 6T write-condition VTC and its diagonal-intersection WSNM estimate
+- `write_butterfly_curve.csv`: write-biased direct and mirrored VTC data
 - `read_snm_state_mismatch.csv`: upper-left/lower-right state margins, conservative Cell RSNM, signed delta and mismatch index
-- `wat_electrical_snm_table.csv`: WAT inputs, derived ratios, Read SNM, Write Trip BL and required BL swing
+- `wat_electrical_snm_table.csv`: WAT inputs, derived ratios, Read SNM and analytical RSNM
 - `analytical_read_snm.csv`: analytical Read SNM parameters and result
 - `cell_geometry_reference.csv`: L/W geometry values and derived ratio references
 - `wat_target_comparison.csv`: PU / PG / PD Vt and Idsat deltas
@@ -146,10 +145,8 @@ If two runs start during the same second, `_02`, `_03`, and so on are appended a
 - `images/01_read_snm_target_comparison.svg`: scalable chart source
 - `images/02_read_snm_butterfly.png`: Read butterfly maximum-square chart
 - `images/02_read_snm_butterfly.svg`: scalable butterfly source
-- `images/03_write_snm_vs_bitline.png`: textbook Write SNM-versus-BL comparison
-- `images/03_write_snm_vs_bitline.svg`: scalable chart source
-- `images/04_single_wat_write_snm_geometry.png`: single-WAT 6T write VTC with origin-anchored WSNM square
-- `images/04_single_wat_write_snm_geometry.svg`: scalable single-WAT WSNM chart source
+- `images/03_write_butterfly_curve.png`: write-biased 6T butterfly VTC comparison
+- `images/03_write_butterfly_curve.svg`: scalable chart source
 - `images/image_manifest.csv`: image manifest
 
 The manual curve tab uses the same dated archive structure with the `rsnm_vdd_curve` analysis name:
@@ -166,10 +163,10 @@ The WAT Vt/Idsat conversion, Read SNM, analytical RSNM, and Write Margin Test eq
 
 ## Presentation decks
 
-- `output/HV28_SRAM_Core_Formulas_Chinese_v5.pptx`: Traditional Chinese explanation of WAT-to-beta conversion, Cell/Pull-up Ratio, RSNM and WSNM.
+- `output/HV28_SRAM_Core_Formulas_Chinese_v5.pptx`: Traditional Chinese explanation of WAT-to-beta conversion, Cell/Pull-up Ratio and RSNM.
 - `output/HV28_SRAM_Core_Formulas_English_v5.pptx`: English version of the same presentation.
 
-The Write-SNM figure uses a blue solid line for the original write VTC, a purple dashed line for the mirrored VTC, a dark-gray dashed line for `Vout = Vin`, and orange geometry for the WSNM square and diagonal crossings.
+The Write Butterfly figure uses a blue solid line for the original write VTC, a purple dashed line for the mirrored VTC, and a dark-gray dashed line for `Vout = Vin`.
 
 ## WAT CSV
 
@@ -183,6 +180,16 @@ TT,0.385,44,0.365,82,0.355,124
 The GUI can import an `.xlsx` workbook through **Import Excel…** and generate measured-WAT versus WAT-target Read-SNM butterfly panels, an SNM-versus-model-VDD chart, and an all-operating-voltage Vin/Vout overlay. The overlay uses color for operating VDD, solid lines for measured WAT, dashed lines for target, and 0.2 V axis increments. The command line also accepts an `.xlsx` path through `--input`.
 
 Start from `HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx`. It follows the manually organized nine-column format exactly: Lot/Wafer, Site, Model VDD, MOS, Vt, Vt Unit, Idsat, Idsat Unit and Notes. PU, PG and PD use separate worksheets; every physical MOS and Model VDD currently has S01-S12 records. If S13-S17 later become available, append them with the same columns and the loader will include them automatically. The distributed workbook deliberately uses plain formatted ranges with worksheet filters instead of Excel Table objects. This avoids the table-repair warning seen with some older or company-managed Excel installations while preserving sorting and filtering.
+
+### Single-set 6T WAT Excel
+
+Use `HV28_6T_WAT_Single_Set_Template.xlsx` when only one Lot/Wafer and one operating VDD are needed. Its **6T WAT Input** worksheet contains one editable row for each physical MOS: PUL, PUR, PGL, PGR, PDL and PDR. Vt and Idsat have explicit unit columns and are normalized by the loader to V and uA.
+
+In **6T Bitcell Analysis**:
+
+- **Import Excel...** copies the first complete six-MOS set into the six GUI input panels.
+- **Save Current...** writes the currently displayed manual values to the same compatible workbook format.
+- Excel is optional; all six Vt/Idsat pairs can still be typed manually.
 
 For repeated site rows, the loader groups data by Lot/Wafer + Model VDD + physical MOS. The arithmetic mean of valid Vt and Idsat measurements is used for each of the six independent MOS inputs; the left and right sides are not merged. Actual row count, median, sample standard deviation, minimum and maximum are exported to `excel_wat_site_statistics.csv`. The sweep result also exports both state margins and the mismatch index. A Model VDD at or below the highest imported MOS Vt remains in the WAT statistics but is reported as SNM N/A.
 
