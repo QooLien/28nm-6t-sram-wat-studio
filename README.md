@@ -4,7 +4,7 @@ Python-only generic 28 nm 6T SRAM WAT compact-model analysis. No SPICE or foundr
 
 The active workflow is focused on:
 
-- Read SNM and separate W0/W1 Write SNM analysis
+- Read SNM and W=1/W=0 Write SNM butterfly analysis
 - Lot/Wafer WAT versus WAT Target VTC comparison
 - Read butterfly maximum-square extraction
 - Independent upper-left / lower-right Read-SNM mismatch analysis
@@ -63,7 +63,7 @@ This preserves PUL/PGL/PDL versus PUR/PGR/PDR mismatch instead of averaging the 
 
 The generic Read condition defaults to `WL = BL = BLB = VDD`; the WL/VDD and BL/VDD ratios can be edited in the interface.
 
-## W0 / W1 Write SNM
+## W=1 / W=0 Write SNM Butterfly
 
 The main 6T report evaluates both write polarities separately using the same actual-voltage coordinates as Read SNM:
 
@@ -73,17 +73,17 @@ Y-axis = Vout (V)
 ```
 
 ```text
-W0: BL = 0,   BLB = VDD, WL = VDD  → write Q = 0
-W1: BL = VDD, BLB = 0,   WL = VDD  → write QB = 0
+W=1 upper VTC: BLB = VDD, WL = VDD
+W=0 lower VTC: BL = 0,   WL = VDD
 ```
 
-For each state, the retained-side write VTC is intersected with `Vout = Vin`. The intersection voltage defines the side of an origin-anchored WSNM square and is reported as `WSNM_W0` or `WSNM_W1`.
+The W=1 and W=0 curves are plotted together on one Vin/Vout graph. The side of the largest square inside the valid write window is reported as `WSNM`.
 
 ```text
-Cell WSNM = min(WSNM_W0, WSNM_W1)
+WSNM = maximum square side in the W=1/W=0 write window
 ```
 
-This captures polarity-dependent writeability caused by PUL/PGL/PDL versus PUR/PGR/PDR mismatch. It is a WAT-calibrated compact-model comparison, not measured WT sign-off.
+This captures the write window set by PUL/PGL/PDL and PUR/PGR/PDR. It is a WAT-calibrated compact-model comparison, not measured WT sign-off.
 
 ## WAT-calibrated device model
 

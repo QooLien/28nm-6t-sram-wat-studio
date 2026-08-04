@@ -80,13 +80,12 @@ class AnalyzerTests(unittest.TestCase):
         self.assertAlmostEqual(result["squares"][0]["side_mv"],
                                result["squares"][1]["side_mv"], delta=1.0)
 
-    def test_metrics_include_w0_w1_write_snm(self):
+    def test_metrics_include_write_snm(self):
         metrics = analyze(self.cell.representative(), self.cfg)["baseline_6t"]["metrics"]
         self.assertNotIn("hold_snm_mv", metrics)
         self.assertIn("read_snm_mv", metrics)
-        self.assertIn("write_snm_w0_mv", metrics)
-        self.assertIn("write_snm_w1_mv", metrics)
-        self.assertEqual(metrics["write_snm_mv"], min(metrics["write_snm_w0_mv"], metrics["write_snm_w1_mv"]))
+        self.assertIn("write_snm_mv", metrics)
+        self.assertGreater(metrics["write_snm_mv"], 0.0)
         self.assertNotIn("read_vmin_v", metrics)
         self.assertNotIn("write_vmin_v", metrics)
 
@@ -112,7 +111,7 @@ class AnalyzerTests(unittest.TestCase):
             html_text = report.read_text(encoding="utf-8")
             self.assertIn("Read SNM Analysis", overview)
             self.assertNotIn("WAT Target VTC", overview)
-            self.assertNotIn("WAT Target retained-side VTC", write_svg)
+            self.assertNotIn("WAT Target pair", write_svg)
             self.assertIn("WAT Target reference is disabled", html_text)
             self.assertFalse((output / "snm_target_comparison.csv").exists())
             self.assertFalse((output / "wat_target_comparison.csv").exists())
@@ -121,14 +120,13 @@ class AnalyzerTests(unittest.TestCase):
                 self.assertEqual({row["dataset"] for row in csv.DictReader(source)},
                                  {"Lot/Wafer"})
 
-    def test_w0_w1_write_snm_contains_two_independent_states(self):
+    def test_write_snm_contains_w1_w0_window_and_square(self):
         result = analyze_three_mos(self.cell, self.cfg, self.targets)
         states = result["baseline_6t"]["write_wsnm"]
         self.assertGreater(len(states["write_0"]["curve"]), 100)
         self.assertGreater(len(states["write_1"]["curve"]), 100)
-        self.assertGreater(states["write_0"]["snm_mv"], 0.0)
-        self.assertGreater(states["write_1"]["snm_mv"], 0.0)
-        self.assertEqual(states["cell_wsnm_mv"], min(states["write_0"]["snm_mv"], states["write_1"]["snm_mv"]))
+        self.assertGreater(states["snm_mv"], 0.0)
+        self.assertIsNotNone(states["write_square"])
 
     def test_pdf_equation_3_36_with_given_wat_values(self):
         current = WatPoint("CURRENT", .35, 29.2, .27, 40.3, .27, 47.6)
@@ -246,17 +244,17 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("1.20", butterfly_svg)
             self.assertNotIn("Figure 3.15", butterfly_svg)
             write_svg = (image_dir / "03_w0_w1_wsnm_analysis.svg").read_text(encoding="utf-8")
-            self.assertIn("W0 / W1 Write SNM Analysis", write_svg)
-            self.assertIn("W0: write Q = 0", write_svg)
-            self.assertIn("W1: write QB = 0", write_svg)
+            self.assertIn("Write SNM Butterfly Analysis", write_svg)
+            self.assertIn("W=1 VTC (upper)", write_svg)
+            self.assertIn("W=0 VTC (lower)", write_svg)
             self.assertIn("Vout = Vin", write_svg)
             html = report.read_text(encoding="utf-8")
             self.assertIn("Read SNM Target Comparison", html)
             self.assertIn("Lot/Wafer SNM", html)
             self.assertNotIn("Current SNM", html)
             self.assertNotIn("Hold SNM", html)
-            self.assertIn("W0 / W1 Write SNM Analysis", html)
-            self.assertIn("Cell WSNM", html)
+            self.assertIn("Write SNM Butterfly Analysis", html)
+            self.assertIn("largest square", html)
             self.assertNotIn("WT Test 0-Bit Vmin", html)
             self.assertNotIn("Vmin", html)
             self.assertFalse((output / "wt_test_0bit_vmin.csv").exists())
