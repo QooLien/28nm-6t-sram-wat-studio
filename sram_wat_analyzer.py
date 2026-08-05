@@ -2125,16 +2125,25 @@ def _interpolate_rsnm_vcc_point(low: RsnmVccPoint, high: RsnmVccPoint,
 
 
 def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
-                           fit_points: int = 801) -> dict:
+                           fit_points: int | None = None) -> dict:
     """Calculate grouped-6T Read SNM at each manually entered VDD point.
 
     Each Idsat value is calibrated at its own row VDD.  Eye closure is only
     estimated when the supplied rows bracket an invalid-to-valid butterfly-eye
     transition; electrical values inside that bracket are linearly interpolated.
+
+    A grouped row is mapped to a symmetric physical cell (PUL=PUR, PGL=PGR,
+    PDL=PDR) and then evaluated through the same ``AsymmetricSram6T`` read
+    butterfly path as the main 6T analysis.  Therefore a symmetric 6T row at
+    the same VDD and model settings produces the same RSNM value.  A grouped
+    row cannot reproduce a main-cell result when its left/right devices differ.
     """
     if len(points) < 2:
         raise ValueError("Enter at least two VDD rows")
-    fit_points = max(201, int(fit_points))
+    # Keep the default numerically synchronized with the main 6T report.
+    # Callers that need a lighter exploratory sweep can still pass fit_points.
+    fit_points = max(201, int(fit_points if fit_points is not None
+                              else max(1201, cfg.grid_points)))
     ordered = sorted(points, key=lambda point: point.vcc_v)
     for index, point in enumerate(ordered):
         if not math.isfinite(point.vcc_v) or not 0 < point.vcc_v <= SNM_PLOT_AXIS_MAX_V:
@@ -2150,12 +2159,12 @@ def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
     def evaluate(point: RsnmVccPoint) -> dict:
         point_cfg = replace(cfg, nominal_vdd=point.vcc_v, wat_vdd=point.vcc_v,
                             grid_points=fit_points)
-        wat = WatPoint(
-            f"VDD_{point.vcc_v:.6g}", point.pu.vt, point.pu.ids,
-            point.pg.vt, point.pg.ids, point.pd.vt, point.pd.ids,
+        cell = SixTWatCell(
+            f"VDD_{point.vcc_v:.6g}",
+            point.pu, point.pu, point.pg, point.pg, point.pd, point.pd,
         )
-        butterfly = Sram6T(wat, point_cfg).butterfly_squares(
-            point.vcc_v, "read", points=fit_points)
+        butterfly = AsymmetricSram6T(cell, point_cfg).read_butterfly(
+            point.vcc_v, fit_points)["read_butterfly"]
         valid = bool(butterfly.get("valid") and butterfly.get("snm_mv") is not None and
                      butterfly["snm_mv"] > 0)
         return {"valid": valid, "snm_mv": butterfly.get("snm_mv") if valid else None,
@@ -4958,6 +4967,43 @@ def launch_gui() -> None:
             result.append(row)
         return result
 
+    def paste_curve_grid(event: tk.Event, start_row: int, start_column: int) -> str:
+        """Paste a rectangular tab-delimited Excel range into the VDD table."""
+        try:
+            clipboard = event.widget.clipboard_get()
+        except tk.TclError:
+            return "break"
+        rows = [line.split("\t") for line in clipboard.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+        if rows and not any(cell.strip() for cell in rows[-1]):
+            rows.pop()
+        if not rows:
+            return "break"
+
+        # Copying a whole Excel table often includes its header.  Ignore that
+        # one row while still accepting ordinary numeric first rows.
+        first_row = " ".join(cell.strip().lower() for cell in rows[0])
+        if "vdd" in first_row and ("pu" in first_row or "isat" in first_row):
+            rows.pop(0)
+        if not rows:
+            return "break"
+        if start_row + len(rows) > 20:
+            messagebox.showwarning("Excel paste", "The VDD sweep table supports at most 20 rows.")
+            return "break"
+
+        while len(curve_row_vars) < start_row + len(rows):
+            curve_row_vars.append({key: tk.StringVar() for key, _label, _color in curve_columns})
+        for row_offset, source_row in enumerate(rows):
+            for column_offset, value in enumerate(source_row):
+                column = start_column + column_offset
+                if column >= len(curve_columns):
+                    break
+                key = curve_columns[column][0]
+                curve_row_vars[start_row + row_offset][key].set(value.strip())
+        rebuild_curve_rows()
+        curve_status.set(f"Pasted {len(rows)} Excel row(s); review values, then analyze")
+        curve_status_label.configure(fg=SECONDARY)
+        return "break"
+
     def rebuild_curve_rows() -> None:
         for child in curve_row_widgets:
             child.destroy()
@@ -4971,6 +5017,8 @@ def launch_gui() -> None:
                 entry = ttk.Entry(curve_table, textvariable=variables[key], width=7,
                                   style="Apple.TEntry")
                 entry.grid(row=row_index + 1, column=column, padx=3, pady=2, sticky="ew")
+                entry.bind("<Control-v>",
+                           lambda event, r=row_index, c=column - 1: paste_curve_grid(event, r, c))
                 curve_row_widgets.append(entry)
 
     def append_curve_row(data: dict[str, object] | None = None) -> None:
@@ -5008,10 +5056,12 @@ def launch_gui() -> None:
                command=append_curve_row).pack(side="left")
     ttk.Button(curve_controls, text="Remove Last", style="Quiet.TButton",
                command=remove_curve_row).pack(side="left", padx=(7, 0))
+    ttk.Button(curve_controls, text="Paste Excel", style="Quiet.TButton",
+               command=lambda: paste_curve_grid(type("PasteEvent", (), {"widget": root})(), 0, 0)).pack(side="left", padx=(7, 0))
     ttk.Button(curve_controls, text="Restore Example", style="Quiet.TButton",
                command=restore_curve_example).pack(side="right")
     ttk.Label(curve_input_card,
-              text="Isat may be 0 uA below threshold. For accurate eye-closure VDD, include rows on both sides of the expected boundary.",
+              text="Excel: select the first target cell and press Ctrl+V to paste a tab-delimited range. Grouped rows map PU/PG/PD symmetrically to both sides of the 6T cell. Isat may be 0 uA below threshold; include rows on both sides of the expected boundary.",
               style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(0, 9))
 
     curve_status = tk.StringVar(value="Ready to analyze the VDD sweep")

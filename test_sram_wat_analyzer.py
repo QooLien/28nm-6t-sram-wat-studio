@@ -507,6 +507,20 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((report.parent / "images" / "01_rsnm_vs_model_vcc.png").exists())
             self.assertIn("Estimated eye-closure VDD", report.read_text(encoding="utf-8"))
 
+    def test_rsnm_vdd_row_matches_main_symmetric_6t_analysis(self):
+        """The curve and primary report must share one RSNM calculation path."""
+        pu, pg, pd = MosWat(.385, 44.0), MosWat(.365, 82.0), MosWat(.355, 124.0)
+        cfg = Config(nominal_vdd=.90, wat_vdd=.90, grid_points=401)
+        cell = SixTWatCell("SYNC", pu, pu, pg, pg, pd, pd)
+        main_rsnm = analyze_six_mos(cell, cfg)["baseline_6t"]["metrics"]["read_snm_mv"]
+        curve = analyze_rsnm_vcc_curve([
+            RsnmVccPoint(.80, pu, pg, pd),
+            RsnmVccPoint(.90, pu, pg, pd),
+        ], cfg)
+        at_ninety = next(row for row in curve["rows"] if row["vcc_v"] == .90)
+        self.assertTrue(at_ninety["valid_eye"])
+        self.assertAlmostEqual(at_ninety["rsnm_mv"], main_rsnm, places=8)
+
     def test_write_trip_margin_curve_brackets_boundary_and_exports(self):
         base_vt = {"pu": .385, "pg": .365, "pd": .355}
         base_ids = {"pu": 44.0, "pg": 82.0, "pd": 124.0}
