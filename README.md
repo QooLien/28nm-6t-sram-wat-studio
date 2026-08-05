@@ -77,7 +77,7 @@ W=1 upper VTC: BLB = VDD, WL = VDD
 W=0 lower VTC: BL = 0,   WL = VDD
 ```
 
-The W=1 and W=0 curves are plotted together on one Vin/Vout graph. The side of the largest square inside the valid write window is reported as `WSNM`.
+The W=1 and W=0 curves are plotted together on one Vin/Vout graph. `WSNM` is the largest valid square whose lower-left and upper-right corners lie on `Vin = Vout`; the diagonal is used for fitting but is intentionally not drawn in the report.
 
 ```text
 WSNM = maximum square side in the W=1/W=0 write window
@@ -180,7 +180,7 @@ The WAT Vt/Idsat conversion, Read SNM, analytical RSNM, and Write Margin Test eq
 
 ## Presentation decks
 
-- `output/HV28_SRAM_Core_Formulas_Chinese_v5.pptx`: Traditional Chinese explanation of WAT-to-beta conversion, Cell/Pull-up Ratio and RSNM.
+- `output/HV28_SRAM_Core_Formulas_Chinese_v6.pptx`: Traditional Chinese explanation with curve-matched Read SNM and Write SNM figures.
 - `output/HV28_SRAM_Core_Formulas_English_v5.pptx`: English version of the same presentation.
 
 The W0/W1 Write-SNM figure uses blue/purple curves for Lot/Wafer VTC pairs, green maximum-square markers, and orange/red curves for the optional WAT Target reference.

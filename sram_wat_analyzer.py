@@ -499,6 +499,50 @@ def _fit_butterfly_squares(direct_curve: list[tuple[float, float]],
     }
 
 
+def _fit_diagonal_write_square(upper_curve: list[tuple[float, float]],
+                               lower_curve: list[tuple[float, float]],
+                               vdd: float) -> dict:
+    """Fit the largest axis-aligned write square with its +45-degree diagonal on y=x.
+
+    The square lower-left and upper-right corners are (a, a) and (b, b).
+    Therefore its Vin=Vout diagonal is the calculation reference while the
+    complete square remains inside the upper W=1 and lower W=0 write VTCs.
+    """
+    if (len(upper_curve) != len(lower_curve) or len(upper_curve) < 21 or
+            vdd <= 0):
+        return {"valid": False, "reason": "matched VTC grids with >=21 points are required",
+                "square": None, "snm_v": None, "snm_mv": None}
+    xs = [point[0] for point in upper_curve]
+    if any(abs(x - lower_curve[index][0]) > 1e-12 for index, x in enumerate(xs)):
+        return {"valid": False, "reason": "W=1 and W=0 VTC grids do not match",
+                "square": None, "snm_v": None, "snm_mv": None}
+    upper = [point[1] for point in upper_curve]
+    lower = [point[1] for point in lower_curve]
+    best: dict | None = None
+    for start in range(len(xs) - 1):
+        min_upper, max_lower = math.inf, -math.inf
+        for stop in range(start, len(xs)):
+            min_upper = min(min_upper, upper[stop])
+            max_lower = max(max_lower, lower[stop])
+            side = xs[stop] - xs[start]
+            if side <= 0:
+                continue
+            if min_upper + 1e-12 >= xs[stop] and max_lower <= xs[start] + 1e-12:
+                if best is None or side > best["side_v"]:
+                    best = {"x_v": xs[start], "y_v": xs[start], "side_v": side,
+                            "side_mv": 1000.0 * side,
+                            "constraint": "square diagonal follows Vin=Vout"}
+            elif max_lower > xs[start] + 1e-12:
+                # The lower curve is monotonically decreasing for the modeled
+                # VTCs; extending this candidate cannot recover the constraint.
+                break
+    if best is None:
+        return {"valid": False, "reason": "no positive Vin=Vout-diagonal write square",
+                "square": None, "snm_v": 0.0, "snm_mv": 0.0}
+    return {"valid": True, "reason": "maximum write square constrained to Vin=Vout diagonal",
+            "square": best, "snm_v": best["side_v"], "snm_mv": best["side_mv"]}
+
+
 def _fit_write_closing_eye(direct_curve: list[tuple[float, float]],
                            mirrored_curve: list[tuple[float, float]],
                            fallback: dict) -> dict:
@@ -972,10 +1016,9 @@ def write_wsnm_states(vdd: float, left: Sram6T, right: Sram6T,
 
     write_0_curve = vtc(left, low_bl)
     write_1_curve = vtc(right, high_bl)
-    fitted = _fit_butterfly_squares(write_1_curve, write_0_curve, vdd, "write")
-    squares = [square for square in fitted.get("squares", []) if square["side_v"] > 0]
-    write_square = max(squares, key=lambda square: square["side_v"]) if squares else None
-    wsnm_v = None if write_square is None else write_square["side_v"]
+    fitted = _fit_diagonal_write_square(write_1_curve, write_0_curve, vdd)
+    write_square = fitted.get("square")
+    wsnm_v = fitted.get("snm_v")
     bias = {"wordline_v": wl, "bl_v": low_bl, "blb_v": high_bl}
     return {
         "method": "W=1 upper and W=0 lower write-VTC maximum-square extraction",
@@ -984,7 +1027,6 @@ def write_wsnm_states(vdd: float, left: Sram6T, right: Sram6T,
                     "write_bias": bias},
         "write_1": {"label": "W=1 (upper VTC)", "curve": write_1_curve,
                     "write_bias": bias},
-        "squares": fitted.get("squares", []),
         "write_square": write_square,
         "snm_v": wsnm_v,
         "snm_mv": None if wsnm_v is None else 1000.0 * wsnm_v,
@@ -2855,9 +2897,8 @@ def write_wsnm_window_svg(result: dict, width: int = 1440, height: int = 900) ->
         f'<text x="54" y="122" fill="#1D1D1F" font-size="19" font-weight="700">WSNM @ VDD = {current["vdd_v"]:.3f} V</text>',
         f'<path d="M54 88 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="94" fill="#3A3A3C" font-size="17">{lot} W=1 VTC (upper)</text>',
         f'<path d="M315 88 h34" stroke="#5856D6" stroke-width="4"/><text x="359" y="94" fill="#3A3A3C" font-size="17">{lot} W=0 VTC (lower)</text>',
-        '<path d="M580 88 h34" stroke="#3A3A3C" stroke-width="3" stroke-dasharray="8 6"/><text x="624" y="94" fill="#3A3A3C" font-size="17">Vout = Vin</text>',
-        '<rect x="788" y="76" width="20" height="20" fill="#EFFAF2" stroke="#34C759" stroke-width="3"/><text x="820" y="94" fill="#3A3A3C" font-size="17">Maximum WSNM square</text>',
-        '<path d="M1090 88 h34" stroke="#FF9500" stroke-width="4"/><text x="1134" y="94" fill="#3A3A3C" font-size="17">WAT Target pair</text>' if target else '',
+        '<rect x="615" y="76" width="20" height="20" fill="#EFFAF2" stroke="#34C759" stroke-width="3"/><text x="647" y="94" fill="#3A3A3C" font-size="17">Vin=Vout diagonal-constrained WSNM square</text>',
+        '<path d="M1080 88 h34" stroke="#FF9500" stroke-width="4"/><text x="1124" y="94" fill="#3A3A3C" font-size="17">WAT Target pair</text>' if target else '',
     ]
     for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
         px, py = xy(voltage, voltage)
@@ -2877,11 +2918,10 @@ def write_wsnm_window_svg(result: dict, width: int = 1440, height: int = 900) ->
         side_px = side / axis_max * size
         parts += [f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{side_px:.1f}" height="{side_px:.1f}" fill="#EFFAF2" fill-opacity=".70" stroke="#34C759" stroke-width="3"/>',
                   f'<text x="{x0+side_px/2:.1f}" y="{y0+side_px/2+5:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">WSNM {current["snm_mv"]:.1f} mV</text>']
-    parts += [f'<path d="M{xy(0,0)[0]:.1f} {xy(0,0)[1]:.1f} L{xy(axis_max,axis_max)[0]:.1f} {xy(axis_max,axis_max)[1]:.1f}" stroke="#3A3A3C" stroke-width="3" stroke-dasharray="8 6"/>',
-              f'<text x="{left+size/2:.1f}" y="{top+size+72}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">{metric_text}</text>',
+    parts += [f'<text x="{left+size/2:.1f}" y="{top+size+72}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">{metric_text}</text>',
               f'<text x="{left+size/2:.1f}" y="{top+size+110}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
               f'<text x="{left-62}" y="{top+size/2}" transform="rotate(-90 {left-62} {top+size/2})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>',
-              '<text x="720" y="865" text-anchor="middle" fill="#6E6E73" font-size="15">W=1 is the BLB-high upper VTC; W=0 is the BL-low lower VTC. WSNM is the largest square in the write window.</text>',
+              '<text x="720" y="865" text-anchor="middle" fill="#6E6E73" font-size="15">W=1 is the BLB-high upper VTC; W=0 is the BL-low lower VTC. The WSNM square diagonal is constrained to Vin=Vout.</text>',
               '</svg>']
     return "".join(part for part in parts if part)
 
@@ -4129,12 +4169,12 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     @media(prefers-reduced-transparency:reduce){{.summary,section{{background:#fff;backdrop-filter:none;border-color:#d2d2d7}}}} @media(prefers-contrast:more){{.summary,section{{background:#fff;border:2px solid #1d1d1f}}}}
     </style></head><body><main>
     <h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: <b>{html.escape(wat["corner"])}</b> · Object mode: <b>{html.escape(result.get("object_mode", "Grouped"))}</b> · SRAM VDD={cfg["nominal_vdd"]:.3f} V</p>
-    <div class="summary"><b>Analysis scope:</b> Read SNM plus a W=1/W=0 Write SNM butterfly. WSNM is the largest square in the valid write window. {scope_reference_text}</div>
+    <div class="summary"><b>Analysis scope:</b> Read SNM plus a W=1/W=0 Write SNM butterfly. WSNM is the largest valid square constrained to the Vin=Vout diagonal. {scope_reference_text}</div>
     {read_overview_section}
     <section><h2>Read SNM Butterfly and Left/Right Mismatch</h2><p>The measured 6T model keeps PUL/PGL/PDL and PUR/PGR/PDR independent. The upper-left and lower-right eyes represent opposite stored states. Cell RSNM is the smaller state margin; a larger difference or mismatch index indicates stronger left/right imbalance. X-axis is Vin and Y-axis is Vout, both expressed in volts and fixed at 0 to 1.20 V.</p>
     <img src="images/{butterfly_png_name}" alt="Asymmetric Read SNM butterfly with two state margins">
     <table><thead><tr><th>Dataset</th><th>Upper-left state SNM (mV)</th><th>Lower-right state SNM (mV)</th><th>Cell RSNM = min (mV)</th><th>Upper - Lower (mV)</th><th>Mismatch index</th></tr></thead><tbody>{state_table_rows}</tbody></table></section>
-    <section><h2>Write SNM Butterfly Analysis</h2><p>The upper W=1 VTC is evaluated with BLB=VDD; the lower W=0 VTC is evaluated with BL=0. Both are plotted on the same Vin/Vout axes. WSNM is the side of the largest square in the valid write window.</p>
+    <section><h2>Write SNM Butterfly Analysis</h2><p>The upper W=1 VTC is evaluated with BLB=VDD; the lower W=0 VTC is evaluated with BL=0. Both are plotted on the same Vin/Vout axes. WSNM is the side of the largest valid square whose diagonal is constrained to Vin=Vout; the diagonal guide itself is not displayed.</p>
     <img src="images/{write_png_name}" alt="W1 and W0 Write SNM butterfly analysis"></section>
     {electrical_snm_section}
     {assumption_section}
