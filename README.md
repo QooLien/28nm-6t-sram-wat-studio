@@ -38,9 +38,17 @@ The **RSNM vs VDD Curve** tab is an independent workflow:
 
 Each row's Idsat is treated as measured at that row's VDD. The program recalibrates the compact device strengths for every row. If an invalid-eye row and the next valid-eye row bracket the boundary, Vt and Idsat are linearly interpolated and a bisection search estimates the eye-closure VDD. This model boundary is not measured WT Vmin.
 
+### Raw IV-curve import
+
+The **RSNM vs VDD Curve** tab can also import raw `Id-Vg` data through **Import IV Curve...**. Use the included `HV28_IV_Curve_Raw_Data_Template.xlsx`, with `PU`, `PG` and `PD` worksheets. Each worksheet has one row per raw point: `Model VDD`, `Vg`, `Idsat` and optional `Vt`, with unit columns. For each Model VDD, the importer linearly interpolates the measured current at `Vg = Model VDD`; this is the compact-model `VGS = VDS = VDD` Idsat convention used for RSNM calibration. It does not use the final/rightmost plotted point unless that point is itself at `Vg = VDD`. If Vt is blank, the current 6T GUI family-average Vt is used. The Vg sweep must span every listed Model VDD.
+
 The **Write Trip Margin** tab reuses the same manual VDD / PU / PG / PD rows so Read and Write trends are based on identical WAT inputs. It calculates the maximum rise allowed on the nominally-low write bitline while PG can still overcome PU, then estimates the boundary between zero and positive write margin. The tab independently generates HTML, PNG, SVG, CSV and JSON results. This boundary is a compact-model reference and is not measured `Select_Write Vmin`.
 
 The **RSNM Mismatch Boundary** tab sweeps PUL/PUR/PGL/PGR/PDL/PDR Vt and Isat one parameter at a time. It reports whether the Upper or Lower Read-SNM eye reaches 0 first and exports the complete six-device Vt/Idsat set at each bracketed boundary. Values that are not being swept remain fixed at the entered Lot/Wafer baseline, so these results are sensitivity references rather than simultaneous multidimensional process limits.
+
+### Wafer multi-chip 6T analysis
+
+Use **64-Chip Template...** to create `HV28_6T_Wafer_64Chip_Template.xlsx`. Each row in its `6T Multi-Chip` sheet represents one physical chip and includes Chip ID, a common Model VDD, and PUL/PUR/PGL/PGR/PDL/PDR Vt and Idsat values. Select **Import Multi-Chip...** to analyze all rows. The report overlays every chip's Read direct/mirrored VTC and Write W=1/W=0 VTC, highlights the chip with the lowest margin, and reports the minimum RSNM and minimum WSNM as conservative wafer references. All imported chips must use one common Model VDD so their VTC axes are comparable.
 
 ## Read SNM chart convention
 

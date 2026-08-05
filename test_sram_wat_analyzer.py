@@ -9,14 +9,14 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_mismatch_rsnm_boundaries, analyze_rsnm_vcc_curve,
+    _read_wat_excel_rows, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve,
     analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, open_output_directory,
-    read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
+    read_iv_curve_excel, read_multi_chip_6t_excel, read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_mismatch_boundary_outputs,
-    write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
+    write_iv_curve_excel_template, write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
     write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
 
@@ -506,6 +506,44 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((report.parent / "rsnm_vcc_curve.csv").exists())
             self.assertTrue((report.parent / "images" / "01_rsnm_vs_model_vcc.png").exists())
             self.assertIn("Estimated eye-closure VDD", report.read_text(encoding="utf-8"))
+
+    def test_iv_curve_excel_extracts_idsat_at_model_vdd(self):
+        from openpyxl import Workbook
+        headers = ["Lot/Wafer", "Model VDD", "VDD Unit", "Vg", "Vg Unit", "Idsat", "Idsat Unit", "Vt", "Vt Unit"]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "raw_iv.xlsx"
+            book = Workbook()
+            book.remove(book.active)
+            for family, vt, multiplier in (("PU", .38, 10), ("PG", .36, 20), ("PD", .35, 30)):
+                sheet = book.create_sheet(family)
+                sheet.append(headers)
+                for vdd in (.5, .6):
+                    for vg in (.4, .5, .6):
+                        sheet.append(["LOT_IV", vdd, "V", vg, "V", multiplier * vg, "uA", vt, "V"])
+            book.save(path)
+            lot, points, extraction = read_iv_curve_excel(path)
+            self.assertEqual(lot, "LOT_IV")
+            self.assertEqual(len(points), 2)
+            at_six = next(point for point in points if point.vcc_v == .6)
+            self.assertAlmostEqual(at_six.pu.ids, 6.0)
+            self.assertAlmostEqual(at_six.pg.ids, 12.0)
+            self.assertAlmostEqual(at_six.pd.ids, 18.0)
+            self.assertEqual(len(extraction), 6)
+            template = write_iv_curve_excel_template(Path(td) / "iv_template.xlsx")
+            self.assertTrue(template.exists())
+
+    def test_multi_chip_6t_excel_template_and_wafer_analysis(self):
+        with tempfile.TemporaryDirectory() as td:
+            template = write_multi_chip_6t_excel_template(Path(td) / "wafer.xlsx", chip_count=2)
+            chips = read_multi_chip_6t_excel(template)
+            self.assertEqual([item.chip_id for item in chips], ["CHIP_01", "CHIP_02"])
+            analysis = analyze_multi_chip_wafer(chips, Config(grid_points=101), fit_points=201)
+            self.assertEqual(len(analysis["rows"]), 2)
+            self.assertGreater(analysis["worst_rsnm"]["rsnm_mv"], 0)
+            self.assertGreater(analysis["worst_wsnm"]["wsnm_mv"], 0)
+            report = write_multi_chip_outputs(analysis, Path(td) / "batch")
+            self.assertTrue(report.exists())
+            self.assertTrue((report.parent / "images" / "01_multi_chip_read_vtc.png").exists())
 
     def test_rsnm_vdd_row_matches_main_symmetric_6t_analysis(self):
         """The curve and primary report must share one RSNM calculation path."""

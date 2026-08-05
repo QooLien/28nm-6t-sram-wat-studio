@@ -208,6 +208,26 @@ class ExcelWatSweepPoint:
 
 
 @dataclass(frozen=True)
+class IvCurveExtraction:
+    """One raw Id-Vg curve reduced to the Idsat used at its model VDD."""
+    family: str
+    model_vdd_v: float
+    vt_v: float
+    sampled_vg_v: float
+    idsat_ua: float
+    source_point_count: int
+
+
+@dataclass(frozen=True)
+class WaferChipWat:
+    """One independently measured physical 6T cell on a wafer."""
+    lot_wafer: str
+    chip_id: str
+    model_vdd_v: float
+    cell: SixTWatCell
+
+
+@dataclass(frozen=True)
 class ThreeTWatCell:
     """Merged object mode: one PU, PG and PD object shared by both cell sides."""
     corner: str
@@ -1621,6 +1641,253 @@ def read_wat_excel(path: str | os.PathLike[str], default_model_vdd_v: float = 0.
         workbook.close()
 
 
+def _interpolate_iv_current(samples: list[tuple[float, float]], vg_v: float,
+                            label: str) -> float:
+    """Linearly interpolate |Ids| at Vg; require the raw curve to span Vg."""
+    ordered = sorted(samples)
+    if len(ordered) < 2:
+        raise ValueError(f"{label}: at least two Vg/Idsat raw points are required")
+    if vg_v < ordered[0][0] - 1e-12 or vg_v > ordered[-1][0] + 1e-12:
+        raise ValueError(
+            f"{label}: Vg sweep {ordered[0][0]:.4g} to {ordered[-1][0]:.4g} V does not span Model VDD {vg_v:.4g} V")
+    xs = [item[0] for item in ordered]
+    index = bisect_left(xs, vg_v)
+    if index < len(ordered) and abs(ordered[index][0] - vg_v) < 1e-12:
+        return ordered[index][1]
+    left_vg, left_i = ordered[index - 1]
+    right_vg, right_i = ordered[index]
+    if right_vg <= left_vg:
+        raise ValueError(f"{label}: duplicate Vg values are not allowed")
+    return left_i + (vg_v - left_vg) * (right_i - left_i) / (right_vg - left_vg)
+
+
+def read_iv_curve_excel(path: str | os.PathLike[str],
+                        fallback_vt_v: dict[str, float] | None = None) -> tuple[str, list[RsnmVccPoint], list[IvCurveExtraction]]:
+    """Read PU/PG/PD raw Id-Vg Excel sheets and create RSNM-VDD inputs.
+
+    Each sheet (PU, PG, PD) uses one row per raw point.  Idsat is extracted at
+    ``Vg = Model VDD`` (the usual compact-model VGS=VDS=VDD convention), not
+    from the final plotted point.  The raw Vg sweep must therefore bracket the
+    stated Model VDD.  A per-row Vt column is optional when fallback Vt values
+    are supplied from the 6T GUI.
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("IV curve import requires openpyxl. Run: python -m pip install -r requirements.txt") from exc
+    fallback_vt_v = {key.lower(): value for key, value in (fallback_vt_v or {}).items()}
+    workbook = load_workbook(path, data_only=True, read_only=True)
+    try:
+        sheets = {_normalized_excel_key(ws.title): ws for ws in workbook.worksheets}
+        raw_by_family: dict[str, dict[float, list[tuple[float, float, float | None, str]]]] = {}
+        lots: set[str] = set()
+        for family in ("pu", "pg", "pd"):
+            worksheet = sheets.get(family) or sheets.get(f"{family}iv") or sheets.get(f"{family}curve")
+            if worksheet is None:
+                raise ValueError("IV curve workbook requires PU, PG and PD worksheets")
+            rows = list(worksheet.iter_rows(values_only=True))
+            if not rows:
+                raise ValueError(f"IV curve worksheet '{worksheet.title}' is empty")
+            headers, header_units = _excel_header_map(list(rows[0]))
+            lot_key = _first_header(headers, "lotwafer", "lot", "wafer", "waferid")
+            vdd_key = _first_header(headers, "modelvdd", "vdd", "supplyvoltage", "testvoltage")
+            vg_key = _first_header(headers, "vg", "vgs", "gatevoltage")
+            ids_key = _first_header(headers, "idsat", "isat", "ids", "id", "draincurrent")
+            vt_key = _first_header(headers, "vt", "vth", "thresholdvoltage")
+            if not all((vdd_key, vg_key, ids_key)):
+                raise ValueError(f"IV curve worksheet '{worksheet.title}' needs Model VDD, Vg and Idsat columns")
+            vdd_unit_key = _first_header(headers, "modelvddunit", "vddunit")
+            vg_unit_key = _first_header(headers, "vgunit", "vgsunit", "gatevoltageunit")
+            ids_unit_key = _first_header(headers, "idsatunit", "isatunit", "idsunit", "idunit", "currentunit")
+            vt_unit_key = _first_header(headers, "vtunit", "vthunit")
+            family_curves: dict[float, list[tuple[float, float, float | None, str]]] = {}
+            for row_number, row_tuple in enumerate(rows[1:], 2):
+                row = list(row_tuple)
+                if not any(value is not None and str(value).strip() for value in row):
+                    continue
+                vdd = _excel_number(_cell(row, headers, vdd_key),
+                                    _cell(row, headers, vdd_unit_key) or header_units.get(vdd_key, "V"),
+                                    _VOLTAGE_UNITS, "V", f"{family.upper()} row {row_number} Model VDD")
+                vg = _excel_number(_cell(row, headers, vg_key),
+                                   _cell(row, headers, vg_unit_key) or header_units.get(vg_key, "V"),
+                                   _VOLTAGE_UNITS, "V", f"{family.upper()} row {row_number} Vg")
+                ids = abs(_excel_number(_cell(row, headers, ids_key),
+                                        _cell(row, headers, ids_unit_key) or header_units.get(ids_key, "uA"),
+                                        _CURRENT_TO_UA, "uA", f"{family.upper()} row {row_number} Idsat"))
+                raw_vt = _cell(row, headers, vt_key)
+                vt = None if raw_vt is None or str(raw_vt).strip() == "" else abs(_excel_number(
+                    raw_vt, _cell(row, headers, vt_unit_key) or header_units.get(vt_key or "", "V"),
+                    _VOLTAGE_UNITS, "V", f"{family.upper()} row {row_number} Vt"))
+                lot = str(_cell(row, headers, lot_key) or "IV_Curve").strip()
+                lots.add(lot)
+                family_curves.setdefault(vdd, []).append((vg, ids, vt, lot))
+            raw_by_family[family] = family_curves
+
+        common_vdds = set.intersection(*(set(raw_by_family[family]) for family in ("pu", "pg", "pd")))
+        if len(common_vdds) < 2:
+            raise ValueError("IV curve data needs at least two common Model VDD values across PU, PG and PD")
+        points: list[RsnmVccPoint] = []
+        extraction: list[IvCurveExtraction] = []
+        for vdd in sorted(common_vdds):
+            mos: dict[str, MosWat] = {}
+            for family in ("pu", "pg", "pd"):
+                samples = raw_by_family[family][vdd]
+                vt_values = [item[2] for item in samples if item[2] is not None]
+                vt = statlib.fmean(vt_values) if vt_values else fallback_vt_v.get(family)
+                if vt is None or vt <= 0:
+                    raise ValueError(f"{family.upper()} at {vdd:.4g} V: enter Vt in Excel or provide a positive 6T fallback Vt")
+                pairs = [(item[0], item[1]) for item in samples]
+                ids = _interpolate_iv_current(pairs, vdd, f"{family.upper()} at {vdd:.4g} V")
+                mos[family] = MosWat(vt, ids)
+                extraction.append(IvCurveExtraction(family.upper(), vdd, vt, vdd, ids, len(pairs)))
+            points.append(RsnmVccPoint(vdd, mos["pu"], mos["pg"], mos["pd"]))
+        lot = next(iter(lots), "IV_Curve") if len(lots) == 1 else "IV_Curve_Mixed_Lots"
+        return lot, points, extraction
+    finally:
+        workbook.close()
+
+
+def write_iv_curve_excel_template(path: str | os.PathLike[str]) -> Path:
+    """Create a raw Id-Vg workbook accepted by :func:`read_iv_curve_excel`."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.utils import get_column_letter
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError as exc:
+        raise RuntimeError("IV curve template export requires openpyxl. Run: python -m pip install -r requirements.txt") from exc
+    destination = Path(path).with_suffix(".xlsx")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    headers = ["Lot/Wafer", "Model VDD", "VDD Unit", "Vg", "Vg Unit", "Idsat", "Idsat Unit", "Vt", "Vt Unit", "Notes"]
+    colors = {"PU": "FFF1F0", "PG": "ECFDF3", "PD": "EEF6FF"}
+    for family in ("PU", "PG", "PD"):
+        sheet = workbook.create_sheet(family)
+        sheet.append(headers)
+        for cell in sheet[1]:
+            cell.fill = PatternFill("solid", fgColor="0B6EF3")
+            cell.font = Font(name="Microsoft JhengHei", size=11, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center")
+        for vdd in (.40, .50, .60, .70, .80, .90, 1.00, 1.10, 1.20):
+            for index in range(13):
+                vg = index * .10
+                sheet.append(["DEMO28_TT_W01", vdd, "V", vg, "V", None, "uA", None, "V",
+                              "Paste raw |Ids|; Vg sweep must include Model VDD"])
+        for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row):
+            for cell in row:
+                cell.fill = PatternFill("solid", fgColor=colors[family])
+        for column, width in enumerate((20, 13, 10, 10, 10, 14, 12, 10, 10, 48), 1):
+            sheet.column_dimensions[chr(64 + column)].width = width
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = f"A1:J{sheet.max_row}"
+    instructions = workbook.create_sheet("Instructions")
+    instructions.append(["HV28 IV Curve Import Template"])
+    instructions.append(["1. Fill one raw Id-Vg point per row on PU, PG and PD sheets."])
+    instructions.append(["2. Model VDD identifies the curve; Vg is the swept gate voltage; Idsat is the magnitude of drain current."])
+    instructions.append(["3. The import extracts Idsat by linear interpolation at Vg = Model VDD. Do not use the last plotted point unless it is Vg = VDD."])
+    instructions.append(["4. Enter Vt in the sheet, or leave it blank to use the current GUI PU/PG/PD average Vt."])
+    instructions.column_dimensions["A"].width = 125
+    workbook.save(destination)
+    return destination
+
+
+def read_multi_chip_6t_excel(path: str | os.PathLike[str],
+                             default_model_vdd_v: float = .90) -> list[WaferChipWat]:
+    """Read a wide-form wafer/chip 6T workbook; one row represents one chip."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("Multi-chip Excel import requires openpyxl. Run: python -m pip install -r requirements.txt") from exc
+    workbook = load_workbook(path, data_only=True, read_only=True)
+    try:
+        sheet = workbook["6T Multi-Chip"] if "6T Multi-Chip" in workbook.sheetnames else workbook.active
+        rows = list(sheet.iter_rows(values_only=True))
+        if len(rows) < 2:
+            raise ValueError("Multi-chip Excel needs a header and at least one chip row")
+        headers, header_units = _excel_header_map(list(rows[0]))
+        lot_key = _first_header(headers, "lotwafer", "lot", "wafer", "waferid")
+        chip_key = _first_header(headers, "chipid", "chip", "dieid", "site", "siteid")
+        vdd_key = _first_header(headers, "modelvdd", "vdd", "supplyvoltage")
+        vdd_unit_key = _first_header(headers, "modelvddunit", "vddunit")
+        if not chip_key:
+            raise ValueError("Multi-chip Excel requires a Chip ID column")
+        devices: dict[str, tuple[str, str]] = {}
+        for device in ("pul", "pur", "pgl", "pgr", "pdl", "pdr"):
+            vt_key = _first_header(headers, f"{device}vt", f"{device}vth")
+            ids_key = _first_header(headers, f"{device}idsat", f"{device}isat", f"{device}ids")
+            if not vt_key or not ids_key:
+                raise ValueError(f"Multi-chip Excel needs {device.upper()} Vt and Idsat columns")
+            devices[device] = (vt_key, ids_key)
+        parsed: list[WaferChipWat] = []
+        for number, row_tuple in enumerate(rows[1:], 2):
+            row = list(row_tuple)
+            if not any(value is not None and str(value).strip() for value in row):
+                continue
+            lot = str(_cell(row, headers, lot_key) or "Wafer").strip()
+            chip = str(_cell(row, headers, chip_key) or "").strip()
+            if not chip:
+                raise ValueError(f"Multi-chip Excel row {number}: Chip ID is blank")
+            raw_vdd = _cell(row, headers, vdd_key)
+            vdd = default_model_vdd_v if raw_vdd is None or str(raw_vdd).strip() == "" else _excel_number(
+                raw_vdd, _cell(row, headers, vdd_unit_key) or header_units.get(vdd_key or "", "V"),
+                _VOLTAGE_UNITS, "V", f"Multi-chip row {number} Model VDD")
+            mos: dict[str, MosWat] = {}
+            for device, (vt_key, ids_key) in devices.items():
+                vt = _excel_number(_cell(row, headers, vt_key),
+                                   _cell(row, headers, f"{vt_key}unit") or header_units.get(vt_key, "V"),
+                                   _VOLTAGE_UNITS, "V", f"Multi-chip row {number} {device.upper()} Vt")
+                ids = _excel_number(_cell(row, headers, ids_key),
+                                    _cell(row, headers, f"{ids_key}unit") or header_units.get(ids_key, "uA"),
+                                    _CURRENT_TO_UA, "uA", f"Multi-chip row {number} {device.upper()} Idsat")
+                mos[device] = MosWat(abs(_positive(vt, f"{device.upper()} Vt")), abs(_positive(ids, f"{device.upper()} Idsat")))
+            parsed.append(WaferChipWat(lot, chip, vdd, SixTWatCell(f"{lot}_{chip}",
+                mos["pul"], mos["pur"], mos["pgl"], mos["pgr"], mos["pdl"], mos["pdr"])))
+        if not parsed:
+            raise ValueError("Multi-chip Excel contains no chip rows")
+        vdds = {round(item.model_vdd_v, 12) for item in parsed}
+        if len(vdds) != 1:
+            raise ValueError("Multi-chip VTC overlay requires one common Model VDD for all chip rows")
+        return parsed
+    finally:
+        workbook.close()
+
+
+def write_multi_chip_6t_excel_template(path: str | os.PathLike[str], chip_count: int = 64) -> Path:
+    """Create an editable wide 6T wafer/chip template accepted by the batch import."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise RuntimeError("Multi-chip template export requires openpyxl. Run: python -m pip install -r requirements.txt") from exc
+    destination = Path(path).with_suffix(".xlsx")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook(); sheet = workbook.active; sheet.title = "6T Multi-Chip"
+    headers = ["Lot/Wafer", "Chip ID", "Model VDD", "VDD Unit"]
+    for name in ("PUL", "PUR", "PGL", "PGR", "PDL", "PDR"):
+        headers.extend([f"{name} Vt", f"{name} Vt Unit", f"{name} Idsat", f"{name} Idsat Unit"])
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.fill = PatternFill("solid", fgColor="0B6EF3")
+        cell.font = Font(name="Microsoft JhengHei", size=10, bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+    defaults = {"PU": (.385, 44.0), "PG": (.365, 82.0), "PD": (.355, 124.0)}
+    for index in range(1, max(1, int(chip_count)) + 1):
+        row = ["DEMO28_TT_W01", f"CHIP_{index:02d}", .90, "V"]
+        for name in ("PUL", "PUR", "PGL", "PGR", "PDL", "PDR"):
+            vt, ids = defaults[name[:2]]
+            row.extend([vt, "V", ids, "uA"])
+        sheet.append(row)
+    for column in range(1, len(headers) + 1):
+        sheet.column_dimensions[get_column_letter(column)].width = 14
+    sheet.freeze_panes = "A2"; sheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{sheet.max_row}"
+    info = workbook.create_sheet("Instructions")
+    info.append(["One row = one physical 6T chip. The batch report overlays all chip VTC/mirror VTC curves and reports the minimum RSNM and WSNM as the wafer reference."])
+    info.column_dimensions["A"].width = 140
+    workbook.save(destination)
+    return destination
+
+
 def write_single_6t_wat_excel(path: str | os.PathLike[str], cell: SixTWatCell,
                               model_vdd_v: float) -> Path:
     """Write one editable six-MOS WAT set in the same long form accepted by import.
@@ -2049,6 +2316,41 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
     result["target_comparisons"] = _target_comparisons(cell, datasheet_targets)
     _attach_target_model(result, datasheet_targets, cfg)
     return result
+
+
+def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
+                             fit_points: int = 401) -> dict:
+    """Evaluate all chip rows and retain every Read/Write VTC for wafer overlay."""
+    if not chips:
+        raise ValueError("At least one chip is required")
+    vdd = chips[0].model_vdd_v
+    if any(abs(item.model_vdd_v - vdd) > 1e-12 for item in chips):
+        raise ValueError("All chips must use the same Model VDD")
+    point_cfg = replace(cfg, nominal_vdd=vdd, wat_vdd=vdd, grid_points=max(201, int(fit_points)))
+    rows = []
+    for item in chips:
+        model = AsymmetricSram6T(item.cell, point_cfg)
+        read = model.read_butterfly(vdd, point_cfg.grid_points)
+        write = write_wsnm_states(vdd, model.left, model.right, point_cfg, point_cfg.grid_points)
+        rows.append({"chip_id": item.chip_id, "cell": item.cell, "read": read,
+                     "rsnm_mv": read["read_butterfly"].get("snm_mv"),
+                     "upper_rsnm_mv": read["read_butterfly"].get("snm_upper_left_mv"),
+                     "lower_rsnm_mv": read["read_butterfly"].get("snm_lower_right_mv"),
+                     "write": write, "wsnm_mv": write.get("snm_mv")})
+    valid_read = [row for row in rows if row["rsnm_mv"] is not None]
+    valid_write = [row for row in rows if row["wsnm_mv"] is not None]
+    if not valid_read or not valid_write:
+        raise ValueError("No valid RSNM or WSNM value was produced from the imported chips")
+    worst_read = min(valid_read, key=lambda row: row["rsnm_mv"])
+    worst_write = min(valid_write, key=lambda row: row["wsnm_mv"])
+    worst_upper = min((row for row in rows if row["upper_rsnm_mv"] is not None),
+                      key=lambda row: row["upper_rsnm_mv"])
+    worst_lower = min((row for row in rows if row["lower_rsnm_mv"] is not None),
+                      key=lambda row: row["lower_rsnm_mv"])
+    return {"lot_wafer": chips[0].lot_wafer, "vdd_v": vdd, "rows": rows,
+            "worst_rsnm": worst_read, "worst_rsnm_upper": worst_upper,
+            "worst_rsnm_lower": worst_lower, "worst_wsnm": worst_write,
+            "fit_points": point_cfg.grid_points}
 
 
 def analyze_three_mos(cell: ThreeTWatCell, cfg: Config,
@@ -3913,6 +4215,102 @@ def _legacy_write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path
     return report
 
 
+def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int = 780) -> str:
+    """Overlay all chip VTC pairs and highlight the chip with the minimum margin."""
+    if mode not in {"read", "write"}:
+        raise ValueError("mode must be read or write")
+    vdd, axis = analysis["vdd_v"], SNM_PLOT_AXIS_MAX_V
+    left, top, plot_w, plot_h = 120, 125, 920, 560
+    worst = analysis["worst_rsnm"] if mode == "read" else analysis["worst_wsnm"]
+    metric = "RSNM" if mode == "read" else "WSNM"
+    def xy(x: float, y: float) -> tuple[float, float]:
+        return left + x / axis * plot_w, top + (1 - y / axis) * plot_h
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Arial,sans-serif">',
+             '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+             f'<text x="54" y="55" fill="#1D1D1F" font-size="33" font-weight="700">Wafer Multi-Chip {metric} VTC Overlay</text>',
+             f'<text x="54" y="87" fill="#6E6E73" font-size="17">{html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD = {vdd:.3f} V</text>',
+             '<path d="M54 108 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="114" fill="#3A3A3C" font-size="15">All chip direct VTC</text>',
+             '<path d="M280 108 h34" stroke="#AF52DE" stroke-width="4" stroke-dasharray="9 6"/><text x="324" y="114" fill="#3A3A3C" font-size="15">All chip mirrored / paired VTC</text>',
+             '<path d="M690 108 h34" stroke="#FF3B30" stroke-width="5"/><text x="734" y="114" fill="#3A3A3C" font-size="15">Minimum-margin chip</text>']
+    for voltage in (0, .3, .6, .9, 1.2):
+        x, y = xy(voltage, voltage)
+        parts += [f'<path d="M{x:.1f} {top} V{top+plot_h} M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA"/>',
+                  f'<text x="{x:.1f}" y="{top+plot_h+27}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
+                  f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>']
+    for row in analysis["rows"]:
+        if mode == "read":
+            direct, mirrored = _read_vtc_pair(row["read"])
+        else:
+            direct, mirrored = row["write"]["write_1"]["curve"], row["write"]["write_0"]["curve"]
+        is_worst = row["chip_id"] == worst["chip_id"]
+        width_px, opacity = (4.5, 1.0) if is_worst else (1.3, .18)
+        direct_points = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in direct)
+        mirror_points = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in mirrored)
+        color = "#FF3B30" if is_worst else "#007AFF"
+        paired_color = "#C21FD4" if not is_worst else "#FF9500"
+        parts += [f'<polyline points="{direct_points}" fill="none" stroke="{color}" stroke-width="{width_px}" opacity="{opacity}"/>',
+                  f'<polyline points="{mirror_points}" fill="none" stroke="{paired_color}" stroke-width="{width_px}" opacity="{opacity}" stroke-dasharray="9 6"/>']
+    # Keep the wafer overlay readable: draw only the single limiting square
+    # belonging to the chip that sets the wafer-level reference value.
+    if mode == "read":
+        square_specs = []
+        for state_key, state_label, row in (
+                ("upper_left", "Upper", analysis["worst_rsnm_upper"]),
+                ("lower_right", "Lower", analysis["worst_rsnm_lower"])):
+            square = next((item for item in row["read"]["read_butterfly"].get("squares", [])
+                           if item.get("state_key") == state_key), None)
+            if square:
+                square_specs.append((state_label, row["chip_id"], square))
+    else:
+        square = worst["write"].get("write_square")
+        square_specs = [("WSNM", worst["chip_id"], square)] if square else []
+    for state_label, chip_id, square in square_specs:
+        if square.get("side_v", 0) <= 0:
+            continue
+        x0, y0, side = square["x_v"], square["y_v"], square["side_v"]
+        x, y_top = xy(x0, y0 + side)
+        side_x, side_y = side / axis * plot_w, side / axis * plot_h
+        parts += [f'<rect x="{x:.1f}" y="{y_top:.1f}" width="{side_x:.1f}" height="{side_y:.1f}" fill="#EFFAF2" fill-opacity="0.75" stroke="#34C759" stroke-width="4"/>',
+                  f'<text x="{x+side_x/2:.1f}" y="{y_top+side_y/2+6:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{state_label} {side*1000:.1f} mV</text>',
+                  f'<text x="{x+side_x/2:.1f}" y="{y_top+side_y/2+28:.1f}" text-anchor="middle" fill="#3A3A3C" font-size="12">{html.escape(chip_id)}</text>']
+    value = worst["rsnm_mv"] if mode == "read" else worst["wsnm_mv"]
+    parts += [f'<text x="{left+plot_w/2:.1f}" y="{height-44}" text-anchor="middle" fill="#1D1D1F" font-size="20">Vin (V)</text>',
+              f'<text x="43" y="{top+plot_h/2:.1f}" transform="rotate(-90 43 {top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="20">Vout (V)</text>',
+              f'<text x="1085" y="{top+55}" fill="#FF3B30" font-size="20" font-weight="700">Worst {metric}</text>',
+              f'<text x="1085" y="{top+86}" fill="#1D1D1F" font-size="18">{html.escape(worst["chip_id"])}: {value:.1f} mV</text>',
+              '</svg>']
+    return "".join(parts)
+
+
+def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str]) -> Path:
+    """Export batch wafer VTC overlays, per-chip margin table and HTML summary."""
+    out = Path(out_dir); image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from reportlab.graphics import renderPM
+        from svglib.svglib import svg2rlg
+    except ImportError as exc:
+        raise RuntimeError("PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
+    charts = [("01_multi_chip_read_vtc.svg", "01_multi_chip_read_vtc.png", "read"),
+              ("02_multi_chip_write_vtc.svg", "02_multi_chip_write_vtc.png", "write")]
+    for svg_name, png_name, mode in charts:
+        path = image_dir / svg_name; path.write_text(multi_chip_vtc_svg(analysis, mode), encoding="utf-8")
+        drawing = svg2rlg(str(path))
+        if drawing is None:
+            raise RuntimeError("Could not render multi-chip VTC overlay")
+        renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
+    export_rows = [{"lot_wafer": analysis["lot_wafer"], "chip_id": row["chip_id"],
+                    "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"], "wsnm_mv": row["wsnm_mv"],
+                    "is_worst_rsnm": row["chip_id"] == analysis["worst_rsnm"]["chip_id"],
+                    "is_worst_wsnm": row["chip_id"] == analysis["worst_wsnm"]["chip_id"]}
+                   for row in analysis["rows"]]
+    with open(out / "multi_chip_snm_summary.csv", "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(export_rows[0])); writer.writeheader(); writer.writerows(export_rows)
+    body = "".join(f'<tr><td>{html.escape(row["chip_id"])}</td><td>{row["rsnm_mv"]:.2f}</td><td>{row["wsnm_mv"]:.2f}</td></tr>' for row in analysis["rows"])
+    report = out / "multi_chip_wafer_report.html"
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Multi-Chip Wafer Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}</style></head><body><main><h1>HV28 SRAM Multi-Chip Wafer Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD={analysis["vdd_v"]:.3f} V</p><section><h2>Conservative wafer reference</h2><p><b>Minimum RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Read VTC / Mirror VTC</h2><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-chip margins</h2><table><tr><th>Chip ID</th><th>RSNM (mV)</th><th>WSNM (mV)</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
+    return report
+
+
 def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     """Write the focused Read SNM current-versus-target HTML report."""
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
@@ -4651,10 +5049,49 @@ def launch_gui() -> None:
         except Exception as exc:
             messagebox.showerror("Excel export", str(exc))
 
+    def import_multi_chip_excel() -> None:
+        selected = filedialog.askopenfilename(
+            title="Import Wafer Multi-Chip 6T Excel",
+            filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
+        if not selected:
+            return
+        try:
+            chips = read_multi_chip_6t_excel(selected, float(numeric["nominal_vdd"].get()))
+            assumptions = {key: (getattr(config_defaults, key) if not assumption_values[key].get().strip()
+                                 else float(assumption_values[key].get()))
+                           for key, _label, _unit in assumption_specs}
+            cfg = Config(nominal_vdd=chips[0].model_vdd_v, wat_vdd=chips[0].model_vdd_v, **assumptions)
+            analysis = analyze_multi_chip_wafer(chips, cfg)
+            run_dir = create_run_output_dir(values["out"].get(), chips[0].lot_wafer, "multi_chip_wafer")
+            report = write_multi_chip_outputs(analysis, run_dir)
+            values["corner"].set(chips[0].lot_wafer)
+            status.set(f"Multi-chip wafer complete: {len(chips)} chips; minimum RSNM={analysis['worst_rsnm']['rsnm_mv']:.1f} mV, WSNM={analysis['worst_wsnm']['wsnm_mv']:.1f} mV")
+            status_label.configure(fg=GREEN)
+            webbrowser.open(report.resolve().as_uri())
+        except Exception as exc:
+            messagebox.showerror("Multi-chip wafer import", str(exc))
+
+    def save_multi_chip_template() -> None:
+        selected = filedialog.asksaveasfilename(
+            title="Save 64-Chip 6T Wafer Template", initialfile="HV28_6T_Wafer_64Chip_Template.xlsx",
+            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")])
+        if not selected:
+            return
+        try:
+            saved = write_multi_chip_6t_excel_template(selected, 64)
+            status.set(f"64-chip wafer template saved: {saved.name}")
+            status_label.configure(fg=GREEN)
+        except Exception as exc:
+            messagebox.showerror("Multi-chip template", str(exc))
+
     ttk.Button(excel_row, text="Save Current...", style="Quiet.TButton",
                command=save_current_excel).pack(side="right")
     ttk.Button(excel_row, text="Import Excel...", style="Quiet.TButton",
                command=pick_excel).pack(side="right", padx=(0, 6))
+    ttk.Button(excel_row, text="Import Multi-Chip...", style="Quiet.TButton",
+               command=import_multi_chip_excel).pack(side="right", padx=(0, 6))
+    ttk.Button(excel_row, text="64-Chip Template...", style="Quiet.TButton",
+               command=save_multi_chip_template).pack(side="right", padx=(0, 6))
 
     schematic = tk.Canvas(left, bg=CARD, highlightthickness=0, height=540)
     schematic.pack(fill="both", expand=True)
@@ -5044,6 +5481,47 @@ def launch_gui() -> None:
         curve_status.set("Example restored; edit the values and analyze")
         curve_status_label.configure(fg=SECONDARY)
 
+    def import_iv_curve_excel() -> None:
+        selected = filedialog.askopenfilename(
+            title="Import PU / PG / PD raw IV Curve Excel",
+            filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
+        if not selected:
+            return
+        try:
+            fallback_vt = {
+                family: statlib.fmean(float(wat_values[f"{family}{side}_vt"].get()) for side in ("1", "2"))
+                for family in ("pu", "pg", "pd")
+            }
+            lot, points, extracted = read_iv_curve_excel(selected, fallback_vt)
+            imported_rows = [{
+                "vcc": f"{point.vcc_v:.6g}",
+                "pu_vt": f"{point.pu.vt:.6g}", "pu_ids": f"{point.pu.ids:.6g}",
+                "pg_vt": f"{point.pg.vt:.6g}", "pg_ids": f"{point.pg.ids:.6g}",
+                "pd_vt": f"{point.pd.vt:.6g}", "pd_ids": f"{point.pd.ids:.6g}",
+            } for point in points]
+            curve_row_vars.clear()
+            for row in imported_rows:
+                curve_row_vars.append({key: tk.StringVar(value=value) for key, value in row.items()})
+            rebuild_curve_rows()
+            values["corner"].set(lot)
+            curve_status.set(f"Imported {len(points)} IV-curve VDD point(s); Idsat extracted at Vg = VDD ({len(extracted)} curves)")
+            curve_status_label.configure(fg=GREEN)
+        except Exception as exc:
+            messagebox.showerror("IV curve import", str(exc))
+
+    def save_iv_curve_template() -> None:
+        selected = filedialog.asksaveasfilename(
+            title="Save Raw IV Curve Excel Template", initialfile="HV28_IV_Curve_Raw_Data_Template.xlsx",
+            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")])
+        if not selected:
+            return
+        try:
+            template = write_iv_curve_excel_template(selected)
+            curve_status.set(f"IV curve template saved: {template.name}")
+            curve_status_label.configure(fg=GREEN)
+        except Exception as exc:
+            messagebox.showerror("IV curve template", str(exc))
+
     saved_curve_rows = saved_state.get("rsnm_vcc_rows", [])
     initial_curve_rows = (saved_curve_rows if isinstance(saved_curve_rows, list) and
                           len(saved_curve_rows) >= 2 else default_curve_rows())
@@ -5058,10 +5536,14 @@ def launch_gui() -> None:
                command=remove_curve_row).pack(side="left", padx=(7, 0))
     ttk.Button(curve_controls, text="Paste Excel", style="Quiet.TButton",
                command=lambda: paste_curve_grid(type("PasteEvent", (), {"widget": root})(), 0, 0)).pack(side="left", padx=(7, 0))
+    ttk.Button(curve_controls, text="Import IV Curve...", style="Quiet.TButton",
+               command=import_iv_curve_excel).pack(side="left", padx=(7, 0))
+    ttk.Button(curve_controls, text="IV Template...", style="Quiet.TButton",
+               command=save_iv_curve_template).pack(side="left", padx=(7, 0))
     ttk.Button(curve_controls, text="Restore Example", style="Quiet.TButton",
                command=restore_curve_example).pack(side="right")
     ttk.Label(curve_input_card,
-              text="Excel: select the first target cell and press Ctrl+V to paste a tab-delimited range. Grouped rows map PU/PG/PD symmetrically to both sides of the 6T cell. Isat may be 0 uA below threshold; include rows on both sides of the expected boundary.",
+              text="Excel: select the first target cell and press Ctrl+V to paste a tab-delimited range. Import IV Curve reads PU/PG/PD raw Id-Vg sheets and extracts |Idsat| at Vg = Model VDD. Grouped rows map PU/PG/PD symmetrically to both sides of the 6T cell.",
               style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(0, 9))
 
     curve_status = tk.StringVar(value="Ready to analyze the VDD sweep")
