@@ -2881,24 +2881,20 @@ def write_wsnm_window_svg(result: dict, width: int = 1440, height: int = 900) ->
     current = result["baseline_6t"]["write_wsnm"]
     has_target = bool(result.get("datasheet_targets") and result.get("target_6t"))
     target = result.get("target_6t", {}).get("write_wsnm") if has_target else None
-    axis_max, left, top, size = SNM_PLOT_AXIS_MAX_V, 210, 165, 560
-    lot = html.escape(str(result["wat"]["corner"]))
+    axis_max, left, top, size = SNM_PLOT_AXIS_MAX_V, 210, 190, 560
 
     def xy(vin: float, vout: float) -> tuple[float, float]:
         return left + vin / axis_max * size, top + (1.0 - vout / axis_max) * size
 
-    metric_text = f'Lot/Wafer WSNM = {current["snm_mv"]:.1f} mV'
-    if target and target.get("snm_mv") is not None:
-        metric_text += f'   |   Target = {target["snm_mv"]:.1f} mV   |   Δ = {current["snm_mv"]-target["snm_mv"]:+.1f} mV'
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="W1 W0 Write SNM butterfly analysis" style="font-family:Calibri,Arial,sans-serif">',
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
         '<text x="54" y="50" fill="#1D1D1F" font-size="32" font-weight="700">Write SNM Butterfly Analysis</text>',
-        f'<text x="54" y="122" fill="#1D1D1F" font-size="19" font-weight="700">WSNM @ VDD = {current["vdd_v"]:.3f} V</text>',
-        f'<path d="M54 88 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="94" fill="#3A3A3C" font-size="17">{lot} W=1 VTC (upper)</text>',
-        f'<path d="M315 88 h34" stroke="#5856D6" stroke-width="4"/><text x="359" y="94" fill="#3A3A3C" font-size="17">{lot} W=0 VTC (lower)</text>',
-        '<rect x="615" y="76" width="20" height="20" fill="#EFFAF2" stroke="#34C759" stroke-width="3"/><text x="647" y="94" fill="#3A3A3C" font-size="17">Vin=Vout diagonal-constrained WSNM square</text>',
-        '<path d="M1080 88 h34" stroke="#FF9500" stroke-width="4"/><text x="1124" y="94" fill="#3A3A3C" font-size="17">WAT Target pair</text>' if target else '',
+        '<path d="M54 88 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="94" fill="#3A3A3C" font-size="17">W=1 VTC (upper)</text>',
+        '<path d="M300 88 h34" stroke="#5856D6" stroke-width="4"/><text x="344" y="94" fill="#3A3A3C" font-size="17">W=0 VTC (lower)</text>',
+        '<rect x="54" y="112" width="20" height="20" fill="#EFFAF2" stroke="#34C759" stroke-width="3"/><text x="86" y="130" fill="#3A3A3C" font-size="17">Vin=Vout diagonal-constrained WSNM square</text>',
+        '<path d="M575 122 h34" stroke="#FF9500" stroke-width="4"/><text x="619" y="128" fill="#3A3A3C" font-size="17">WAT Target pair</text>' if target else '',
+        f'<text x="54" y="162" fill="#1D1D1F" font-size="19" font-weight="700">WSNM @ VDD = {current["vdd_v"]:.3f} V</text>',
     ]
     for voltage in (0.0, 0.30, 0.60, 0.90, axis_max):
         px, py = xy(voltage, voltage)
@@ -2918,10 +2914,9 @@ def write_wsnm_window_svg(result: dict, width: int = 1440, height: int = 900) ->
         side_px = side / axis_max * size
         parts += [f'<rect x="{x0:.1f}" y="{y0:.1f}" width="{side_px:.1f}" height="{side_px:.1f}" fill="#EFFAF2" fill-opacity=".70" stroke="#34C759" stroke-width="3"/>',
                   f'<text x="{x0+side_px/2:.1f}" y="{y0+side_px/2+5:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">WSNM {current["snm_mv"]:.1f} mV</text>']
-    parts += [f'<text x="{left+size/2:.1f}" y="{top+size+72}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">{metric_text}</text>',
-              f'<text x="{left+size/2:.1f}" y="{top+size+110}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
+    parts += [f'<text x="{left+size/2:.1f}" y="{top+size+76}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
               f'<text x="{left-62}" y="{top+size/2}" transform="rotate(-90 {left-62} {top+size/2})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>',
-              '<text x="720" y="865" text-anchor="middle" fill="#6E6E73" font-size="15">W=1 is the BLB-high upper VTC; W=0 is the BL-low lower VTC. The WSNM square diagonal is constrained to Vin=Vout.</text>',
+              '<text x="720" y="875" text-anchor="middle" fill="#6E6E73" font-size="15">W=1 is the BLB-high upper VTC; W=0 is the BL-low lower VTC. The WSNM square diagonal is constrained to Vin=Vout.</text>',
               '</svg>']
     return "".join(part for part in parts if part)
 
@@ -3212,13 +3207,9 @@ def read_snm_butterfly_svg(result: dict, width: int = 1440, height: int = 820) -
             side_px_x = square["side_v"] / axis_max * plot_w
             side_px_y = square["side_v"] / axis_max * plot_h
             stroke_width = 4 if abs(square["side_v"] - limiting) < 1e-12 else 3
-            state_label = "QB=0 / Q=1" if square["lobe"] == 1 else "QB=1 / Q=0"
             value_label = f'{square["side_mv"]:.1f} mV'
             parts += [f'<rect x="{left:.1f}" y="{top:.1f}" width="{side_px_x:.1f}" height="{side_px_y:.1f}" fill="#EFFAF2" stroke="#34C759" stroke-width="{stroke_width}"/>',
-                      f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2-2:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{state_label}</text>',
-                      f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2+17:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="14" font-weight="700">{value_label}</text>']
-            arrow_x = min(left + side_px_x + 16, plot_left + plot_w - 8)
-            parts += [f'<path d="M{arrow_x:.1f} {top+3:.1f} V{top+side_px_y-3:.1f} M{arrow_x-5:.1f} {top+3:.1f} H{arrow_x+5:.1f} M{arrow_x-5:.1f} {top+side_px_y-3:.1f} H{arrow_x+5:.1f}" stroke="#34C759" stroke-width="2"/>']
+                      f'<text x="{left+side_px_x/2:.1f}" y="{top+side_px_y/2+5:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{value_label}</text>']
 
         butterfly = data["read_butterfly"]
         state_text = (f'Upper {butterfly.get("snm_upper_left_mv", squares[0]["side_mv"]):.1f} mV · '

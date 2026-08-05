@@ -234,8 +234,9 @@ class AnalyzerTests(unittest.TestCase):
             self.assertNotIn("Geometric RSNM", butterfly_svg)
             self.assertNotIn("Analytical RSNM", butterfly_svg)
             self.assertIn("cell RSNM is the smaller value", butterfly_svg)
-            self.assertIn("QB=0 / Q=1", butterfly_svg)
-            self.assertIn("QB=1 / Q=0", butterfly_svg)
+            self.assertNotIn("QB=0 / Q=1", butterfly_svg)
+            self.assertIn("mV</text>", butterfly_svg)
+            self.assertNotIn("QB=1 / Q=0", butterfly_svg)
             for dataset in (result["baseline_6t"], result["target_6t"]):
                 for square in dataset["read_butterfly"]["squares"]:
                     self.assertIn(f'>{square["side_mv"]:.1f} mV</text>', butterfly_svg)
