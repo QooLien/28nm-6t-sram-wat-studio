@@ -80,6 +80,19 @@ DISPLAY_MOS_NAMES = {
     "pd1": "PDL", "pd2": "PDR",
 }
 
+# One numerical resolution is used whenever a reported Read/Write SNM value
+# is compared across the single-cell, VDD-sweep, and wafer multi-chip flows.
+# The square extractor operates on a sampled VTC, so differing point counts
+# would otherwise create a small grid-quantization difference even for the
+# exact same six MOS inputs.
+SNM_FIT_GRID_POINTS = 1201
+
+
+def _snm_fit_points(cfg: "Config", requested: int | None = None) -> int:
+    """Return the common numerical resolution for all reported SNM metrics."""
+    return max(SNM_FIT_GRID_POINTS, int(cfg.grid_points),
+               0 if requested is None else int(requested))
+
 
 def open_output_directory(path: str | os.PathLike[str]) -> Path:
     """Create and open the selected output directory in the system file manager."""
@@ -1272,7 +1285,7 @@ def variants(wat: WatPoint, cfg: Config, device: str) -> list[tuple[str, WatPoin
 
 def metric(model: Sram6T, cfg: Config,
            read_butterfly: dict | None = None) -> dict[str, float | None]:
-    square_points = max(1201, cfg.grid_points)
+    square_points = _snm_fit_points(cfg)
     read_butterfly = read_butterfly or model.butterfly_squares(
         cfg.nominal_vdd, "read", square_points)
     analytical = model.analytical_read_snm_eq_3_36(cfg.nominal_vdd)
@@ -1341,7 +1354,7 @@ def evaluate_judgment(metrics: dict[str, float | None],
 
 def analyze(wat: WatPoint, cfg: Config) -> dict:
     model = Sram6T(wat, cfg)
-    square_points = max(1201, cfg.grid_points)
+    square_points = _snm_fit_points(cfg)
     read_butterfly = model.butterfly_squares(cfg.nominal_vdd, "read", square_points)
     write_states = write_wsnm_states(cfg.nominal_vdd, model, model, cfg, square_points)
     read_vtc = model.vtc(cfg.nominal_vdd, "read", 201)
@@ -2290,13 +2303,13 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
     }
     half_cell = cell_metric(cell, cfg)
     asymmetric_model = AsymmetricSram6T(cell, cfg)
-    asymmetric = asymmetric_model.read_butterfly(
-        cfg.nominal_vdd, max(1201, cfg.grid_points))
+    fit_points = _snm_fit_points(cfg)
+    asymmetric = asymmetric_model.read_butterfly(cfg.nominal_vdd, fit_points)
     vdd = cfg.nominal_vdd
     baseline = result["baseline_6t"]
     baseline.update(asymmetric)
     baseline["write_wsnm"] = write_wsnm_states(
-        vdd, asymmetric_model.left, asymmetric_model.right, cfg, max(1201, cfg.grid_points))
+        vdd, asymmetric_model.left, asymmetric_model.right, cfg, fit_points)
     butterfly = asymmetric["read_butterfly"]
     baseline["metrics"].update({
         "read_snm_mv": butterfly["snm_mv"],
@@ -2319,14 +2332,18 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
 
 
 def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
-                             fit_points: int = 401) -> dict:
+                             fit_points: int | None = None) -> dict:
     """Evaluate all chip rows and retain every Read/Write VTC for wafer overlay."""
     if not chips:
         raise ValueError("At least one chip is required")
     vdd = chips[0].model_vdd_v
     if any(abs(item.model_vdd_v - vdd) > 1e-12 for item in chips):
         raise ValueError("All chips must use the same Model VDD")
-    point_cfg = replace(cfg, nominal_vdd=vdd, wat_vdd=vdd, grid_points=max(201, int(fit_points)))
+    # Do not use a lighter wafer-only grid: the same physical 6T input must
+    # return exactly the same RSNM/WSNM as the single-bitcell analysis.
+    common_fit_points = _snm_fit_points(cfg, fit_points)
+    point_cfg = replace(cfg, nominal_vdd=vdd, wat_vdd=vdd,
+                        grid_points=common_fit_points)
     rows = []
     for item in chips:
         model = AsymmetricSram6T(item.cell, point_cfg)
@@ -2444,8 +2461,7 @@ def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
         raise ValueError("Enter at least two VDD rows")
     # Keep the default numerically synchronized with the main 6T report.
     # Callers that need a lighter exploratory sweep can still pass fit_points.
-    fit_points = max(201, int(fit_points if fit_points is not None
-                              else max(1201, cfg.grid_points)))
+    fit_points = _snm_fit_points(cfg, fit_points)
     ordered = sorted(points, key=lambda point: point.vcc_v)
     for index, point in enumerate(ordered):
         if not math.isfinite(point.vcc_v) or not 0 < point.vcc_v <= SNM_PLOT_AXIS_MAX_V:

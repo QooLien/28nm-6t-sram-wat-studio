@@ -7,7 +7,7 @@ from unittest import mock
 
 from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
-    SixTWatCell, Sram6T, ThreeTWatCell,
+    SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve,
     analyze_write_trip_margin_curve,
@@ -544,6 +544,17 @@ class AnalyzerTests(unittest.TestCase):
             report = write_multi_chip_outputs(analysis, Path(td) / "batch")
             self.assertTrue(report.exists())
             self.assertTrue((report.parent / "images" / "01_multi_chip_read_vtc.png").exists())
+
+    def test_single_and_multi_chip_use_identical_snm_calculation(self):
+        """One multi-chip row must numerically match the 6T single-cell result."""
+        cfg = Config(nominal_vdd=.90, wat_vdd=.90, grid_points=101)
+        pu, pg, pd = MosWat(.385, 44.0), MosWat(.365, 82.0), MosWat(.355, 124.0)
+        cell = SixTWatCell("SYNC", pu, pu, pg, pg, pd, pd)
+        single = analyze_six_mos(cell, cfg)["baseline_6t"]["metrics"]
+        multi = analyze_multi_chip_wafer(
+            [WaferChipWat("SYNC", "CHIP_01", .90, cell)], cfg)["rows"][0]
+        self.assertAlmostEqual(multi["rsnm_mv"], single["read_snm_mv"], places=9)
+        self.assertAlmostEqual(multi["wsnm_mv"], single["write_snm_mv"], places=9)
 
     def test_rsnm_vdd_row_matches_main_symmetric_6t_analysis(self):
         """The curve and primary report must share one RSNM calculation path."""
