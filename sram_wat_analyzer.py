@@ -4220,7 +4220,9 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int
     if mode not in {"read", "write"}:
         raise ValueError("mode must be read or write")
     vdd, axis = analysis["vdd_v"], SNM_PLOT_AXIS_MAX_V
-    left, top, plot_w, plot_h = 120, 125, 920, 560
+    # Equal physical X/Y scale is required so every electrical square is
+    # rendered as a square, not a visually misleading rectangle.
+    left, top, plot_w, plot_h = 150, 165, 560, 560
     worst = analysis["worst_rsnm"] if mode == "read" else analysis["worst_wsnm"]
     metric = "RSNM" if mode == "read" else "WSNM"
     def xy(x: float, y: float) -> tuple[float, float]:
@@ -4253,14 +4255,11 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int
     # Keep the wafer overlay readable: draw only the single limiting square
     # belonging to the chip that sets the wafer-level reference value.
     if mode == "read":
-        square_specs = []
-        for state_key, state_label, row in (
-                ("upper_left", "Upper", analysis["worst_rsnm_upper"]),
-                ("lower_right", "Lower", analysis["worst_rsnm_lower"])):
-            square = next((item for item in row["read"]["read_butterfly"].get("squares", [])
-                           if item.get("state_key") == state_key), None)
-            if square:
-                square_specs.append((state_label, row["chip_id"], square))
+        # Never combine Upper and Lower eyes from different chips.  Both
+        # squares belong to the one chip that sets the wafer cell-RSNM.
+        square_specs = [("Upper" if item.get("state_key") == "upper_left" else "Lower",
+                         worst["chip_id"], item)
+                        for item in worst["read"]["read_butterfly"].get("squares", [])]
     else:
         square = worst["write"].get("write_square")
         square_specs = [("WSNM", worst["chip_id"], square)] if square else []
@@ -4299,13 +4298,15 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str]) ->
             raise RuntimeError("Could not render multi-chip VTC overlay")
         renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
     export_rows = [{"lot_wafer": analysis["lot_wafer"], "chip_id": row["chip_id"],
-                    "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"], "wsnm_mv": row["wsnm_mv"],
+                    "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
+                    "upper_rsnm_mv": row["upper_rsnm_mv"], "lower_rsnm_mv": row["lower_rsnm_mv"],
+                    "wsnm_mv": row["wsnm_mv"],
                     "is_worst_rsnm": row["chip_id"] == analysis["worst_rsnm"]["chip_id"],
                     "is_worst_wsnm": row["chip_id"] == analysis["worst_wsnm"]["chip_id"]}
                    for row in analysis["rows"]]
     with open(out / "multi_chip_snm_summary.csv", "w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(export_rows[0])); writer.writeheader(); writer.writerows(export_rows)
-    body = "".join(f'<tr><td>{html.escape(row["chip_id"])}</td><td>{row["rsnm_mv"]:.2f}</td><td>{row["wsnm_mv"]:.2f}</td></tr>' for row in analysis["rows"])
+    body = "".join(f'<tr><td>{html.escape(row["chip_id"])}</td><td>{row["upper_rsnm_mv"]:.2f}</td><td>{row["lower_rsnm_mv"]:.2f}</td><td>{row["rsnm_mv"]:.2f}</td><td>{row["wsnm_mv"]:.2f}</td></tr>' for row in analysis["rows"])
     report = out / "multi_chip_wafer_report.html"
     report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Multi-Chip Wafer Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}</style></head><body><main><h1>HV28 SRAM Multi-Chip Wafer Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD={analysis["vdd_v"]:.3f} V</p><section><h2>Conservative wafer reference</h2><p><b>Minimum RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Read VTC / Mirror VTC</h2><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-chip margins</h2><table><tr><th>Chip ID</th><th>RSNM (mV)</th><th>WSNM (mV)</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
     return report
