@@ -12,7 +12,7 @@ from sram_wat_analyzer import (
     _read_wat_excel_rows, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve,
     analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
-    create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, open_output_directory,
+    create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
     read_iv_curve_excel, read_multi_chip_6t_excel, read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_mismatch_boundary_outputs,
@@ -555,6 +555,26 @@ class AnalyzerTests(unittest.TestCase):
             [WaferChipWat("SYNC", "CHIP_01", .90, cell)], cfg)["rows"][0]
         self.assertAlmostEqual(multi["rsnm_mv"], single["read_snm_mv"], places=9)
         self.assertAlmostEqual(multi["wsnm_mv"], single["write_snm_mv"], places=9)
+
+    def test_multi_chip_read_chart_uses_independent_upper_and_lower_limits(self):
+        """The chart must label each wafer state minimum, not reuse one cell's two squares."""
+        cfg = Config(nominal_vdd=.90, wat_vdd=.90)
+        pu, pg, pd = MosWat(.385, 44.0), MosWat(.365, 82.0), MosWat(.355, 124.0)
+        cell = SixTWatCell("SYNC", pu, pu, pg, pg, pd, pd)
+        chips = [WaferChipWat("SYNC", "CHIP_A", .90, cell),
+                 WaferChipWat("SYNC", "CHIP_B", .90, cell)]
+        analysis = analyze_multi_chip_wafer(chips, cfg)
+        # Deliberately select different rows to verify that the SVG uses the
+        # state-specific references rather than the cell-RSNM winner twice.
+        upper, lower = analysis["rows"]
+        analysis["worst_rsnm_upper"] = upper
+        analysis["worst_rsnm_lower"] = lower
+        analysis["worst_rsnm"] = lower
+        svg = multi_chip_vtc_svg(analysis, "read")
+        self.assertIn(f'Upper minimum {upper["upper_rsnm_mv"]:.1f} mV', svg)
+        self.assertIn(f'Lower minimum {lower["lower_rsnm_mv"]:.1f} mV', svg)
+        self.assertIn(">CHIP_A</text>", svg)
+        self.assertIn(">CHIP_B</text>", svg)
 
     def test_rsnm_vdd_row_matches_main_symmetric_6t_analysis(self):
         """The curve and primary report must share one RSNM calculation path."""

@@ -4232,7 +4232,7 @@ def _legacy_write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path
 
 
 def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int = 780) -> str:
-    """Overlay all chip VTC pairs and highlight the chip with the minimum margin."""
+    """Overlay wafer VTCs and show the correct state-specific limiting margins."""
     if mode not in {"read", "write"}:
         raise ValueError("mode must be read or write")
     vdd, axis = analysis["vdd_v"], SNM_PLOT_AXIS_MAX_V
@@ -4241,6 +4241,8 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int
     left, top, plot_w, plot_h = 150, 165, 560, 560
     worst = analysis["worst_rsnm"] if mode == "read" else analysis["worst_wsnm"]
     metric = "RSNM" if mode == "read" else "WSNM"
+    upper_worst = analysis.get("worst_rsnm_upper") if mode == "read" else None
+    lower_worst = analysis.get("worst_rsnm_lower") if mode == "read" else None
     def xy(x: float, y: float) -> tuple[float, float]:
         return left + x / axis * plot_w, top + (1 - y / axis) * plot_h
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Arial,sans-serif">',
@@ -4249,7 +4251,7 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int
              f'<text x="54" y="87" fill="#6E6E73" font-size="17">{html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD = {vdd:.3f} V</text>',
              '<path d="M54 108 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="114" fill="#3A3A3C" font-size="15">All chip direct VTC</text>',
              '<path d="M280 108 h34" stroke="#AF52DE" stroke-width="4" stroke-dasharray="9 6"/><text x="324" y="114" fill="#3A3A3C" font-size="15">All chip mirrored / paired VTC</text>',
-             '<path d="M690 108 h34" stroke="#FF3B30" stroke-width="5"/><text x="734" y="114" fill="#3A3A3C" font-size="15">Minimum-margin chip</text>']
+             '<path d="M690 108 h34" stroke="#FF9500" stroke-width="5"/><text x="734" y="114" fill="#3A3A3C" font-size="15">State-limit chip VTC pair</text>']
     for voltage in (0, .3, .6, .9, 1.2):
         x, y = xy(voltage, voltage)
         parts += [f'<path d="M{x:.1f} {top} V{top+plot_h} M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA"/>',
@@ -4260,22 +4262,38 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int
             direct, mirrored = _read_vtc_pair(row["read"])
         else:
             direct, mirrored = row["write"]["write_1"]["curve"], row["write"]["write_0"]["curve"]
-        is_worst = row["chip_id"] == worst["chip_id"]
-        width_px, opacity = (4.5, 1.0) if is_worst else (1.3, .18)
+        if mode == "read":
+            # Upper and lower wafer minima can belong to different chips.
+            # Highlight both complete VTC pairs so each drawn square remains
+            # associated with physically valid curves from the same chip.
+            is_upper_limit = row["chip_id"] == upper_worst["chip_id"]
+            is_lower_limit = row["chip_id"] == lower_worst["chip_id"]
+            is_limit = is_upper_limit or is_lower_limit
+        else:
+            is_upper_limit = is_lower_limit = False
+            is_limit = row["chip_id"] == worst["chip_id"]
+        width_px, opacity = (4.5, 1.0) if is_limit else (1.3, .18)
         direct_points = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in direct)
         mirror_points = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in mirrored)
-        color = "#FF3B30" if is_worst else "#007AFF"
-        paired_color = "#C21FD4" if not is_worst else "#FF9500"
+        color = ("#FF9500" if is_upper_limit and not is_lower_limit else
+                 "#FF3B30" if is_limit else "#007AFF")
+        paired_color = "#AF52DE" if is_limit else "#C21FD4"
         parts += [f'<polyline points="{direct_points}" fill="none" stroke="{color}" stroke-width="{width_px}" opacity="{opacity}"/>',
                   f'<polyline points="{mirror_points}" fill="none" stroke="{paired_color}" stroke-width="{width_px}" opacity="{opacity}" stroke-dasharray="9 6"/>']
-    # Keep the wafer overlay readable: draw only the single limiting square
-    # belonging to the chip that sets the wafer-level reference value.
     if mode == "read":
-        # Never combine Upper and Lower eyes from different chips.  Both
-        # squares belong to the one chip that sets the wafer cell-RSNM.
-        square_specs = [("Upper" if item.get("state_key") == "upper_left" else "Lower",
-                         worst["chip_id"], item)
-                        for item in worst["read"]["read_butterfly"].get("squares", [])]
+        # Wafer Upper and Lower minima are reported independently.  Each
+        # square is always selected from the matching VTC pair of its own
+        # chip; we never combine a direct curve from one chip with a mirrored
+        # curve from another chip to form a fictitious butterfly.
+        def state_square(row: dict, state_key: str) -> dict | None:
+            return next((item for item in row["read"]["read_butterfly"].get("squares", [])
+                         if item.get("state_key") == state_key), None)
+        upper_square = state_square(upper_worst, "upper_left")
+        lower_square = state_square(lower_worst, "lower_right")
+        square_specs = [
+            ("Upper minimum", upper_worst["chip_id"], upper_square),
+            ("Lower minimum", lower_worst["chip_id"], lower_square),
+        ]
     else:
         square = worst["write"].get("write_square")
         square_specs = [("WSNM", worst["chip_id"], square)] if square else []
@@ -4289,10 +4307,15 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int
                   f'<text x="{x+side_x/2:.1f}" y="{y_top+side_y/2+6:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{state_label} {side*1000:.1f} mV</text>',
                   f'<text x="{x+side_x/2:.1f}" y="{y_top+side_y/2+28:.1f}" text-anchor="middle" fill="#3A3A3C" font-size="12">{html.escape(chip_id)}</text>']
     value = worst["rsnm_mv"] if mode == "read" else worst["wsnm_mv"]
+    state_summary = ([
+        f'<text x="1085" y="{top+118}" fill="#FF9500" font-size="16">Upper min: {upper_worst["upper_rsnm_mv"]:.1f} mV · {html.escape(upper_worst["chip_id"])}</text>',
+        f'<text x="1085" y="{top+146}" fill="#FF3B30" font-size="16">Lower min: {lower_worst["lower_rsnm_mv"]:.1f} mV · {html.escape(lower_worst["chip_id"])}</text>',
+    ] if mode == "read" else [])
     parts += [f'<text x="{left+plot_w/2:.1f}" y="{height-44}" text-anchor="middle" fill="#1D1D1F" font-size="20">Vin (V)</text>',
               f'<text x="43" y="{top+plot_h/2:.1f}" transform="rotate(-90 43 {top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="20">Vout (V)</text>',
               f'<text x="1085" y="{top+55}" fill="#FF3B30" font-size="20" font-weight="700">Worst {metric}</text>',
               f'<text x="1085" y="{top+86}" fill="#1D1D1F" font-size="18">{html.escape(worst["chip_id"])}: {value:.1f} mV</text>',
+              *state_summary,
               '</svg>']
     return "".join(parts)
 
@@ -4318,13 +4341,15 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str]) ->
                     "upper_rsnm_mv": row["upper_rsnm_mv"], "lower_rsnm_mv": row["lower_rsnm_mv"],
                     "wsnm_mv": row["wsnm_mv"],
                     "is_worst_rsnm": row["chip_id"] == analysis["worst_rsnm"]["chip_id"],
+                    "is_worst_rsnm_upper": row["chip_id"] == analysis["worst_rsnm_upper"]["chip_id"],
+                    "is_worst_rsnm_lower": row["chip_id"] == analysis["worst_rsnm_lower"]["chip_id"],
                     "is_worst_wsnm": row["chip_id"] == analysis["worst_wsnm"]["chip_id"]}
                    for row in analysis["rows"]]
     with open(out / "multi_chip_snm_summary.csv", "w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(export_rows[0])); writer.writeheader(); writer.writerows(export_rows)
     body = "".join(f'<tr><td>{html.escape(row["chip_id"])}</td><td>{row["upper_rsnm_mv"]:.2f}</td><td>{row["lower_rsnm_mv"]:.2f}</td><td>{row["rsnm_mv"]:.2f}</td><td>{row["wsnm_mv"]:.2f}</td></tr>' for row in analysis["rows"])
     report = out / "multi_chip_wafer_report.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Multi-Chip Wafer Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}</style></head><body><main><h1>HV28 SRAM Multi-Chip Wafer Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD={analysis["vdd_v"]:.3f} V</p><section><h2>Conservative wafer reference</h2><p><b>Minimum RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Read VTC / Mirror VTC</h2><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-chip margins</h2><table><tr><th>Chip ID</th><th>RSNM (mV)</th><th>WSNM (mV)</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Multi-Chip Wafer Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}</style></head><body><main><h1>HV28 SRAM Multi-Chip Wafer Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD={analysis["vdd_v"]:.3f} V</p><section><h2>Conservative wafer reference</h2><p><b>Minimum cell RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum Upper state RSNM:</b> {analysis["worst_rsnm_upper"]["upper_rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm_upper"]["chip_id"])})<br><b>Minimum Lower state RSNM:</b> {analysis["worst_rsnm_lower"]["lower_rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm_lower"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Read VTC / Mirror VTC</h2><p>Upper and Lower squares are each taken from their own state-limiting chip. Their direct/mirrored VTC pair is highlighted together; the two states are not combined into one artificial chip.</p><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-chip margins</h2><table><tr><th>Chip ID</th><th>RSNM (mV)</th><th>WSNM (mV)</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
     return report
 
 
