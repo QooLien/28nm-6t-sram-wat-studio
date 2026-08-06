@@ -4231,14 +4231,17 @@ def _legacy_write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path
     return report
 
 
-def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int = 780) -> str:
+def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int = 735) -> str:
     """Overlay wafer VTCs and show the correct state-specific limiting margins."""
     if mode not in {"read", "write"}:
         raise ValueError("mode must be read or write")
     vdd, axis = analysis["vdd_v"], SNM_PLOT_AXIS_MAX_V
     # Equal physical X/Y scale is required so every electrical square is
     # rendered as a square, not a visually misleading rectangle.
-    left, top, plot_w, plot_h = 150, 165, 560, 560
+    # Deliberately compact square plot.  The right-hand information card has
+    # a fixed safe width, so long chip IDs never extend beyond the SVG canvas.
+    left, top, plot_w, plot_h = 150, 185, 430, 430
+    card_x, card_y, card_w = 650, 190, 470
     worst = analysis["worst_rsnm"] if mode == "read" else analysis["worst_wsnm"]
     metric = "RSNM" if mode == "read" else "WSNM"
     upper_worst = analysis.get("worst_rsnm_upper") if mode == "read" else None
@@ -4247,16 +4250,17 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int
         return left + x / axis * plot_w, top + (1 - y / axis) * plot_h
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Arial,sans-serif">',
              '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-             f'<text x="54" y="55" fill="#1D1D1F" font-size="33" font-weight="700">Wafer Multi-Chip {metric} VTC Overlay</text>',
-             f'<text x="54" y="87" fill="#6E6E73" font-size="17">{html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD = {vdd:.3f} V</text>',
-             '<path d="M54 108 h34" stroke="#007AFF" stroke-width="4"/><text x="98" y="114" fill="#3A3A3C" font-size="15">All chip direct VTC</text>',
-             '<path d="M280 108 h34" stroke="#AF52DE" stroke-width="4" stroke-dasharray="9 6"/><text x="324" y="114" fill="#3A3A3C" font-size="15">All chip mirrored / paired VTC</text>',
-             '<path d="M690 108 h34" stroke="#FF9500" stroke-width="5"/><text x="734" y="114" fill="#3A3A3C" font-size="15">State-limit chip VTC pair</text>']
+             f'<text x="54" y="55" fill="#1D1D1F" font-size="31" font-weight="700">Wafer Multi-Chip {metric} VTC Overlay</text>',
+             f'<text x="54" y="84" fill="#6E6E73" font-size="16">{html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD = {vdd:.3f} V</text>',
+             '<path d="M54 112 h30" stroke="#007AFF" stroke-width="4"/><text x="94" y="117" fill="#3A3A3C" font-size="14">All chip direct VTC</text>',
+             '<path d="M265 112 h30" stroke="#AF52DE" stroke-width="4" stroke-dasharray="9 6"/><text x="305" y="117" fill="#3A3A3C" font-size="14">All chip mirrored / paired VTC</text>',
+             '<path d="M535 112 h30" stroke="#FF9500" stroke-width="5"/><text x="575" y="117" fill="#3A3A3C" font-size="14">State-limit chip VTC pair</text>',
+             f'<rect x="{card_x}" y="{card_y}" width="{card_w}" height="220" rx="16" fill="#F5F5F7" stroke="#E5E5EA"/>']
     for voltage in (0, .3, .6, .9, 1.2):
         x, y = xy(voltage, voltage)
         parts += [f'<path d="M{x:.1f} {top} V{top+plot_h} M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA"/>',
-                  f'<text x="{x:.1f}" y="{top+plot_h+27}" text-anchor="middle" fill="#6E6E73" font-size="15">{voltage:.2f}</text>',
-                  f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="15">{voltage:.2f}</text>']
+                  f'<text x="{x:.1f}" y="{top+plot_h+28}" text-anchor="middle" fill="#6E6E73" font-size="14">{voltage:.2f}</text>',
+                  f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="14">{voltage:.2f}</text>']
     for row in analysis["rows"]:
         if mode == "read":
             direct, mirrored = _read_vtc_pair(row["read"])
@@ -4307,15 +4311,23 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1280, height: int
                   f'<text x="{x+side_x/2:.1f}" y="{y_top+side_y/2+6:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{state_label} {side*1000:.1f} mV</text>',
                   f'<text x="{x+side_x/2:.1f}" y="{y_top+side_y/2+28:.1f}" text-anchor="middle" fill="#3A3A3C" font-size="12">{html.escape(chip_id)}</text>']
     value = worst["rsnm_mv"] if mode == "read" else worst["wsnm_mv"]
-    state_summary = ([
-        f'<text x="1085" y="{top+118}" fill="#FF9500" font-size="16">Upper min: {upper_worst["upper_rsnm_mv"]:.1f} mV · {html.escape(upper_worst["chip_id"])}</text>',
-        f'<text x="1085" y="{top+146}" fill="#FF3B30" font-size="16">Lower min: {lower_worst["lower_rsnm_mv"]:.1f} mV · {html.escape(lower_worst["chip_id"])}</text>',
-    ] if mode == "read" else [])
-    parts += [f'<text x="{left+plot_w/2:.1f}" y="{height-44}" text-anchor="middle" fill="#1D1D1F" font-size="20">Vin (V)</text>',
-              f'<text x="43" y="{top+plot_h/2:.1f}" transform="rotate(-90 43 {top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="20">Vout (V)</text>',
-              f'<text x="1085" y="{top+55}" fill="#FF3B30" font-size="20" font-weight="700">Worst {metric}</text>',
-              f'<text x="1085" y="{top+86}" fill="#1D1D1F" font-size="18">{html.escape(worst["chip_id"])}: {value:.1f} mV</text>',
-              *state_summary,
+    if mode == "read":
+        summary_rows = [
+            ("Cell minimum", f'{value:.1f} mV · {worst["chip_id"]}', "#FF3B30"),
+            ("Upper minimum", f'{upper_worst["upper_rsnm_mv"]:.1f} mV · {upper_worst["chip_id"]}', "#FF9500"),
+            ("Lower minimum", f'{lower_worst["lower_rsnm_mv"]:.1f} mV · {lower_worst["chip_id"]}', "#FF3B30"),
+        ]
+    else:
+        summary_rows = [("Wafer WSNM", f'{value:.1f} mV · {worst["chip_id"]}', "#FF9500")]
+    card_text = [f'<text x="{card_x+24}" y="{card_y+36}" fill="#1D1D1F" font-size="20" font-weight="700">Wafer margin summary</text>']
+    for index, (label, detail, color) in enumerate(summary_rows):
+        y = card_y + 75 + index * 43
+        card_text += [f'<circle cx="{card_x+30}" cy="{y-5}" r="5" fill="{color}"/>',
+                      f'<text x="{card_x+45}" y="{y}" fill="#3A3A3C" font-size="15">{label}</text>',
+                      f'<text x="{card_x+45}" y="{y+20}" fill="#1D1D1F" font-size="16" font-weight="700">{html.escape(detail)}</text>']
+    parts += [f'<text x="{left+plot_w/2:.1f}" y="{top+plot_h+82}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
+              f'<text x="70" y="{top+plot_h/2:.1f}" transform="rotate(-90 70 {top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>',
+              *card_text,
               '</svg>']
     return "".join(parts)
 
