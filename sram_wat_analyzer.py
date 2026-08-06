@@ -4308,8 +4308,7 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
         x, y_top = xy(x0, y0 + side)
         side_x, side_y = side / axis * plot_w, side / axis * plot_h
         parts += [f'<rect x="{x:.1f}" y="{y_top:.1f}" width="{side_x:.1f}" height="{side_y:.1f}" fill="#EFFAF2" fill-opacity="0.75" stroke="#34C759" stroke-width="4"/>',
-                  f'<text x="{x+side_x/2:.1f}" y="{y_top+side_y/2+6:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{state_label} {side*1000:.1f} mV</text>',
-                  f'<text x="{x+side_x/2:.1f}" y="{y_top+side_y/2+28:.1f}" text-anchor="middle" fill="#3A3A3C" font-size="12">{html.escape(chip_id)}</text>']
+        ]
     value = worst["rsnm_mv"] if mode == "read" else worst["wsnm_mv"]
     if mode == "read":
         summary_rows = [

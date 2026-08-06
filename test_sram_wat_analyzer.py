@@ -557,7 +557,7 @@ class AnalyzerTests(unittest.TestCase):
         self.assertAlmostEqual(multi["wsnm_mv"], single["write_snm_mv"], places=9)
 
     def test_multi_chip_read_chart_uses_independent_upper_and_lower_limits(self):
-        """The chart must label each wafer state minimum, not reuse one cell's two squares."""
+        """The summary card must show each state limit; squares stay text-free."""
         cfg = Config(nominal_vdd=.90, wat_vdd=.90)
         pu, pg, pd = MosWat(.385, 44.0), MosWat(.365, 82.0), MosWat(.355, 124.0)
         cell = SixTWatCell("SYNC", pu, pu, pg, pg, pd, pd)
@@ -571,10 +571,11 @@ class AnalyzerTests(unittest.TestCase):
         analysis["worst_rsnm_lower"] = lower
         analysis["worst_rsnm"] = lower
         svg = multi_chip_vtc_svg(analysis, "read")
-        self.assertIn(f'Upper minimum {upper["upper_rsnm_mv"]:.1f} mV', svg)
-        self.assertIn(f'Lower minimum {lower["lower_rsnm_mv"]:.1f} mV', svg)
-        self.assertIn(">CHIP_A</text>", svg)
-        self.assertIn(">CHIP_B</text>", svg)
+        self.assertIn(">Upper minimum</text>", svg)
+        self.assertIn(">Lower minimum</text>", svg)
+        self.assertIn(f'>{upper["upper_rsnm_mv"]:.1f} mV · CHIP_A</text>', svg)
+        self.assertIn(f'>{lower["lower_rsnm_mv"]:.1f} mV · CHIP_B</text>', svg)
+        self.assertNotIn("Upper minimum 204.0 mV", svg)
 
     def test_rsnm_vdd_row_matches_main_symmetric_6t_analysis(self):
         """The curve and primary report must share one RSNM calculation path."""
