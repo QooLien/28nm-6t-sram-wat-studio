@@ -1,3 +1,7 @@
 reportlab>=4.0,<5
-svglib>=1.5,<2
+# Binary PNG backend used by ReportLab on clean Windows and Apple Silicon Macs.
+rl-renderPM>=4.0,<5
+# 1.6+ pulls in Cairo build dependencies that are not available on a clean
+# Windows or macOS Python installation.
+svglib>=1.5,<1.6
 openpyxl>=3.1,<4

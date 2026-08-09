@@ -18,9 +18,59 @@ Hold SNM and Vmin comparison are not included in the active report.
 
 ## Run
 
-On Windows, double-click `open_sram_wat_analyzer.cmd`. The launcher checks Python, Tkinter, Excel and chart dependencies, then calls `install_dependencies.cmd` when packages are missing.
+The Python analysis code and project files are shared by Windows and macOS. Each
+device keeps its own local Python environment, which is intentionally ignored by
+Git.
+
+### Windows
+
+Double-click `open_sram_wat_analyzer.cmd`. The launcher checks Python, Tkinter,
+Excel and chart dependencies, then calls `install_dependencies.cmd` when
+packages are missing. Existing Windows and intranet/offline behavior is
+preserved.
 
 For a company intranet/offline PC, follow [INTRANET_PC_SETUP.md](INTRANET_PC_SETUP.md). Use `prepare_offline_packages.cmd` on an internet-connected Windows PC with the same Python version, copy the generated `wheelhouse` with the project, then run `install_dependencies.cmd` on the intranet PC.
+
+### macOS
+
+Double-click `open_sram_wat_analyzer.command`. On its first run, the launcher:
+
+1. Checks that Python 3 and Tkinter are available.
+2. Creates a local `.venv` environment.
+3. Installs the report export packages from `requirements.txt`.
+4. Opens the same analyzer GUI used on Windows.
+
+If Finder does not allow the launcher to open after downloading the project as a
+ZIP, run this command once from Terminal:
+
+```bash
+chmod +x open_sram_wat_analyzer.command
+```
+
+Cloning the project with Git preserves the executable setting automatically.
+
+### Working on more than one device
+
+Use GitHub as the shared source of truth. Before starting work on either device:
+
+```bash
+git pull --ff-only
+```
+
+After making and testing a change:
+
+```bash
+git status
+git add <changed-files>
+git commit -m "Describe the change"
+git push
+```
+
+Generated `output/` folders and each device's `.venv` remain local and are not
+synchronized. Commit input CSV files only when they are safe and intended to be
+shared.
+
+### Analysis steps
 
 1. Enter the six independent PUL / PUR / PGL / PGR / PDL / PDR WAT Vt and Idsat values.
 2. Enter the corresponding PU / PG / PD WAT Target values.

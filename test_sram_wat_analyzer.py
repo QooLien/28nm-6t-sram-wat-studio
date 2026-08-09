@@ -53,7 +53,7 @@ class AnalyzerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "new output"
             with mock.patch("sram_wat_analyzer.sys.platform", "win32"), \
-                    mock.patch("sram_wat_analyzer.os.startfile") as startfile:
+                    mock.patch("sram_wat_analyzer.os.startfile", create=True) as startfile:
                 opened = open_output_directory(target)
             self.assertEqual(opened, target.resolve())
             self.assertTrue(target.is_dir())
