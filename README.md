@@ -18,9 +18,30 @@ Hold SNM and Vmin comparison are not included in the active report.
 
 ## Run
 
-On Windows, double-click `open_sram_wat_analyzer.cmd`. The launcher checks Python, Tkinter, Excel and chart dependencies, then calls `install_dependencies.cmd` when packages are missing.
+On Windows, double-click `launchers/windows/open_sram_wat_analyzer.cmd`. The launcher checks Python, Tkinter, Excel and chart dependencies, then calls `launchers/windows/install_dependencies.cmd` when packages are missing.
 
-For a company intranet/offline PC, follow [INTRANET_PC_SETUP.md](INTRANET_PC_SETUP.md). Use `prepare_offline_packages.cmd` on an internet-connected Windows PC with the same Python version, copy the generated `wheelhouse` with the project, then run `install_dependencies.cmd` on the intranet PC.
+For a company intranet/offline PC, follow [INTRANET_PC_SETUP.md](docs/INTRANET_PC_SETUP.md). Use `launchers/windows/prepare_offline_packages.cmd` on an internet-connected Windows PC with the same Python version, copy the generated `wheelhouse` with the project, then run `launchers/windows/install_dependencies.cmd` on the intranet PC.
+
+## Check and synchronize the GitHub version
+
+On an internet-connected Windows PC, double-click `launchers/windows/sync_project.cmd`. On macOS,
+double-click `launchers/macos/sync_project.command`. The tool fetches `origin/main`, displays the
+local and GitHub commit IDs, and reports whether the checkout is current. If an
+update is available, it asks before applying a fast-forward update.
+
+The synchronizer updates only when the current branch is `main`, tracked files
+have no uncommitted changes, and Git can perform a fast-forward. It never deletes
+or overwrites untracked local files. If the checkout has local commits, diverged
+history, or tracked edits, it stops and requests manual review. The company
+intranet/offline PC should continue to use a tested GitHub Release instead of
+this network synchronizer.
+
+Command-line alternatives:
+
+```bash
+python tools/sync_project.py --check
+python tools/sync_project.py --sync
+```
 
 1. Enter the six independent PUL / PUR / PGL / PGR / PDL / PDR WAT Vt and Idsat values.
 2. Enter the corresponding PU / PG / PD WAT Target values.
@@ -40,7 +61,7 @@ Each row's Idsat is treated as measured at that row's VDD. The program recalibra
 
 ### Raw IV-curve import
 
-The **RSNM vs VDD Curve** tab can also import raw `Id-Vg` data through **Import IV Curve...**. Use the included `HV28_IV_Curve_Raw_Data_Template.xlsx`, with `PU`, `PG` and `PD` worksheets. Each worksheet has one row per raw point: `Model VDD`, `Vg`, `Idsat` and optional `Vt`, with unit columns. For each Model VDD, the importer linearly interpolates the measured current at `Vg = Model VDD`; this is the compact-model `VGS = VDS = VDD` Idsat convention used for RSNM calibration. It does not use the final/rightmost plotted point unless that point is itself at `Vg = VDD`. If Vt is blank, the current 6T GUI family-average Vt is used. The Vg sweep must span every listed Model VDD.
+The **RSNM vs VDD Curve** tab can also import raw `Id-Vg` data through **Import IV Curve...**. Use the included `input/templates/HV28_IV_Curve_Raw_Data_Template.xlsx`, with `PU`, `PG` and `PD` worksheets. Each worksheet has one row per raw point: `Model VDD`, `Vg`, `Idsat` and optional `Vt`, with unit columns. For each Model VDD, the importer linearly interpolates the measured current at `Vg = Model VDD`; this is the compact-model `VGS = VDS = VDD` Idsat convention used for RSNM calibration. It does not use the final/rightmost plotted point unless that point is itself at `Vg = VDD`. If Vt is blank, the current 6T GUI family-average Vt is used. The Vg sweep must span every listed Model VDD.
 
 The **Write Trip Margin** tab reuses the same manual VDD / PU / PG / PD rows so Read and Write trends are based on identical WAT inputs. It calculates the maximum rise allowed on the nominally-low write bitline while PG can still overcome PU, then estimates the boundary between zero and positive write margin. The tab independently generates HTML, PNG, SVG, CSV and JSON results. This boundary is a compact-model reference and is not measured `Select_Write Vmin`.
 
@@ -50,7 +71,7 @@ The **RSNM Mismatch Boundary** tab sweeps PUL/PUR/PGL/PGR/PDL/PDR Vt and Isat on
 
 Use **Multi-Cell Template...** to create `HV28_6T_Wafer_MultiCell_Template.xlsx`. Each row in its `6T Multi-Cell` sheet represents one measured 6T cell/chip. The import needs only Lot/Wafer, Chip ID, and PUL/PUR/PGL/PGR/PDL/PDR `Vt` and `Idsat` columns; use V for Vt and µA for Idsat, with no unit columns. Select **Import Multi-Cell...** to analyze all rows. The common Model VDD is taken from the active GUI setting, ensuring all VTC axes are comparable. The report overlays every cell's Read direct/mirrored VTC and Write W=1/W=0 VTC, highlights the cell with the lowest margin, and reports the minimum RSNM and minimum WSNM as conservative wafer references.
 
-The same import automatically builds a synthetic per-device median cell, identifies the minimum RSNM cell and minimum Write Margin cell separately, then runs a one-factor 10% step screening from each worst cell toward the median. The HTML report lists the shortest PU/PG/PD Vt or Idsat moves that reach the median Read or Write target; detailed data is exported as `median_target_read_shmoo.csv` and `median_target_write_shmoo.csv`. Use `HV28_6T_MedianWorst_50Cell_Template.xlsx` when preparing a 50-cell data set for this workflow.
+The same import automatically builds a synthetic per-device median cell, identifies the minimum RSNM cell and minimum Write Margin cell separately, then runs a one-factor 10% step screening from each worst cell toward the median. The HTML report lists the shortest PU/PG/PD Vt or Idsat moves that reach the median Read or Write target; detailed data is exported as `median_target_read_shmoo.csv` and `median_target_write_shmoo.csv`. Use `input/templates/HV28_6T_MedianWorst_50Cell_Template.xlsx` when preparing a 50-cell data set for this workflow.
 
 ## Read SNM chart convention
 
@@ -186,12 +207,12 @@ The manual curve tab uses the same dated archive structure with the `rsnm_vdd_cu
 
 ## Formula guide
 
-The WAT Vt/Idsat conversion, Read SNM, analytical RSNM, and Write Margin Test equations are explained in Traditional Chinese in the [HV28 SRAM Analysis Formula Guide (PDF)](https://github.com/QooLien/28nm-6t-sram-wat-studio/releases/download/v1.5.0/HV28_SRAM_Analysis_Formula_Guide.pdf). The reproducible source is `generate_formula_guide_zh.py`.
+The WAT Vt/Idsat conversion, Read SNM, analytical RSNM, and Write Margin Test equations are explained in Traditional Chinese in the [HV28 SRAM Analysis Formula Guide (PDF)](https://github.com/QooLien/28nm-6t-sram-wat-studio/releases/download/v1.5.0/HV28_SRAM_Analysis_Formula_Guide.pdf). The reproducible source is `tools/generate_formula_guide_zh.py`.
 
 ## Presentation decks
 
-- `output/HV28_SRAM_Core_Formulas_Chinese_v6.pptx`: Traditional Chinese explanation with curve-matched Read SNM and Write SNM figures.
-- `output/HV28_SRAM_Core_Formulas_English_v5.pptx`: English version of the same presentation.
+- `output/reference/presentations/HV28_SRAM_Core_Formulas_Chinese_v5.pptx`: Traditional Chinese explanation with curve-matched Read SNM and Write SNM figures.
+- `output/reference/presentations/HV28_SRAM_Core_Formulas_English_v5.pptx`: English version of the same presentation.
 
 The W0/W1 Write-SNM figure uses blue/purple curves for Lot/Wafer VTC pairs, green maximum-square markers, and orange/red curves for the optional WAT Target reference.
 
@@ -206,11 +227,11 @@ TT,0.385,44,0.365,82,0.355,124
 
 The GUI can import an `.xlsx` workbook through **Import Excel…** and generate measured-WAT versus WAT-target Read-SNM butterfly panels, an SNM-versus-model-VDD chart, and an all-operating-voltage Vin/Vout overlay. The overlay uses color for operating VDD, solid lines for measured WAT, dashed lines for target, and 0.2 V axis increments. The command line also accepts an `.xlsx` path through `--input`.
 
-Start from `HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx`. It follows the manually organized nine-column format exactly: Lot/Wafer, Site, Model VDD, MOS, Vt, Vt Unit, Idsat, Idsat Unit and Notes. PU, PG and PD use separate worksheets; every physical MOS and Model VDD currently has S01-S12 records. If S13-S17 later become available, append them with the same columns and the loader will include them automatically. The distributed workbook deliberately uses plain formatted ranges with worksheet filters instead of Excel Table objects. This avoids the table-repair warning seen with some older or company-managed Excel installations while preserving sorting and filtering.
+Start from `input/templates/HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx`. It follows the manually organized nine-column format exactly: Lot/Wafer, Site, Model VDD, MOS, Vt, Vt Unit, Idsat, Idsat Unit and Notes. PU, PG and PD use separate worksheets; every physical MOS and Model VDD currently has S01-S12 records. If S13-S17 later become available, append them with the same columns and the loader will include them automatically. The distributed workbook deliberately uses plain formatted ranges with worksheet filters instead of Excel Table objects. This avoids the table-repair warning seen with some older or company-managed Excel installations while preserving sorting and filtering.
 
 ### Single-set 6T WAT Excel
 
-Use `HV28_6T_WAT_Single_Set_Template.xlsx` when only one Lot/Wafer and one operating VDD are needed. Its **6T WAT Input** worksheet contains one editable row for each physical MOS: PUL, PUR, PGL, PGR, PDL and PDR. Vt and Idsat have explicit unit columns and are normalized by the loader to V and uA.
+Use `input/templates/HV28_6T_WAT_Single_Set_Template.xlsx` when only one Lot/Wafer and one operating VDD are needed. Its **6T WAT Input** worksheet contains one editable row for each physical MOS: PUL, PUR, PGL, PGR, PDL and PDR. Vt and Idsat have explicit unit columns and are normalized by the loader to V and uA.
 
 In **6T Bitcell Analysis**:
 

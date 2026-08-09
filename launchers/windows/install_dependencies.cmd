@@ -1,6 +1,7 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0\..\.."
+set "PROJECT_ROOT=%CD%"
 
 set "PYTHON_CMD="
 where py >nul 2>&1
@@ -20,12 +21,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
-if exist "%~dp0wheelhouse\*.whl" (
+if exist "%PROJECT_ROOT%\wheelhouse\*.whl" (
   echo Installing from the local offline wheelhouse...
-  %PYTHON_CMD% -m pip install --no-index --find-links "%~dp0wheelhouse" -r "%~dp0requirements.txt"
+  %PYTHON_CMD% -m pip install --no-index --find-links "%PROJECT_ROOT%\wheelhouse" -r "%PROJECT_ROOT%\requirements.txt"
 ) else (
   echo No wheelhouse was found. Attempting installation from the configured Python package index...
-  %PYTHON_CMD% -m pip install -r "%~dp0requirements.txt"
+  %PYTHON_CMD% -m pip install -r "%PROJECT_ROOT%\requirements.txt"
 )
 if errorlevel 1 exit /b 1
 

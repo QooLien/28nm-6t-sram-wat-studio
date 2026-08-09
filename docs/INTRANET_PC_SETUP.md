@@ -12,8 +12,8 @@
 ## 方法 A：內網 PC 可以連公司 PyPI／Proxy
 
 1. 下載或解壓縮完整專案資料夾。
-2. 雙擊 `install_dependencies.cmd`。
-3. 安裝完成後雙擊 `open_sram_wat_analyzer.cmd`。
+2. 雙擊 `launchers/windows/install_dependencies.cmd`。
+3. 安裝完成後雙擊 `launchers/windows/open_sram_wat_analyzer.cmd`。
 
 安裝程式會使用公司已設定的 Python package index；若公司需要 Proxy，請由 IT 先設定 pip。
 
@@ -22,20 +22,20 @@
 在一台可上網、且 Python 版本與內網 PC 相同的 Windows PC：
 
 1. 下載完整專案。
-2. 雙擊 `prepare_offline_packages.cmd`。
+2. 雙擊 `launchers/windows/prepare_offline_packages.cmd`。
 3. 確認專案內產生 `wheelhouse` 資料夾及多個 `.whl` 檔。
 4. 將完整專案資料夾（必須包含 `wheelhouse`）複製到內網 PC。
 
 在內網 PC：
 
-1. 雙擊 `install_dependencies.cmd`。
+1. 雙擊 `launchers/windows/install_dependencies.cmd`。
 2. 安裝程式會自動使用：
 
    ```text
    pip install --no-index --find-links wheelhouse -r requirements.txt
    ```
 
-3. 出現 `HV28 SRAM dependencies verified` 後，雙擊 `open_sram_wat_analyzer.cmd`。
+3. 出現 `HV28 SRAM dependencies verified` 後，雙擊 `launchers/windows/open_sram_wat_analyzer.cmd`。
 
 ## 驗證安裝
 
@@ -50,8 +50,8 @@ py -3 -m unittest -q
 
 ## 公司電腦操作
 
-1. 雙擊 `open_sram_wat_analyzer.cmd`。
-2. 手動輸入六顆 MOS WAT，或使用 `Import Excel...` 選擇 `HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx` 格式的資料。
+1. 雙擊 `launchers/windows/open_sram_wat_analyzer.cmd`。
+2. 手動輸入六顆 MOS WAT，或使用 `Import Excel...` 選擇 `input/templates/HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx` 格式的資料。
 3. 填入 PU／PG／PD WAT Target 與 Model Settings。
 4. 選擇輸出資料夾。
 5. 執行一般分析或 `Analyze Excel VDD Sweep`。
@@ -65,11 +65,11 @@ py -3 -m unittest -q
 
 ### `No matching distribution found`
 
-通常是連網 PC 與內網 PC 的 Python 版本或 32／64-bit 架構不同。請使用與內網 PC 完全相同的 Python 重新執行 `prepare_offline_packages.cmd`。
+通常是連網 PC 與內網 PC 的 Python 版本或 32／64-bit 架構不同。請使用與內網 PC 完全相同的 Python 重新執行 `launchers/windows/prepare_offline_packages.cmd`。
 
 ### `No module named openpyxl`
 
-重新執行 `install_dependencies.cmd`，並確認 `requirements.txt` 與 `wheelhouse` 都在專案根目錄。
+重新執行 `launchers/windows/install_dependencies.cmd`，並確認 `requirements.txt` 與 `wheelhouse` 都在專案根目錄。
 
 ### Tkinter 無法使用
 

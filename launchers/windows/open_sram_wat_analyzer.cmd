@@ -1,6 +1,7 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0\..\.."
+set "PROJECT_ROOT=%CD%"
 
 set "PYTHON_CMD="
 where py >nul 2>&1
@@ -20,7 +21,7 @@ if not defined PYTHON_CMD (
 %PYTHON_CMD% -c "import tkinter, reportlab, svglib, rlPyCairo, openpyxl" >nul 2>&1
 if errorlevel 1 (
   echo Required Python packages are missing. Starting the dependency installer...
-  call "%~dp0install_dependencies.cmd"
+  call "%PROJECT_ROOT%\launchers\windows\install_dependencies.cmd"
   if errorlevel 1 (
     echo Dependency installation failed.
     echo For an intranet PC, copy the wheelhouse folder prepared on an internet-connected PC.
@@ -30,6 +31,6 @@ if errorlevel 1 (
   )
 )
 
-%PYTHON_CMD% "%~dp0sram_wat_analyzer.py"
+%PYTHON_CMD% "%PROJECT_ROOT%\sram_wat_analyzer.py"
 if errorlevel 1 pause
 endlocal

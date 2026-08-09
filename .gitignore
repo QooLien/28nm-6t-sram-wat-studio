@@ -4,7 +4,9 @@ __pycache__/
 .mypy_cache/
 
 # Generated analysis reports
-output/
+output/*
+!output/reference/
+!output/reference/**
 output_*/
 work/
 tmp/
