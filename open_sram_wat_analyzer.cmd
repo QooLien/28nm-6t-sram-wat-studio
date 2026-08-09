@@ -17,7 +17,7 @@ if not defined PYTHON_CMD (
   exit /b 1
 )
 
-%PYTHON_CMD% -c "import tkinter, reportlab, svglib, openpyxl" >nul 2>&1
+%PYTHON_CMD% -c "import tkinter, reportlab, svglib, openpyxl, _rl_renderPM" >nul 2>&1
 if errorlevel 1 (
   echo Required Python packages are missing. Starting the dependency installer...
   call "%~dp0install_dependencies.cmd"

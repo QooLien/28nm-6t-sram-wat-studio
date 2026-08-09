@@ -2913,7 +2913,7 @@ def write_rsnm_vcc_curve_outputs(analysis: dict, out_dir: str | os.PathLike[str]
     drawing = svg2rlg(str(svg_path))
     if drawing is None:
         raise RuntimeError("Could not render RSNM versus VDD chart")
-    renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
+    renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180)
 
     csv_fields = ["vcc_v", "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
                   "pd_vt_v", "pd_idsat_ua", "rsnm_mv", "valid_eye", "status", "reason"]
@@ -2989,7 +2989,7 @@ def write_write_trip_margin_outputs(analysis: dict,
     drawing = svg2rlg(str(svg_path))
     if drawing is None:
         raise RuntimeError("Could not render Write Trip Margin versus VDD chart")
-    renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
+    renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180)
 
     csv_fields = ["vdd_v", "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
                   "pd_vt_v", "pd_idsat_ua", "wtm_mv", "writable", "status"]
@@ -4002,7 +4002,7 @@ def _legacy_write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path
         drawing = svg2rlg(str(svg_path))
         if drawing is None:
             raise RuntimeError(f"Could not render chart image: {filename}")
-        renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
+        renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180)
         image_manifest.extend([
             {"filename": png_name, "format": "PNG", "role": "Primary image",
              "device": device, "description": description},
@@ -4346,7 +4346,7 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str]) ->
         drawing = svg2rlg(str(path))
         if drawing is None:
             raise RuntimeError("Could not render multi-chip VTC overlay")
-        renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
+        renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180)
     export_rows = [{"lot_wafer": analysis["lot_wafer"], "chip_id": row["chip_id"],
                     "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
                     "upper_rsnm_mv": row["upper_rsnm_mv"], "lower_rsnm_mv": row["lower_rsnm_mv"],
@@ -4405,21 +4405,20 @@ def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
     drawing = svg2rlg(str(svg_path))
     if drawing is None:
         raise RuntimeError("Could not render Read SNM target comparison")
-    renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
+    renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180)
     butterfly_svg_path = image_dir / butterfly_svg_name
     butterfly_svg_path.write_text(read_snm_butterfly_svg(result), encoding="utf-8")
     butterfly_drawing = svg2rlg(str(butterfly_svg_path))
     if butterfly_drawing is None:
         raise RuntimeError("Could not render Read SNM butterfly chart")
     renderPM.drawToFile(butterfly_drawing, str(image_dir / butterfly_png_name),
-                        fmt="PNG", dpi=180, backend="rlPyCairo")
+                        fmt="PNG", dpi=180)
     write_svg_path = image_dir / write_svg_name
     write_svg_path.write_text(write_wsnm_window_svg(result), encoding="utf-8")
     write_drawing = svg2rlg(str(write_svg_path))
     if write_drawing is None:
         raise RuntimeError("Could not render W0/W1 Write SNM analysis")
-    renderPM.drawToFile(write_drawing, str(image_dir / write_png_name), fmt="PNG", dpi=180,
-                        backend="rlPyCairo")
+    renderPM.drawToFile(write_drawing, str(image_dir / write_png_name), fmt="PNG", dpi=180)
 
     comparison_rows = result.get("snm_target_comparison", [])
     comparison_export_rows = [{
@@ -4666,7 +4665,7 @@ def write_excel_sweep_outputs(entries: list[dict], out_dir: str | os.PathLike[st
         drawing = svg2rlg(str(svg_path))
         if drawing is None:
             raise RuntimeError(f"Could not render {stem}")
-        renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
+        renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180)
         manifest_rows.extend([
             {"filename": png_path.name, "format": "PNG", "description": description},
             {"filename": svg_path.name, "format": "SVG", "description": description},
