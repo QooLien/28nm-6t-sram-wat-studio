@@ -29,7 +29,7 @@ if exist "%~dp0wheelhouse\*.whl" (
 )
 if errorlevel 1 exit /b 1
 
-%PYTHON_CMD% -c "import tkinter, reportlab, svglib, openpyxl; print('HV28 SRAM dependencies verified')"
+%PYTHON_CMD% -c "import tkinter, reportlab, svglib, rlPyCairo, openpyxl; print('HV28 SRAM dependencies verified')"
 if errorlevel 1 exit /b 1
 
 echo Installation completed successfully.

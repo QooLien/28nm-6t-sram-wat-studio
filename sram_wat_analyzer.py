@@ -957,6 +957,31 @@ class Sram6T:
         return None
 
 
+def educational_sram_metrics(wat: WatPoint, vdd: float) -> dict[str, float | list[tuple[float, float]]]:
+    """Return compact-model values for the interactive SRAM training tab.
+
+    This intentionally uses the same WAT-calibrated 6T model as the main
+    application.  It is a learning aid: the metrics show directional device
+    trade-offs, not a replacement for PDK/array sign-off.
+    """
+    if not math.isfinite(vdd) or vdd <= 0:
+        raise ValueError("Training VDD must be a positive finite value")
+    cfg = Config(wat_vdd=vdd, nominal_vdd=vdd, grid_points=401)
+    model = Sram6T(wat, cfg)
+    read_fit = model.butterfly_squares(vdd, "read", points=401)
+    ratios = model.strength_ratios()
+    return {
+        "beta_pu": model.pu.beta,
+        "beta_pg": model.pg.beta,
+        "beta_pd": model.pd.beta,
+        "cell_ratio": ratios["cell_ratio_beta"],
+        "pull_up_ratio": ratios["pull_up_ratio_beta"],
+        "read_snm_mv": float(read_fit.get("snm_mv") or 0.0),
+        "write_margin_mv": 1000.0 * model.write_snm(vdd),
+        "read_vtc": model.vtc(vdd, "read", points=81),
+    }
+
+
 class AsymmetricSram6T:
     """Cross-coupled Read-SNM model retaining all six independent WAT objects."""
 
@@ -1806,14 +1831,25 @@ def write_iv_curve_excel_template(path: str | os.PathLike[str]) -> Path:
 
 def read_multi_chip_6t_excel(path: str | os.PathLike[str],
                              default_model_vdd_v: float = .90) -> list[WaferChipWat]:
-    """Read a wide-form wafer/chip 6T workbook; one row represents one chip."""
+    """Read a unit-free wide-form wafer multi-cell 6T workbook.
+
+    One row represents one measured cell/chip.  The required electrical inputs
+    are PUL/PUR/PGL/PGR/PDL/PDR Vt and Idsat, expressed directly in V and uA.
+    Lot/Wafer and Chip ID remain metadata; Model VDD is optional and otherwise
+    uses the VDD selected in the GUI.
+    """
     try:
         from openpyxl import load_workbook
     except ImportError as exc:
         raise RuntimeError("Multi-chip Excel import requires openpyxl. Run: python -m pip install -r requirements.txt") from exc
     workbook = load_workbook(path, data_only=True, read_only=True)
     try:
-        sheet = workbook["6T Multi-Chip"] if "6T Multi-Chip" in workbook.sheetnames else workbook.active
+        if "6T Multi-Cell" in workbook.sheetnames:
+            sheet = workbook["6T Multi-Cell"]
+        elif "6T Multi-Chip" in workbook.sheetnames:  # compatibility with earlier templates
+            sheet = workbook["6T Multi-Chip"]
+        else:
+            sheet = workbook.active
         rows = list(sheet.iter_rows(values_only=True))
         if len(rows) < 2:
             raise ValueError("Multi-chip Excel needs a header and at least one chip row")
@@ -1866,7 +1902,7 @@ def read_multi_chip_6t_excel(path: str | os.PathLike[str],
 
 
 def write_multi_chip_6t_excel_template(path: str | os.PathLike[str], chip_count: int = 64) -> Path:
-    """Create an editable wide 6T wafer/chip template accepted by the batch import."""
+    """Create a simple unit-free 6T wafer multi-cell template accepted by batch import."""
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
@@ -1875,10 +1911,10 @@ def write_multi_chip_6t_excel_template(path: str | os.PathLike[str], chip_count:
         raise RuntimeError("Multi-chip template export requires openpyxl. Run: python -m pip install -r requirements.txt") from exc
     destination = Path(path).with_suffix(".xlsx")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    workbook = Workbook(); sheet = workbook.active; sheet.title = "6T Multi-Chip"
-    headers = ["Lot/Wafer", "Chip ID", "Model VDD", "VDD Unit"]
+    workbook = Workbook(); sheet = workbook.active; sheet.title = "6T Multi-Cell"
+    headers = ["Lot/Wafer", "Chip ID"]
     for name in ("PUL", "PUR", "PGL", "PGR", "PDL", "PDR"):
-        headers.extend([f"{name} Vt", f"{name} Vt Unit", f"{name} Idsat", f"{name} Idsat Unit"])
+        headers.extend([f"{name} Vt", f"{name} Idsat"])
     sheet.append(headers)
     for cell in sheet[1]:
         cell.fill = PatternFill("solid", fgColor="0B6EF3")
@@ -1886,16 +1922,16 @@ def write_multi_chip_6t_excel_template(path: str | os.PathLike[str], chip_count:
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
     defaults = {"PU": (.385, 44.0), "PG": (.365, 82.0), "PD": (.355, 124.0)}
     for index in range(1, max(1, int(chip_count)) + 1):
-        row = ["DEMO28_TT_W01", f"CHIP_{index:02d}", .90, "V"]
+        row = ["DEMO28_TT_W01", f"CHIP_{index:02d}"]
         for name in ("PUL", "PUR", "PGL", "PGR", "PDL", "PDR"):
             vt, ids = defaults[name[:2]]
-            row.extend([vt, "V", ids, "uA"])
+            row.extend([vt, ids])
         sheet.append(row)
     for column in range(1, len(headers) + 1):
         sheet.column_dimensions[get_column_letter(column)].width = 14
     sheet.freeze_panes = "A2"; sheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{sheet.max_row}"
     info = workbook.create_sheet("Instructions")
-    info.append(["One row = one physical 6T chip. The batch report overlays all chip VTC/mirror VTC curves and reports the minimum RSNM and WSNM as the wafer reference."])
+    info.append(["One row = one measured 6T cell/chip. Fill Vt in V and Idsat in uA; no unit columns or per-row VDD are required. The import uses the Model VDD currently selected in the GUI. The batch report overlays all cell VTC/mirror VTC curves and reports the minimum RSNM and WSNM as wafer references."])
     info.column_dimensions["A"].width = 140
     workbook.save(destination)
     return destination
@@ -2331,6 +2367,101 @@ def analyze_six_mos(cell: SixTWatCell, cfg: Config,
     return result
 
 
+def _multi_cell_metrics(cell: SixTWatCell, cfg: Config, vdd: float,
+                        fit_points: int) -> dict[str, object]:
+    """Evaluate one independent 6T cell for the wafer multi-cell flow."""
+    model = AsymmetricSram6T(cell, cfg)
+    read = model.read_butterfly(vdd, fit_points)
+    write = write_wsnm_states(vdd, model.left, model.right, cfg, fit_points)
+    side_ratios = (model.left.strength_ratios(), model.right.strength_ratios())
+    # This is the compact write-trip/bitline-tolerance proxy, deliberately
+    # reported separately from geometrical WSNM.
+    write_margin_mv = 1000.0 * min(model.left.write_snm(vdd), model.right.write_snm(vdd))
+    return {
+        "cell": cell,
+        "read": read,
+        "rsnm_mv": read["read_butterfly"].get("snm_mv"),
+        "upper_rsnm_mv": read["read_butterfly"].get("snm_upper_left_mv"),
+        "lower_rsnm_mv": read["read_butterfly"].get("snm_lower_right_mv"),
+        "write": write,
+        "wsnm_mv": write.get("snm_mv"),
+        "write_margin_mv": write_margin_mv,
+        "cell_ratio_beta": min(item["cell_ratio_beta"] for item in side_ratios),
+        "pull_up_ratio_beta": min(item["pull_up_ratio_beta"] for item in side_ratios),
+    }
+
+
+def _median_multi_cell(chips: list[WaferChipWat]) -> SixTWatCell:
+    """Build a synthetic median 6T cell from every physical MOS parameter."""
+    def median_mos(name: str) -> MosWat:
+        return MosWat(
+            statlib.median(getattr(item.cell, name).vt for item in chips),
+            statlib.median(getattr(item.cell, name).ids for item in chips),
+        )
+    return SixTWatCell(
+        "MEDIAN_CELL", *(median_mos(name) for name in ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2")))
+
+
+def _move_family_toward_median(current: SixTWatCell, median: SixTWatCell,
+                               family: str, attribute: str, fraction: float) -> SixTWatCell:
+    """Move both sides of one PU/PG/PD family toward its physical-MOS median."""
+    if family not in {"pu", "pg", "pd"} or attribute not in {"vt", "ids"}:
+        raise ValueError("family must be PU/PG/PD and attribute must be Vt/Idsat")
+    updates: dict[str, MosWat] = {}
+    for name in (f"{family}1", f"{family}2"):
+        source, target = getattr(current, name), getattr(median, name)
+        updates[name] = replace(source, **{
+            attribute: getattr(source, attribute) + fraction * (getattr(target, attribute) - getattr(source, attribute))
+        })
+    return replace(current, **updates)
+
+
+def _median_target_shmoo(worst: dict[str, object], median: dict[str, object],
+                         cfg: Config, vdd: float, objective: str) -> dict[str, object]:
+    """One-factor 0..100% tuning sweep from one worst cell toward the median.
+
+    Each step shifts both devices of the selected PU/PG/PD family toward their
+    own physical-MOS median.  It is intentionally a screening shmoo, not a
+    simultaneous process correction or a PDK optimisation.
+    """
+    if objective not in {"rsnm_mv", "write_margin_mv"}:
+        raise ValueError("Unsupported median-target objective")
+    target = float(median[objective])
+    coarse_points = 151
+    rows: list[dict[str, object]] = []
+    recommendations: list[dict[str, object]] = []
+    for family in ("pu", "pg", "pd"):
+        for attribute in ("vt", "ids"):
+            family_rows = []
+            for percent in range(0, 101, 10):
+                cell = _move_family_toward_median(
+                    worst["cell"], median["cell"], family, attribute, percent / 100.0)
+                values = _multi_cell_metrics(cell, cfg, vdd, coarse_points)
+                row = {
+                    "family": family.upper(),
+                    "parameter": "Vt" if attribute == "vt" else "Idsat",
+                    "toward_median_pct": percent,
+                    "rsnm_mv": values["rsnm_mv"],
+                    "write_margin_mv": values["write_margin_mv"],
+                    "cell_ratio_beta": values["cell_ratio_beta"],
+                    "pull_up_ratio_beta": values["pull_up_ratio_beta"],
+                    "reaches_target": float(values[objective]) >= target,
+                }
+                rows.append(row); family_rows.append(row)
+            reached = next((row for row in family_rows if row["reaches_target"]), None)
+            if reached:
+                recommendations.append(reached)
+    recommendations.sort(key=lambda row: (int(row["toward_median_pct"]),
+                                           -float(row[objective])))
+    return {
+        "objective": objective,
+        "target_value_mv": target,
+        "rows": rows,
+        "recommendations": recommendations,
+        "method": "one-factor 10% step sweep toward physical-MOS medians",
+    }
+
+
 def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
                              fit_points: int | None = None) -> dict:
     """Evaluate all chip rows and retain every Read/Write VTC for wafer overlay."""
@@ -2346,27 +2477,30 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
                         grid_points=common_fit_points)
     rows = []
     for item in chips:
-        model = AsymmetricSram6T(item.cell, point_cfg)
-        read = model.read_butterfly(vdd, point_cfg.grid_points)
-        write = write_wsnm_states(vdd, model.left, model.right, point_cfg, point_cfg.grid_points)
-        rows.append({"chip_id": item.chip_id, "cell": item.cell, "read": read,
-                     "rsnm_mv": read["read_butterfly"].get("snm_mv"),
-                     "upper_rsnm_mv": read["read_butterfly"].get("snm_upper_left_mv"),
-                     "lower_rsnm_mv": read["read_butterfly"].get("snm_lower_right_mv"),
-                     "write": write, "wsnm_mv": write.get("snm_mv")})
+        rows.append({"chip_id": item.chip_id, **_multi_cell_metrics(
+            item.cell, point_cfg, vdd, point_cfg.grid_points)})
     valid_read = [row for row in rows if row["rsnm_mv"] is not None]
     valid_write = [row for row in rows if row["wsnm_mv"] is not None]
     if not valid_read or not valid_write:
         raise ValueError("No valid RSNM or WSNM value was produced from the imported chips")
     worst_read = min(valid_read, key=lambda row: row["rsnm_mv"])
     worst_write = min(valid_write, key=lambda row: row["wsnm_mv"])
+    worst_write_margin = min(rows, key=lambda row: row["write_margin_mv"])
     worst_upper = min((row for row in rows if row["upper_rsnm_mv"] is not None),
                       key=lambda row: row["upper_rsnm_mv"])
     worst_lower = min((row for row in rows if row["lower_rsnm_mv"] is not None),
                       key=lambda row: row["lower_rsnm_mv"])
+    median_cell = _median_multi_cell(chips)
+    median = {"chip_id": "MEDIAN_CELL", **_multi_cell_metrics(
+        median_cell, point_cfg, vdd, point_cfg.grid_points)}
     return {"lot_wafer": chips[0].lot_wafer, "vdd_v": vdd, "rows": rows,
             "worst_rsnm": worst_read, "worst_rsnm_upper": worst_upper,
             "worst_rsnm_lower": worst_lower, "worst_wsnm": worst_write,
+            "worst_write_margin": worst_write_margin, "median_cell": median,
+            "median_target_read_shmoo": _median_target_shmoo(
+                worst_read, median, point_cfg, vdd, "rsnm_mv"),
+            "median_target_write_shmoo": _median_target_shmoo(
+                worst_write_margin, median, point_cfg, vdd, "write_margin_mv"),
             "fit_points": point_cfg.grid_points}
 
 
@@ -4250,7 +4384,7 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
         return left + x / axis * plot_w, top + (1 - y / axis) * plot_h
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Arial,sans-serif">',
              '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-             f'<text x="54" y="55" fill="#1D1D1F" font-size="31" font-weight="700">Wafer Multi-Chip {metric} VTC Overlay</text>',
+             f'<text x="54" y="55" fill="#1D1D1F" font-size="31" font-weight="700">Wafer Multi-Cell {metric} VTC Overlay</text>',
              f'<text x="54" y="84" fill="#6E6E73" font-size="16">{html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD = {vdd:.3f} V</text>',
              '<path d="M54 112 h30" stroke="#007AFF" stroke-width="4"/><text x="94" y="117" fill="#3A3A3C" font-size="14">All chip direct VTC</text>',
              '<path d="M265 112 h30" stroke="#AF52DE" stroke-width="4" stroke-dasharray="9 6"/><text x="305" y="117" fill="#3A3A3C" font-size="14">All chip mirrored / paired VTC</text>',
@@ -4350,17 +4484,42 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str]) ->
     export_rows = [{"lot_wafer": analysis["lot_wafer"], "chip_id": row["chip_id"],
                     "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
                     "upper_rsnm_mv": row["upper_rsnm_mv"], "lower_rsnm_mv": row["lower_rsnm_mv"],
-                    "wsnm_mv": row["wsnm_mv"],
+                    "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
+                    "cell_ratio_beta": row["cell_ratio_beta"],
+                    "pull_up_ratio_beta": row["pull_up_ratio_beta"],
                     "is_worst_rsnm": row["chip_id"] == analysis["worst_rsnm"]["chip_id"],
                     "is_worst_rsnm_upper": row["chip_id"] == analysis["worst_rsnm_upper"]["chip_id"],
                     "is_worst_rsnm_lower": row["chip_id"] == analysis["worst_rsnm_lower"]["chip_id"],
-                    "is_worst_wsnm": row["chip_id"] == analysis["worst_wsnm"]["chip_id"]}
+                    "is_worst_wsnm": row["chip_id"] == analysis["worst_wsnm"]["chip_id"],
+                    "is_worst_write_margin": row["chip_id"] == analysis["worst_write_margin"]["chip_id"]}
                    for row in analysis["rows"]]
     with open(out / "multi_chip_snm_summary.csv", "w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(export_rows[0])); writer.writeheader(); writer.writerows(export_rows)
-    body = "".join(f'<tr><td>{html.escape(row["chip_id"])}</td><td>{row["upper_rsnm_mv"]:.2f}</td><td>{row["lower_rsnm_mv"]:.2f}</td><td>{row["rsnm_mv"]:.2f}</td><td>{row["wsnm_mv"]:.2f}</td></tr>' for row in analysis["rows"])
-    report = out / "multi_chip_wafer_report.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Multi-Chip Wafer Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}</style></head><body><main><h1>HV28 SRAM Multi-Chip Wafer Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} chips · Model VDD={analysis["vdd_v"]:.3f} V</p><section><h2>Conservative wafer reference</h2><p><b>Minimum cell RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum Upper state RSNM:</b> {analysis["worst_rsnm_upper"]["upper_rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm_upper"]["chip_id"])})<br><b>Minimum Lower state RSNM:</b> {analysis["worst_rsnm_lower"]["lower_rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm_lower"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Read VTC / Mirror VTC</h2><p>Upper and Lower squares are each taken from their own state-limiting chip. Their direct/mirrored VTC pair is highlighted together; the two states are not combined into one artificial chip.</p><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-chip margins</h2><table><tr><th>Chip ID</th><th>RSNM (mV)</th><th>WSNM (mV)</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
+    for name, shmoo in (("read", analysis["median_target_read_shmoo"]),
+                         ("write", analysis["median_target_write_shmoo"])):
+        with open(out / f"median_target_{name}_shmoo.csv", "w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(shmoo["rows"][0]))
+            writer.writeheader(); writer.writerows(shmoo["rows"])
+    body = "".join(
+        f'<tr><td>{html.escape(row["chip_id"])}</td><td>{row["upper_rsnm_mv"]:.2f}</td>'
+        f'<td>{row["lower_rsnm_mv"]:.2f}</td><td>{row["rsnm_mv"]:.2f}</td>'
+        f'<td>{row["write_margin_mv"]:.2f}</td><td>{row["cell_ratio_beta"]:.3f}</td>'
+        f'<td>{row["pull_up_ratio_beta"]:.3f}</td></tr>' for row in analysis["rows"])
+    median = analysis["median_cell"]
+
+    def recommendation_rows(shmoo: dict) -> str:
+        if not shmoo["recommendations"]:
+            return '<tr><td colspan="6">No one-factor 0–100% move toward the median reached this target.</td></tr>'
+        return "".join(
+            f'<tr><td>{row["family"]}</td><td>{row["parameter"]}</td><td>{row["toward_median_pct"]}%</td>'
+            f'<td>{row["rsnm_mv"]:.2f}</td><td>{row["write_margin_mv"]:.2f}</td>'
+            f'<td>CR={row["cell_ratio_beta"]:.3f}; PR={row["pull_up_ratio_beta"]:.3f}</td></tr>'
+            for row in shmoo["recommendations"][:4])
+
+    read_shmoo = analysis["median_target_read_shmoo"]
+    write_shmoo = analysis["median_target_write_shmoo"]
+    report = out / "multi_cell_wafer_report.html"
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Wafer Multi-Cell Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}.note{{color:#6e6e73}}.warn{{color:#c2410c;font-weight:bold}}</style></head><body><main><h1>HV28 SRAM Wafer Multi-Cell Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} measured cells · Model VDD={analysis["vdd_v"]:.3f} V</p><section><h2>Conservative wafer reference</h2><p><b>Minimum cell RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum Write Margin:</b> {analysis["worst_write_margin"]["write_margin_mv"]:.2f} mV ({html.escape(analysis["worst_write_margin"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Synthetic median reference cell</h2><p>The median cell is built from the per-device median Vt and Idsat values. It is a statistical reference and may not be a physically measured cell.</p><table><tr><th>RSNM</th><th>Write Margin</th><th>Cell Ratio (CR)</th><th>Pull-up Ratio (PR)</th></tr><tr><td>{median["rsnm_mv"]:.2f} mV</td><td>{median["write_margin_mv"]:.2f} mV</td><td>{median["cell_ratio_beta"]:.3f}</td><td>{median["pull_up_ratio_beta"]:.3f}</td></tr></table></section><section><h2>Worst-to-median adjustment screening</h2><p class="note">Each shmoo moves both devices of one family, one parameter at a time, from the worst cell toward its physical-MOS median in 10% steps. It is a direction-finding compact-model screening, not a simultaneous process correction.</p><h3>Read target: median RSNM = {read_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_rsnm"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(read_shmoo)}</table><h3>Write target: median Write Margin = {write_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_write_margin"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(write_shmoo)}</table><p class="note">Detailed sweep data: <code>median_target_read_shmoo.csv</code> and <code>median_target_write_shmoo.csv</code>.</p></section><section><h2>Read VTC / Mirror VTC</h2><p>Upper and Lower squares are each taken from their own state-limiting cell. Their direct/mirrored VTC pair is highlighted together; the two states are not combined into one artificial cell.</p><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-cell margins</h2><table><tr><th>Cell / Chip ID</th><th>Upper RSNM</th><th>Lower RSNM</th><th>RSNM</th><th>Write Margin</th><th>CR</th><th>PR</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
     return report
 
 
@@ -4999,10 +5158,139 @@ def launch_gui() -> None:
     curve_tab = ttk.Frame(notebook, style="Root.TFrame")
     write_margin_tab = ttk.Frame(notebook, style="Root.TFrame")
     mismatch_boundary_tab = ttk.Frame(notebook, style="Root.TFrame")
+    training_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
     notebook.add(curve_tab, text="RSNM vs VDD Curve")
     notebook.add(write_margin_tab, text="Write Trip Margin")
     notebook.add(mismatch_boundary_tab, text="RSNM Mismatch Boundary")
+    notebook.add(training_tab, text="SRAM Training Lab")
+
+    # Interactive educational view.  The controls intentionally use the same
+    # compact WAT-calibrated model as the main analysis, while making it clear
+    # that the displayed values are trends rather than sign-off specifications.
+    training_tab.columnconfigure(0, weight=4)
+    training_tab.columnconfigure(1, weight=6)
+    training_tab.rowconfigure(0, weight=1)
+    training_input_card = ttk.Frame(training_tab, style="Card.TFrame", padding=20)
+    training_output_card = ttk.Frame(training_tab, style="Card.TFrame", padding=20)
+    training_input_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+    training_output_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    ttk.Label(training_input_card, text="SRAM Training Lab", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(
+        training_input_card,
+        text="Move a Vt or Idsat slider to observe the 6T read/write trade-off. Values update immediately.",
+        style="Meta.TLabel", wraplength=390).pack(anchor="w", pady=(3, 16))
+
+    training_defaults = {
+        "vdd": 0.90, "pu_vt": 0.385, "pu_ids": 44.0,
+        "pg_vt": 0.365, "pg_ids": 82.0, "pd_vt": 0.355, "pd_ids": 124.0,
+    }
+    training_values = {
+        key: tk.DoubleVar(value=float(saved_text("training", key, default)))
+        for key, default in training_defaults.items()
+    }
+    training_display: dict[str, tk.StringVar] = {
+        key: tk.StringVar() for key in training_values
+    }
+
+    def training_slider(parent, label: str, key: str, low: float, high: float,
+                        resolution: float, unit: str, color: str) -> None:
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill="x", pady=4)
+        ttk.Label(row, text=label, style="Body.TLabel", width=12).pack(side="left")
+        value_label = tk.Label(row, textvariable=training_display[key], bg=CARD, fg=color,
+                               font=("Calibri", 10, "bold"), width=10, anchor="e")
+        value_label.pack(side="right")
+        tk.Scale(row, variable=training_values[key], from_=low, to=high,
+                 resolution=resolution, orient="horizontal", showvalue=False,
+                 length=190, highlightthickness=0, bd=0, bg=CARD, fg=TEXT,
+                 activebackground=color, troughcolor="#E5E5EA").pack(side="right", padx=(8, 4))
+
+    ttk.Label(training_input_card, text="Operating condition", style="Section.TLabel").pack(anchor="w")
+    training_slider(training_input_card, "Model VDD", "vdd", 0.50, 1.20, 0.01, "V", BLUE)
+    for device, title, color in (("pu", "PU / pull-up", RED), ("pg", "PG / access", GREEN),
+                                 ("pd", "PD / pull-down", BLUE)):
+        ttk.Label(training_input_card, text=title, style="Section.TLabel").pack(anchor="w", pady=(12, 0))
+        training_slider(training_input_card, "Vt", f"{device}_vt", 0.20, 0.55, 0.001, "V", color)
+        training_slider(training_input_card, "Idsat", f"{device}_ids", 5.0, 220.0, 1.0, "µA", color)
+
+    ttk.Label(
+        training_input_card,
+        text="Teaching model only: slider results show relative 6T trends. Use PDK simulation and measured WT for sign-off.",
+        style="Meta.TLabel", wraplength=390).pack(anchor="w", pady=(16, 0))
+
+    ttk.Label(training_output_card, text="Live 6T Trend", style="ChartTitle.TLabel").pack(anchor="w")
+    training_summary = tk.Label(training_output_card, bg=CARD, fg=SECONDARY,
+                                font=("Calibri", 10), anchor="w", justify="left")
+    training_summary.pack(anchor="w", pady=(2, 8))
+    training_canvas = tk.Canvas(training_output_card, bg=CARD, highlightthickness=0, height=460)
+    training_canvas.pack(fill="both", expand=True)
+
+    def draw_training_trend(*_args) -> None:
+        try:
+            data = educational_sram_metrics(
+                WatPoint("Training", training_values["pu_vt"].get(), training_values["pu_ids"].get(),
+                         training_values["pg_vt"].get(), training_values["pg_ids"].get(),
+                         training_values["pd_vt"].get(), training_values["pd_ids"].get()),
+                training_values["vdd"].get())
+        except Exception as exc:
+            training_summary.configure(text=f"Input error: {exc}", fg=RED)
+            return
+        for key, variable in training_values.items():
+            unit = "V" if key.endswith("vt") or key == "vdd" else "µA"
+            training_display[key].set(f"{variable.get():.3f} {unit}" if unit == "V" else f"{variable.get():.0f} {unit}")
+        training_summary.configure(
+            text=(f"CR = βPD / βPG = {data['cell_ratio']:.2f}    ·    "
+                  f"PR = βPG / βPU = {data['pull_up_ratio']:.2f}\n"
+                  "Higher CR generally helps read stability; higher PR generally helps write-0 ability."),
+            fg=SECONDARY)
+        canvas = training_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 620)
+        height = max(canvas.winfo_height(), 420)
+        canvas.create_text(28, 24, text="Effective WAT-calibrated drive β (relative)", anchor="w",
+                           fill=TEXT, font=("Calibri", 12, "bold"))
+        betas = [("PU", data["beta_pu"], RED), ("PG", data["beta_pg"], GREEN), ("PD", data["beta_pd"], BLUE)]
+        max_beta = max(value for _, value, _ in betas) or 1.0
+        x0, bar_w, gap = 70, 95, 54
+        chart_bottom, chart_top = 190, 70
+        for index, (label, beta, color) in enumerate(betas):
+            x = x0 + index * (bar_w + gap)
+            h = (chart_bottom - chart_top) * beta / max_beta
+            canvas.create_rectangle(x, chart_bottom - h, x + bar_w, chart_bottom,
+                                    fill=color, outline="")
+            canvas.create_text(x + bar_w / 2, chart_bottom + 18, text=label,
+                               fill=TEXT, font=("Calibri", 11, "bold"))
+            canvas.create_text(x + bar_w / 2, chart_bottom - h - 12, text=f"{beta:.0f}",
+                               fill=TEXT, font=("Calibri", 10, "bold"))
+        canvas.create_line(48, chart_bottom, 48 + 3 * (bar_w + gap) - gap, chart_bottom,
+                           fill=BORDER, width=1)
+        canvas.create_text(28, 238, text="Compact-model margins at selected VDD", anchor="w",
+                           fill=TEXT, font=("Calibri", 12, "bold"))
+        gauges = [
+            ("Read SNM", data["read_snm_mv"], 0.5 * training_values["vdd"].get() * 1000.0, BLUE,
+             "Higher is more read-stable"),
+            ("Write margin", data["write_margin_mv"], training_values["vdd"].get() * 1000.0, GREEN,
+             "Higher means PG can overcome PU with more bitline tolerance"),
+        ]
+        for index, (label, value, scale, color, note) in enumerate(gauges):
+            y = 286 + index * 82
+            fraction = max(0.0, min(1.0, value / max(scale, 1.0)))
+            canvas.create_text(48, y, text=label, anchor="w", fill=TEXT, font=("Calibri", 11, "bold"))
+            canvas.create_text(48, y + 20, text=note, anchor="w", fill=SECONDARY, font=("Calibri", 9))
+            left, right = 270, width - 35
+            canvas.create_rectangle(left, y - 8, right, y + 12, fill="#E5E5EA", outline="")
+            canvas.create_rectangle(left, y - 8, left + (right-left)*fraction, y + 12, fill=color, outline="")
+            canvas.create_text(right, y + 2, text=f"{value:.1f} mV", anchor="e", fill=TEXT,
+                               font=("Calibri", 11, "bold"))
+        canvas.create_text(48, height - 30,
+                           text="Read trend: PD↑ or PG↓ tends to raise CR.  Write trend: PG↑ or PU↓ tends to raise PR.",
+                           anchor="w", fill=SECONDARY, font=("Calibri", 10))
+
+    for variable in training_values.values():
+        variable.trace_add("write", draw_training_trend)
+    training_canvas.bind("<Configure>", draw_training_trend)
+    root.after_idle(draw_training_trend)
 
     content = ttk.Frame(bitcell_tab, style="Root.TFrame"); content.pack(fill="both", expand=True)
     content.columnconfigure(0, weight=7); content.columnconfigure(1, weight=4); content.rowconfigure(0, weight=1)
@@ -5104,7 +5392,7 @@ def launch_gui() -> None:
 
     def import_multi_chip_excel() -> None:
         selected = filedialog.askopenfilename(
-            title="Import Wafer Multi-Chip 6T Excel",
+            title="Import Wafer Multi-Cell 6T Excel",
             filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
         if not selected:
             return
@@ -5115,35 +5403,35 @@ def launch_gui() -> None:
                            for key, _label, _unit in assumption_specs}
             cfg = Config(nominal_vdd=chips[0].model_vdd_v, wat_vdd=chips[0].model_vdd_v, **assumptions)
             analysis = analyze_multi_chip_wafer(chips, cfg)
-            run_dir = create_run_output_dir(values["out"].get(), chips[0].lot_wafer, "multi_chip_wafer")
+            run_dir = create_run_output_dir(values["out"].get(), chips[0].lot_wafer, "multi_cell_wafer")
             report = write_multi_chip_outputs(analysis, run_dir)
             values["corner"].set(chips[0].lot_wafer)
-            status.set(f"Multi-chip wafer complete: {len(chips)} chips; minimum RSNM={analysis['worst_rsnm']['rsnm_mv']:.1f} mV, WSNM={analysis['worst_wsnm']['wsnm_mv']:.1f} mV")
+            status.set(f"Wafer multi-cell complete: {len(chips)} cells; minimum RSNM={analysis['worst_rsnm']['rsnm_mv']:.1f} mV, WSNM={analysis['worst_wsnm']['wsnm_mv']:.1f} mV")
             status_label.configure(fg=GREEN)
             webbrowser.open(report.resolve().as_uri())
         except Exception as exc:
-            messagebox.showerror("Multi-chip wafer import", str(exc))
+            messagebox.showerror("Wafer multi-cell import", str(exc))
 
     def save_multi_chip_template() -> None:
         selected = filedialog.asksaveasfilename(
-            title="Save 64-Chip 6T Wafer Template", initialfile="HV28_6T_Wafer_64Chip_Template.xlsx",
+            title="Save Wafer Multi-Cell 6T Template", initialfile="HV28_6T_Wafer_MultiCell_Template.xlsx",
             defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")])
         if not selected:
             return
         try:
             saved = write_multi_chip_6t_excel_template(selected, 64)
-            status.set(f"64-chip wafer template saved: {saved.name}")
+            status.set(f"Wafer multi-cell template saved: {saved.name}")
             status_label.configure(fg=GREEN)
         except Exception as exc:
-            messagebox.showerror("Multi-chip template", str(exc))
+            messagebox.showerror("Wafer multi-cell template", str(exc))
 
     ttk.Button(excel_row, text="Save Current...", style="Quiet.TButton",
                command=save_current_excel).pack(side="right")
     ttk.Button(excel_row, text="Import Excel...", style="Quiet.TButton",
                command=pick_excel).pack(side="right", padx=(0, 6))
-    ttk.Button(excel_row, text="Import Multi-Chip...", style="Quiet.TButton",
+    ttk.Button(excel_row, text="Import Multi-Cell...", style="Quiet.TButton",
                command=import_multi_chip_excel).pack(side="right", padx=(0, 6))
-    ttk.Button(excel_row, text="64-Chip Template...", style="Quiet.TButton",
+    ttk.Button(excel_row, text="Multi-Cell Template...", style="Quiet.TButton",
                command=save_multi_chip_template).pack(side="right", padx=(0, 6))
 
     schematic = tk.Canvas(left, bg=CARD, highlightthickness=0, height=540)
@@ -6165,6 +6453,7 @@ def launch_gui() -> None:
             "options": {"use_wat_target_reference": use_wat_target_reference.get()},
             "numeric": {key: variable.get() for key, variable in numeric.items()},
             "assumptions": {key: variable.get() for key, variable in assumption_values.items()},
+            "training": {key: variable.get() for key, variable in training_values.items()},
             "rsnm_vcc_rows": [
                 {key: variable.get() for key, variable in row.items()}
                 for row in curve_row_vars

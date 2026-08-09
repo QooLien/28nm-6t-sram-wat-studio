@@ -12,6 +12,7 @@ from sram_wat_analyzer import (
     _read_wat_excel_rows, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve,
     analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
+    educational_sram_metrics,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
     read_iv_curve_excel, read_multi_chip_6t_excel, read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
     save_gui_state,
@@ -36,6 +37,18 @@ class AnalyzerTests(unittest.TestCase):
         self.assertLess(below, at_threshold)
         self.assertLess(at_threshold, above)
         self.assertAlmostEqual(device.current(.90, .90), 44.0, places=7)
+
+    def test_training_metrics_use_wat_calibrated_beta_ratios(self):
+        baseline = educational_sram_metrics(
+            WatPoint("TRAIN", .385, 44.0, .365, 82.0, .355, 124.0), .90)
+        stronger_pg = educational_sram_metrics(
+            WatPoint("TRAIN", .385, 44.0, .365, 110.0, .355, 124.0), .90)
+        self.assertGreater(baseline["read_snm_mv"], 0.0)
+        self.assertGreaterEqual(baseline["write_margin_mv"], 0.0)
+        self.assertGreater(baseline["cell_ratio"], 0.0)
+        self.assertGreater(baseline["pull_up_ratio"], 0.0)
+        self.assertGreater(stronger_pg["beta_pg"], baseline["beta_pg"])
+        self.assertGreater(stronger_pg["pull_up_ratio"], baseline["pull_up_ratio"])
 
     def test_run_output_directory_uses_date_time_wafer_and_never_overwrites(self):
         stamp = datetime(2026, 8, 1, 14, 30, 25)
@@ -541,9 +554,13 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual(len(analysis["rows"]), 2)
             self.assertGreater(analysis["worst_rsnm"]["rsnm_mv"], 0)
             self.assertGreater(analysis["worst_wsnm"]["wsnm_mv"], 0)
+            self.assertEqual(analysis["median_cell"]["chip_id"], "MEDIAN_CELL")
+            self.assertEqual(len(analysis["median_target_read_shmoo"]["rows"]), 66)
+            self.assertEqual(len(analysis["median_target_write_shmoo"]["rows"]), 66)
             report = write_multi_chip_outputs(analysis, Path(td) / "batch")
             self.assertTrue(report.exists())
             self.assertTrue((report.parent / "images" / "01_multi_chip_read_vtc.png").exists())
+            self.assertTrue((report.parent / "median_target_read_shmoo.csv").exists())
 
     def test_single_and_multi_chip_use_identical_snm_calculation(self):
         """One multi-chip row must numerically match the 6T single-cell result."""

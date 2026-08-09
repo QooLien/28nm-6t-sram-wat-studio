@@ -46,9 +46,11 @@ The **Write Trip Margin** tab reuses the same manual VDD / PU / PG / PD rows so 
 
 The **RSNM Mismatch Boundary** tab sweeps PUL/PUR/PGL/PGR/PDL/PDR Vt and Isat one parameter at a time. It reports whether the Upper or Lower Read-SNM eye reaches 0 first and exports the complete six-device Vt/Idsat set at each bracketed boundary. Values that are not being swept remain fixed at the entered Lot/Wafer baseline, so these results are sensitivity references rather than simultaneous multidimensional process limits.
 
-### Wafer multi-chip 6T analysis
+### Wafer multi-cell 6T analysis
 
-Use **64-Chip Template...** to create `HV28_6T_Wafer_64Chip_Template.xlsx`. Each row in its `6T Multi-Chip` sheet represents one physical chip and includes Chip ID, a common Model VDD, and PUL/PUR/PGL/PGR/PDL/PDR Vt and Idsat values. Select **Import Multi-Chip...** to analyze all rows. The report overlays every chip's Read direct/mirrored VTC and Write W=1/W=0 VTC, highlights the chip with the lowest margin, and reports the minimum RSNM and minimum WSNM as conservative wafer references. All imported chips must use one common Model VDD so their VTC axes are comparable.
+Use **Multi-Cell Template...** to create `HV28_6T_Wafer_MultiCell_Template.xlsx`. Each row in its `6T Multi-Cell` sheet represents one measured 6T cell/chip. The import needs only Lot/Wafer, Chip ID, and PUL/PUR/PGL/PGR/PDL/PDR `Vt` and `Idsat` columns; use V for Vt and µA for Idsat, with no unit columns. Select **Import Multi-Cell...** to analyze all rows. The common Model VDD is taken from the active GUI setting, ensuring all VTC axes are comparable. The report overlays every cell's Read direct/mirrored VTC and Write W=1/W=0 VTC, highlights the cell with the lowest margin, and reports the minimum RSNM and minimum WSNM as conservative wafer references.
+
+The same import automatically builds a synthetic per-device median cell, identifies the minimum RSNM cell and minimum Write Margin cell separately, then runs a one-factor 10% step screening from each worst cell toward the median. The HTML report lists the shortest PU/PG/PD Vt or Idsat moves that reach the median Read or Write target; detailed data is exported as `median_target_read_shmoo.csv` and `median_target_write_shmoo.csv`. Use `HV28_6T_MedianWorst_50Cell_Template.xlsx` when preparing a 50-cell data set for this workflow.
 
 ## Read SNM chart convention
 
