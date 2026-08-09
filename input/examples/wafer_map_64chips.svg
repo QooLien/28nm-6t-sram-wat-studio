@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000" viewBox="0 0 1000 1000">
+  <rect width="1000" height="1000" fill="#f7f9fc"/>
+  <text x="500" y="52" text-anchor="middle" font-family="Arial, sans-serif" font-size="30" font-weight="700" fill="#172033">64 Chips Wafer Map</text>
+  <text x="500" y="82" text-anchor="middle" font-family="Arial, sans-serif" font-size="17" fill="#536079">Top-left: (10,10) · X → right · Y → down</text>
+
+  <circle cx="500" cy="520" r="410" fill="#e9eef5" stroke="#26364d" stroke-width="7"/>
+  <path d="M470 928 L500 908 L530 928" fill="#f7f9fc" stroke="#26364d" stroke-width="7" stroke-linejoin="round"/>
+
+  <g id="chips" font-family="Arial, sans-serif" font-size="19" font-weight="600" text-anchor="middle" dominant-baseline="middle">
+    <!-- Generated 8 × 8 chip grid; x=10..17, y=10..17 -->
+    <g stroke="#ffffff" stroke-width="3">
+      <!-- row y=10 -->
+      <rect x="220" y="240" width="70" height="70" rx="3" fill="#80bfff"/><rect x="290" y="240" width="70" height="70" rx="3" fill="#80bfff"/><rect x="360" y="240" width="70" height="70" rx="3" fill="#80bfff"/><rect x="430" y="240" width="70" height="70" rx="3" fill="#80bfff"/><rect x="500" y="240" width="70" height="70" rx="3" fill="#80bfff"/><rect x="570" y="240" width="70" height="70" rx="3" fill="#80bfff"/><rect x="640" y="240" width="70" height="70" rx="3" fill="#80bfff"/><rect x="710" y="240" width="70" height="70" rx="3" fill="#80bfff"/>
+      <!-- row y=11 -->
+      <rect x="220" y="310" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="290" y="310" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="360" y="310" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="430" y="310" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="500" y="310" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="570" y="310" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="640" y="310" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="710" y="310" width="70" height="70" rx="3" fill="#72b5f5"/>
+      <!-- row y=12 -->
+      <rect x="220" y="380" width="70" height="70" rx="3" fill="#80bfff"/><rect x="290" y="380" width="70" height="70" rx="3" fill="#80bfff"/><rect x="360" y="380" width="70" height="70" rx="3" fill="#80bfff"/><rect x="430" y="380" width="70" height="70" rx="3" fill="#80bfff"/><rect x="500" y="380" width="70" height="70" rx="3" fill="#80bfff"/><rect x="570" y="380" width="70" height="70" rx="3" fill="#80bfff"/><rect x="640" y="380" width="70" height="70" rx="3" fill="#80bfff"/><rect x="710" y="380" width="70" height="70" rx="3" fill="#80bfff"/>
+      <!-- row y=13 -->
+      <rect x="220" y="450" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="290" y="450" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="360" y="450" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="430" y="450" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="500" y="450" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="570" y="450" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="640" y="450" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="710" y="450" width="70" height="70" rx="3" fill="#72b5f5"/>
+      <!-- row y=14 -->
+      <rect x="220" y="520" width="70" height="70" rx="3" fill="#80bfff"/><rect x="290" y="520" width="70" height="70" rx="3" fill="#80bfff"/><rect x="360" y="520" width="70" height="70" rx="3" fill="#80bfff"/><rect x="430" y="520" width="70" height="70" rx="3" fill="#80bfff"/><rect x="500" y="520" width="70" height="70" rx="3" fill="#80bfff"/><rect x="570" y="520" width="70" height="70" rx="3" fill="#80bfff"/><rect x="640" y="520" width="70" height="70" rx="3" fill="#80bfff"/><rect x="710" y="520" width="70" height="70" rx="3" fill="#80bfff"/>
+      <!-- row y=15 -->
+      <rect x="220" y="590" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="290" y="590" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="360" y="590" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="430" y="590" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="500" y="590" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="570" y="590" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="640" y="590" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="710" y="590" width="70" height="70" rx="3" fill="#72b5f5"/>
+      <!-- row y=16 -->
+      <rect x="220" y="660" width="70" height="70" rx="3" fill="#80bfff"/><rect x="290" y="660" width="70" height="70" rx="3" fill="#80bfff"/><rect x="360" y="660" width="70" height="70" rx="3" fill="#80bfff"/><rect x="430" y="660" width="70" height="70" rx="3" fill="#80bfff"/><rect x="500" y="660" width="70" height="70" rx="3" fill="#80bfff"/><rect x="570" y="660" width="70" height="70" rx="3" fill="#80bfff"/><rect x="640" y="660" width="70" height="70" rx="3" fill="#80bfff"/><rect x="710" y="660" width="70" height="70" rx="3" fill="#80bfff"/>
+      <!-- row y=17 -->
+      <rect x="220" y="730" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="290" y="730" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="360" y="730" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="430" y="730" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="500" y="730" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="570" y="730" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="640" y="730" width="70" height="70" rx="3" fill="#72b5f5"/><rect x="710" y="730" width="70" height="70" rx="3" fill="#72b5f5"/>
+    </g>
+
+    <g fill="#10243c">
+      <text x="255" y="275">10,10</text><text x="325" y="275">11,10</text><text x="395" y="275">12,10</text><text x="465" y="275">13,10</text><text x="535" y="275">14,10</text><text x="605" y="275">15,10</text><text x="675" y="275">16,10</text><text x="745" y="275">17,10</text>
+      <text x="255" y="345">10,11</text><text x="325" y="345">11,11</text><text x="395" y="345">12,11</text><text x="465" y="345">13,11</text><text x="535" y="345">14,11</text><text x="605" y="345">15,11</text><text x="675" y="345">16,11</text><text x="745" y="345">17,11</text>
+      <text x="255" y="415">10,12</text><text x="325" y="415">11,12</text><text x="395" y="415">12,12</text><text x="465" y="415">13,12</text><text x="535" y="415">14,12</text><text x="605" y="415">15,12</text><text x="675" y="415">16,12</text><text x="745" y="415">17,12</text>
+      <text x="255" y="485">10,13</text><text x="325" y="485">11,13</text><text x="395" y="485">12,13</text><text x="465" y="485">13,13</text><text x="535" y="485">14,13</text><text x="605" y="485">15,13</text><text x="675" y="485">16,13</text><text x="745" y="485">17,13</text>
+      <text x="255" y="555">10,14</text><text x="325" y="555">11,14</text><text x="395" y="555">12,14</text><text x="465" y="555">13,14</text><text x="535" y="555">14,14</text><text x="605" y="555">15,14</text><text x="675" y="555">16,14</text><text x="745" y="555">17,14</text>
+      <text x="255" y="625">10,15</text><text x="325" y="625">11,15</text><text x="395" y="625">12,15</text><text x="465" y="625">13,15</text><text x="535" y="625">14,15</text><text x="605" y="625">15,15</text><text x="675" y="625">16,15</text><text x="745" y="625">17,15</text>
+      <text x="255" y="695">10,16</text><text x="325" y="695">11,16</text><text x="395" y="695">12,16</text><text x="465" y="695">13,16</text><text x="535" y="695">14,16</text><text x="605" y="695">15,16</text><text x="675" y="695">16,16</text><text x="745" y="695">17,16</text>
+      <text x="255" y="765">10,17</text><text x="325" y="765">11,17</text><text x="395" y="765">12,17</text><text x="465" y="765">13,17</text><text x="535" y="765">14,17</text><text x="605" y="765">15,17</text><text x="675" y="765">16,17</text><text x="745" y="765">17,17</text>
+    </g>
+  </g>
+
+  <g font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#26364d">
+    <text x="500" y="215" text-anchor="middle">X = 10 → 17</text>
+    <text x="190" y="520" text-anchor="middle" transform="rotate(-90 190 520)">Y = 10 → 17</text>
+  </g>
+</svg>

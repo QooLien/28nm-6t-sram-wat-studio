@@ -66,7 +66,7 @@ class AnalyzerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "new output"
             with mock.patch("sram_wat_analyzer.sys.platform", "win32"), \
-                    mock.patch("sram_wat_analyzer.os.startfile") as startfile:
+                    mock.patch("sram_wat_analyzer.os.startfile", create=True) as startfile:
                 opened = open_output_directory(target)
             self.assertEqual(opened, target.resolve())
             self.assertTrue(target.is_dir())
@@ -466,9 +466,8 @@ class AnalyzerTests(unittest.TestCase):
     def test_distributed_excel_template_uses_compatible_filtered_ranges(self):
         from openpyxl import load_workbook
 
-        template = Path(__file__).with_name(
-            "HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx"
-        )
+        template = (Path(__file__).resolve().parents[1] / "input" / "templates" /
+                    "HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx")
         workbook = load_workbook(template, read_only=False, data_only=False)
         self.assertEqual(workbook.sheetnames, ["PU", "PG", "PD", "Instructions"])
         for sheet_name in ("PU", "PG", "PD"):

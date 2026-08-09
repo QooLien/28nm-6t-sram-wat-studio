@@ -4,7 +4,7 @@ import os
 import shutil
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "tmp" / "matplotlib"))
 
 import matplotlib
@@ -35,7 +35,7 @@ from reportlab.platypus import (
 )
 
 
-OUTPUT_DIR = ROOT / "output" / "pdf"
+OUTPUT_DIR = ROOT / "output" / "reference" / "pdf"
 TEMP_DIR = ROOT / "tmp" / "pdfs" / "formula_guide_zh"
 OUTPUT_PDF = OUTPUT_DIR / "HV28_SRAM_Analysis_Formula_Guide.pdf"
 
