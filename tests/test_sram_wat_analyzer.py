@@ -547,8 +547,13 @@ class AnalyzerTests(unittest.TestCase):
     def test_multi_chip_6t_excel_template_and_wafer_analysis(self):
         with tempfile.TemporaryDirectory() as td:
             template = write_multi_chip_6t_excel_template(Path(td) / "wafer.xlsx", chip_count=2)
+            from openpyxl import load_workbook
+            workbook = load_workbook(template)
+            workbook["6T Multi-Cell"]["D2"] = -44.0  # Signed PMOS WAT current
+            workbook.save(template)
             chips = read_multi_chip_6t_excel(template)
             self.assertEqual([item.chip_id for item in chips], ["CHIP_01", "CHIP_02"])
+            self.assertEqual(chips[0].raw_idsat_ua["pul"], -44.0)
             analysis = analyze_multi_chip_wafer(chips, Config(grid_points=101), fit_points=201)
             self.assertEqual(len(analysis["rows"]), 2)
             self.assertGreater(analysis["worst_rsnm"]["rsnm_mv"], 0)
@@ -562,6 +567,8 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((report.parent / "median_target_read_shmoo.csv").exists())
             self.assertTrue((report.parent / "imported_6t_vt_idsat_data.xlsx").exists())
             self.assertIn("Minimum RSNM source 6T WAT values",
+                          (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
+            self.assertIn(">-44.00</text>",
                           (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
 
     def test_single_and_multi_chip_use_identical_snm_calculation(self):

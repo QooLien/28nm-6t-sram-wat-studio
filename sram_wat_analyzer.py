@@ -239,6 +239,9 @@ class WaferChipWat:
     chip_id: str
     model_vdd_v: float
     cell: SixTWatCell
+    # Preserve the original WAT current sign for report traceability.  The
+    # compact NMOS/PMOS drive equations use the magnitude held in ``cell``.
+    raw_idsat_ua: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -1882,6 +1885,7 @@ def read_multi_chip_6t_excel(path: str | os.PathLike[str],
                 raw_vdd, _cell(row, headers, vdd_unit_key) or header_units.get(vdd_key or "", "V"),
                 _VOLTAGE_UNITS, "V", f"Multi-chip row {number} Model VDD")
             mos: dict[str, MosWat] = {}
+            raw_idsat_ua: dict[str, float] = {}
             for device, (vt_key, ids_key) in devices.items():
                 vt = _excel_number(_cell(row, headers, vt_key),
                                    _cell(row, headers, f"{vt_key}unit") or header_units.get(vt_key, "V"),
@@ -1889,9 +1893,13 @@ def read_multi_chip_6t_excel(path: str | os.PathLike[str],
                 ids = _excel_number(_cell(row, headers, ids_key),
                                     _cell(row, headers, f"{ids_key}unit") or header_units.get(ids_key, "uA"),
                                     _CURRENT_TO_UA, "uA", f"Multi-chip row {number} {device.upper()} Idsat")
+                # WAT may report PMOS Idsat as a negative signed current.
+                # Keep that sign for the output record while using its
+                # magnitude to calibrate the compact drive model.
+                raw_idsat_ua[device] = ids
                 mos[device] = MosWat(abs(_positive(vt, f"{device.upper()} Vt")), abs(_positive(ids, f"{device.upper()} Idsat")))
             parsed.append(WaferChipWat(lot, chip, vdd, SixTWatCell(f"{lot}_{chip}",
-                mos["pul"], mos["pur"], mos["pgl"], mos["pgr"], mos["pdl"], mos["pdr"])))
+                mos["pul"], mos["pur"], mos["pgl"], mos["pgr"], mos["pdl"], mos["pdr"]), raw_idsat_ua))
         if not parsed:
             raise ValueError("Multi-chip Excel contains no chip rows")
         vdds = {round(item.model_vdd_v, 12) for item in parsed}
@@ -2392,6 +2400,46 @@ def _multi_cell_metrics(cell: SixTWatCell, cfg: Config, vdd: float,
     }
 
 
+def _dominant_snm_degradation_parameter(cell: SixTWatCell,
+                                        median_cell: SixTWatCell,
+                                        mode: str) -> dict[str, object] | None:
+    """Find the strongest one-parameter adverse shift relative to wafer median.
+
+    This is an explanatory marker for the multi-cell overlay, not a causal
+    decomposition.  Read SNM is mainly weakened by weaker PD or stronger PG;
+    Write SNM is mainly weakened by stronger PU or weaker PG.
+    """
+    if mode not in {"read", "write"}:
+        raise ValueError("mode must be read or write")
+    candidates: list[tuple[float, str, str, str]] = []
+    for attr, label in (("pu1", "PUL"), ("pu2", "PUR"),
+                        ("pg1", "PGL"), ("pg2", "PGR"),
+                        ("pd1", "PDL"), ("pd2", "PDR")):
+        measured, median = getattr(cell, attr), getattr(median_cell, attr)
+        vt_scale = max(abs(median.vt), 1e-12)
+        ids_scale = max(abs(median.ids), 1e-12)
+        family = attr[:2]
+        # sign = +1 means an upward shift is adverse; -1 means downward is.
+        if mode == "read":
+            sign = 1 if family == "pd" else (-1 if family == "pg" else 0)
+        else:
+            sign = -1 if family == "pu" else (1 if family == "pg" else 0)
+        if sign == 0:
+            continue
+        vt_score = max(0.0, sign * (measured.vt - median.vt) / vt_scale)
+        # Idsat has the opposite relation to Vt for effective drive strength.
+        ids_score = max(0.0, -sign * (abs(measured.ids) - abs(median.ids)) / ids_scale)
+        candidates.extend(((vt_score, label, "vt", "Vt"),
+                           (ids_score, label, "idsat", "Idsat")))
+    if not candidates:
+        return None
+    score, device, parameter, parameter_label = max(candidates, key=lambda item: item[0])
+    if score <= 1e-12:
+        return None
+    return {"device": device, "parameter": parameter,
+            "parameter_label": parameter_label, "score": score}
+
+
 def _median_multi_cell(chips: list[WaferChipWat]) -> SixTWatCell:
     """Build a synthetic median 6T cell from every physical MOS parameter."""
     def median_mos(name: str) -> MosWat:
@@ -2478,7 +2526,7 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
                         grid_points=common_fit_points)
     rows = []
     for item in chips:
-        rows.append({"chip_id": item.chip_id, **_multi_cell_metrics(
+        rows.append({"chip_id": item.chip_id, "raw_idsat_ua": item.raw_idsat_ua or {}, **_multi_cell_metrics(
             item.cell, point_cfg, vdd, point_cfg.grid_points)})
     valid_read = [row for row in rows if row["rsnm_mv"] is not None]
     valid_write = [row for row in rows if row["wsnm_mv"] is not None]
@@ -2498,6 +2546,10 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
             "worst_rsnm": worst_read, "worst_rsnm_upper": worst_upper,
             "worst_rsnm_lower": worst_lower, "worst_wsnm": worst_write,
             "worst_write_margin": worst_write_margin, "median_cell": median,
+            "dominant_read_driver": _dominant_snm_degradation_parameter(
+                worst_read["cell"], median_cell, "read"),
+            "dominant_write_driver": _dominant_snm_degradation_parameter(
+                worst_write["cell"], median_cell, "write"),
             "median_target_read_shmoo": _median_target_shmoo(
                 worst_read, median, point_cfg, vdd, "rsnm_mv"),
             "median_target_write_shmoo": _median_target_shmoo(
@@ -4463,6 +4515,8 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     # the minimum reported SNM.  This lets the VTC overlay be audited without
     # accidentally combining a square from one cell with WAT data from another.
     source_cell = worst["cell"]
+    dominant = analysis.get("dominant_read_driver" if mode == "read" else "dominant_write_driver")
+    raw_idsat_ua = worst.get("raw_idsat_ua", {})
     source_values = (
         ("PUL", source_cell.pu1), ("PUR", source_cell.pu2),
         ("PGL", source_cell.pg1), ("PGR", source_cell.pg2),
@@ -4479,11 +4533,21 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     ]
     for index, (name, mos) in enumerate(source_values):
         y = table_top + 70 + index * 22
+        is_vt_driver = bool(dominant and dominant["device"] == name and dominant["parameter"] == "vt")
+        is_ids_driver = bool(dominant and dominant["device"] == name and dominant["parameter"] == "idsat")
+        vt_fill = "#FF3B30" if is_vt_driver else "#3A3A3C"
+        ids_fill = "#FF3B30" if is_ids_driver else "#3A3A3C"
+        vt_weight = ' font-weight="700"' if is_vt_driver else ""
+        ids_weight = ' font-weight="700"' if is_ids_driver else ""
+        ids_display = raw_idsat_ua.get(name.lower(), mos.ids)
         card_text += [
             f'<text x="{card_x+28}" y="{y}" fill="#1D1D1F" font-size="14" font-weight="700">{name}</text>',
-            f'<text x="{card_x+145}" y="{y}" fill="#3A3A3C" font-size="14">{mos.vt:.4f}</text>',
-            f'<text x="{card_x+270}" y="{y}" fill="#3A3A3C" font-size="14">{mos.ids:.2f}</text>',
+            f'<text x="{card_x+145}" y="{y}" fill="{vt_fill}" font-size="14"{vt_weight}>{mos.vt:.4f}</text>',
+            f'<text x="{card_x+270}" y="{y}" fill="{ids_fill}" font-size="14"{ids_weight}>{ids_display:.2f}</text>',
         ]
+    driver_note = (f'Red bold: {dominant["device"]} {dominant["parameter_label"]} is the largest adverse shift vs wafer median.'
+                   if dominant else 'No single adverse parameter differs from the wafer median.')
+    card_text.append(f'<text x="{card_x+24}" y="{card_y+card_h-18}" fill="#6E6E73" font-size="12">{html.escape(driver_note)}</text>')
     parts += [f'<text x="{left+plot_w/2:.1f}" y="{top+plot_h+82}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
               f'<text x="70" y="{top+plot_h/2:.1f}" transform="rotate(-90 70 {top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>',
               *card_text,
