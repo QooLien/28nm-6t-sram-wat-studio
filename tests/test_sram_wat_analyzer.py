@@ -556,10 +556,13 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual(analysis["median_cell"]["chip_id"], "MEDIAN_CELL")
             self.assertEqual(len(analysis["median_target_read_shmoo"]["rows"]), 66)
             self.assertEqual(len(analysis["median_target_write_shmoo"]["rows"]), 66)
-            report = write_multi_chip_outputs(analysis, Path(td) / "batch")
+            report = write_multi_chip_outputs(analysis, Path(td) / "batch", template)
             self.assertTrue(report.exists())
             self.assertTrue((report.parent / "images" / "01_multi_chip_read_vtc.png").exists())
             self.assertTrue((report.parent / "median_target_read_shmoo.csv").exists())
+            self.assertTrue((report.parent / "imported_6t_vt_idsat_data.xlsx").exists())
+            self.assertIn("Minimum RSNM source 6T WAT values",
+                          (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
 
     def test_single_and_multi_chip_use_identical_snm_calculation(self):
         """One multi-chip row must numerically match the 6T single-cell result."""

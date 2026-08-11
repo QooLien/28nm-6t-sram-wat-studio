@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import shutil
 import statistics as statlib
 import subprocess
 import sys
@@ -4375,7 +4376,7 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     # Deliberately compact square plot.  The right-hand information card has
     # a fixed safe width, so long chip IDs never extend beyond the SVG canvas.
     left, top, plot_w, plot_h = 150, 185, 430, 430
-    card_x, card_y, card_w = 650, 190, 470
+    card_x, card_y, card_w, card_h = 650, 170, 470, 430
     worst = analysis["worst_rsnm"] if mode == "read" else analysis["worst_wsnm"]
     metric = "RSNM" if mode == "read" else "WSNM"
     upper_worst = analysis.get("worst_rsnm_upper") if mode == "read" else None
@@ -4389,7 +4390,7 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
              '<path d="M54 112 h30" stroke="#007AFF" stroke-width="4"/><text x="94" y="117" fill="#3A3A3C" font-size="14">All chip direct VTC</text>',
              '<path d="M265 112 h30" stroke="#AF52DE" stroke-width="4" stroke-dasharray="9 6"/><text x="305" y="117" fill="#3A3A3C" font-size="14">All chip mirrored / paired VTC</text>',
              '<path d="M535 112 h30" stroke="#FF9500" stroke-width="5"/><text x="575" y="117" fill="#3A3A3C" font-size="14">State-limit chip VTC pair</text>',
-             f'<rect x="{card_x}" y="{card_y}" width="{card_w}" height="220" rx="16" fill="#F5F5F7" stroke="#E5E5EA"/>']
+             f'<rect x="{card_x}" y="{card_y}" width="{card_w}" height="{card_h}" rx="16" fill="#F5F5F7" stroke="#E5E5EA"/>']
     for voltage in (0, .3, .6, .9, 1.2):
         x, y = xy(voltage, voltage)
         parts += [f'<path d="M{x:.1f} {top} V{top+plot_h} M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA"/>',
@@ -4458,6 +4459,31 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
         card_text += [f'<circle cx="{card_x+30}" cy="{y-5}" r="5" fill="{color}"/>',
                       f'<text x="{card_x+45}" y="{y}" fill="#3A3A3C" font-size="15">{label}</text>',
                       f'<text x="{card_x+45}" y="{y+20}" fill="#1D1D1F" font-size="16" font-weight="700">{html.escape(detail)}</text>']
+    # Keep the electrical inputs physically tied to the same cell that owns
+    # the minimum reported SNM.  This lets the VTC overlay be audited without
+    # accidentally combining a square from one cell with WAT data from another.
+    source_cell = worst["cell"]
+    source_values = (
+        ("PUL", source_cell.pu1), ("PUR", source_cell.pu2),
+        ("PGL", source_cell.pg1), ("PGR", source_cell.pg2),
+        ("PDL", source_cell.pd1), ("PDR", source_cell.pd2),
+    )
+    table_top = card_y + 218 if mode == "read" else card_y + 132
+    card_text += [
+        f'<path d="M{card_x+24} {table_top-18} H{card_x+card_w-24}" stroke="#D2D2D7"/>',
+        f'<text x="{card_x+24}" y="{table_top}" fill="#1D1D1F" font-size="15" font-weight="700">Minimum {metric} source 6T WAT values</text>',
+        f'<text x="{card_x+24}" y="{table_top+20}" fill="#6E6E73" font-size="13">{html.escape(worst["chip_id"])} · Vt (V) / Idsat (uA)</text>',
+        f'<text x="{card_x+28}" y="{table_top+45}" fill="#6E6E73" font-size="13" font-weight="700">MOS</text>',
+        f'<text x="{card_x+145}" y="{table_top+45}" fill="#6E6E73" font-size="13" font-weight="700">Vt (V)</text>',
+        f'<text x="{card_x+270}" y="{table_top+45}" fill="#6E6E73" font-size="13" font-weight="700">Idsat (uA)</text>',
+    ]
+    for index, (name, mos) in enumerate(source_values):
+        y = table_top + 70 + index * 22
+        card_text += [
+            f'<text x="{card_x+28}" y="{y}" fill="#1D1D1F" font-size="14" font-weight="700">{name}</text>',
+            f'<text x="{card_x+145}" y="{y}" fill="#3A3A3C" font-size="14">{mos.vt:.4f}</text>',
+            f'<text x="{card_x+270}" y="{y}" fill="#3A3A3C" font-size="14">{mos.ids:.2f}</text>',
+        ]
     parts += [f'<text x="{left+plot_w/2:.1f}" y="{top+plot_h+82}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
               f'<text x="70" y="{top+plot_h/2:.1f}" transform="rotate(-90 70 {top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>',
               *card_text,
@@ -4465,9 +4491,19 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     return "".join(parts)
 
 
-def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str]) -> Path:
+def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
+                             input_excel_path: str | os.PathLike[str] | None = None) -> Path:
     """Export batch wafer VTC overlays, per-chip margin table and HTML summary."""
     out = Path(out_dir); image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
+    backup_name = "imported_6t_vt_idsat_data.xlsx"
+    if input_excel_path is not None:
+        source = Path(input_excel_path)
+        if not source.is_file():
+            raise FileNotFoundError(f"Imported Multi-Cell Excel was not found: {source}")
+        # Preserve the exact imported workbook, including any user metadata,
+        # as a run-local audit backup.  The analysis always reads Vt in V and
+        # Idsat in uA from its accepted 6T Multi-Cell sheet.
+        shutil.copy2(source, out / backup_name)
     try:
         from reportlab.graphics import renderPM
         from svglib.svglib import svg2rlg
@@ -4519,7 +4555,10 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str]) ->
     read_shmoo = analysis["median_target_read_shmoo"]
     write_shmoo = analysis["median_target_write_shmoo"]
     report = out / "multi_cell_wafer_report.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Wafer Multi-Cell Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}.note{{color:#6e6e73}}.warn{{color:#c2410c;font-weight:bold}}</style></head><body><main><h1>HV28 SRAM Wafer Multi-Cell Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} measured cells · Model VDD={analysis["vdd_v"]:.3f} V</p><section><h2>Conservative wafer reference</h2><p><b>Minimum cell RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum Write Margin:</b> {analysis["worst_write_margin"]["write_margin_mv"]:.2f} mV ({html.escape(analysis["worst_write_margin"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Synthetic median reference cell</h2><p>The median cell is built from the per-device median Vt and Idsat values. It is a statistical reference and may not be a physically measured cell.</p><table><tr><th>RSNM</th><th>Write Margin</th><th>Cell Ratio (CR)</th><th>Pull-up Ratio (PR)</th></tr><tr><td>{median["rsnm_mv"]:.2f} mV</td><td>{median["write_margin_mv"]:.2f} mV</td><td>{median["cell_ratio_beta"]:.3f}</td><td>{median["pull_up_ratio_beta"]:.3f}</td></tr></table></section><section><h2>Worst-to-median adjustment screening</h2><p class="note">Each shmoo moves both devices of one family, one parameter at a time, from the worst cell toward its physical-MOS median in 10% steps. It is a direction-finding compact-model screening, not a simultaneous process correction.</p><h3>Read target: median RSNM = {read_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_rsnm"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(read_shmoo)}</table><h3>Write target: median Write Margin = {write_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_write_margin"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(write_shmoo)}</table><p class="note">Detailed sweep data: <code>median_target_read_shmoo.csv</code> and <code>median_target_write_shmoo.csv</code>.</p></section><section><h2>Read VTC / Mirror VTC</h2><p>Upper and Lower squares are each taken from their own state-limiting cell. Their direct/mirrored VTC pair is highlighted together; the two states are not combined into one artificial cell.</p><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-cell margins</h2><table><tr><th>Cell / Chip ID</th><th>Upper RSNM</th><th>Lower RSNM</th><th>RSNM</th><th>Write Margin</th><th>CR</th><th>PR</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
+    backup_note = (f'<p class="note">Imported 6T Vt/Idsat backup: <code>{backup_name}</code>. '
+                   'This is the original workbook used for this run.</p>'
+                   if input_excel_path is not None else '')
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Wafer Multi-Cell Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}.note{{color:#6e6e73}}.warn{{color:#c2410c;font-weight:bold}}</style></head><body><main><h1>HV28 SRAM Wafer Multi-Cell Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} measured cells · Model VDD={analysis["vdd_v"]:.3f} V</p>{backup_note}<section><h2>Conservative wafer reference</h2><p><b>Minimum cell RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum Write Margin:</b> {analysis["worst_write_margin"]["write_margin_mv"]:.2f} mV ({html.escape(analysis["worst_write_margin"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Synthetic median reference cell</h2><p>The median cell is built from the per-device median Vt and Idsat values. It is a statistical reference and may not be a physically measured cell.</p><table><tr><th>RSNM</th><th>Write Margin</th><th>Cell Ratio (CR)</th><th>Pull-up Ratio (PR)</th></tr><tr><td>{median["rsnm_mv"]:.2f} mV</td><td>{median["write_margin_mv"]:.2f} mV</td><td>{median["cell_ratio_beta"]:.3f}</td><td>{median["pull_up_ratio_beta"]:.3f}</td></tr></table></section><section><h2>Worst-to-median adjustment screening</h2><p class="note">Each shmoo moves both devices of one family, one parameter at a time, from the worst cell toward its physical-MOS median in 10% steps. It is a direction-finding compact-model screening, not a simultaneous process correction.</p><h3>Read target: median RSNM = {read_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_rsnm"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(read_shmoo)}</table><h3>Write target: median Write Margin = {write_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_write_margin"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(write_shmoo)}</table><p class="note">Detailed sweep data: <code>median_target_read_shmoo.csv</code> and <code>median_target_write_shmoo.csv</code>.</p></section><section><h2>Read VTC / Mirror VTC</h2><p>Upper and Lower squares are each taken from their own state-limiting cell. Their direct/mirrored VTC pair is highlighted together; the two states are not combined into one artificial cell. The overlay card lists the complete six-MOS Vt/Idsat set for the cell that owns the minimum RSNM.</p><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><p>The overlay card lists the complete six-MOS Vt/Idsat set for the cell that owns the minimum WSNM.</p><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-cell margins</h2><table><tr><th>Cell / Chip ID</th><th>Upper RSNM</th><th>Lower RSNM</th><th>RSNM</th><th>Write Margin</th><th>CR</th><th>PR</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
     return report
 
 
@@ -5404,7 +5443,7 @@ def launch_gui() -> None:
             cfg = Config(nominal_vdd=chips[0].model_vdd_v, wat_vdd=chips[0].model_vdd_v, **assumptions)
             analysis = analyze_multi_chip_wafer(chips, cfg)
             run_dir = create_run_output_dir(values["out"].get(), chips[0].lot_wafer, "multi_cell_wafer")
-            report = write_multi_chip_outputs(analysis, run_dir)
+            report = write_multi_chip_outputs(analysis, run_dir, selected)
             values["corner"].set(chips[0].lot_wafer)
             status.set(f"Wafer multi-cell complete: {len(chips)} cells; minimum RSNM={analysis['worst_rsnm']['rsnm_mv']:.1f} mV, WSNM={analysis['worst_wsnm']['wsnm_mv']:.1f} mV")
             status_label.configure(fg=GREEN)
