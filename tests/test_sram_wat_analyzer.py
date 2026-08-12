@@ -9,7 +9,7 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve,
+    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg,
     analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     educational_sram_metrics,
@@ -588,6 +588,37 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual(set(result["curves"]), {"rsnm_mv", "wsnm_mv", "write_margin_mv"})
             self.assertEqual(result["curves"]["rsnm_mv"]["rows"][0]["chip_id"], "C02")
             self.assertAlmostEqual(result["curves"]["write_margin_mv"]["eye_closure"]["estimated_vdd_v"], .40)
+
+    def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):
+        rows = []
+        for vdd, margin in ((.60, 40.0), (.80, 80.0), (1.00, 95.0)):
+            row = {"vdd_v": vdd, "sample_count": 1}
+            for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
+                row[key] = margin
+                row[f"{key}_chip_id"] = "C01"
+                row[f"{key}_lot_wafer"] = "W01"
+            rows.append(row)
+        result = analyze_estimate_vmin_curves(rows)
+        closure = result["curves"]["rsnm_mv"]["eye_closure"]
+        self.assertTrue(closure["extrapolated"])
+        self.assertAlmostEqual(closure["slope_mv_per_v"], 200.0)
+        self.assertAlmostEqual(closure["estimated_vdd_v"], .40)
+        self.assertEqual((closure["low_vdd_v"], closure["high_vdd_v"]), (.60, .80))
+        svg = estimate_vmin_curve_svg(result["curves"]["rsnm_mv"])
+        self.assertIn("Extrapolated eye-closure VDD 0.4000 V", svg)
+        self.assertIn("Two-lowest-VDD slope: 200.00 mV/V", svg)
+
+    def test_estimate_vmin_rejects_nonpositive_low_vdd_slope(self):
+        rows = []
+        for vdd, margin in ((.60, 80.0), (.80, 60.0), (1.00, 90.0)):
+            row = {"vdd_v": vdd, "sample_count": 1}
+            for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
+                row[key] = margin
+                row[f"{key}_chip_id"] = "C01"
+                row[f"{key}_lot_wafer"] = "W01"
+            rows.append(row)
+        result = analyze_estimate_vmin_curves(rows)
+        self.assertIsNone(result["curves"]["rsnm_mv"]["eye_closure"])
 
     def test_single_and_multi_chip_use_identical_snm_calculation(self):
         """One multi-chip row must numerically match the 6T single-cell result."""
