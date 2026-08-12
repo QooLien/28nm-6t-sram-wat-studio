@@ -3184,7 +3184,7 @@ def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list
 
 
 def _estimate_zero_boundary(rows: list[dict[str, object]], key: str) -> dict[str, object] | None:
-    """Linearly locate the first positive-to-zero margin boundary in measured points."""
+    """Locate margin=0 by interpolation, or extrapolate from the low-VDD end."""
     for low, high in zip(rows, rows[1:]):
         low_value, high_value = float(low[key]), float(high[key])
         if low_value <= 0 < high_value:
@@ -3194,7 +3194,32 @@ def _estimate_zero_boundary(rows: list[dict[str, object]], key: str) -> dict[str
                 estimate = float(low["vdd_v"]) + (0.0 - low_value) * (
                     float(high["vdd_v"]) - float(low["vdd_v"])) / (high_value - low_value)
             return {"estimated_vdd_v": estimate, "low_vdd_v": low["vdd_v"],
-                    "high_vdd_v": high["vdd_v"], "method": "linear interpolation of imported Multi-Cell margins"}
+                    "high_vdd_v": high["vdd_v"], "extrapolated": False,
+                    "method": "linear interpolation of imported Multi-Cell margins"}
+    # When every imported SNM/margin is still positive, the two lowest-VDD
+    # points are closest to the missing eye-closure boundary.  Extend their
+    # local linear slope down to margin=0, but accept only a physically
+    # downward result between 0 V and the lowest measured VDD.
+    if len(rows) >= 2:
+        first, second = rows[0], rows[1]
+        first_vdd, second_vdd = float(first["vdd_v"]), float(second["vdd_v"])
+        first_value, second_value = float(first[key]), float(second[key])
+        delta_vdd = second_vdd - first_vdd
+        if first_value > 0 and second_value > 0 and delta_vdd > 0:
+            slope_mv_per_v = (second_value - first_value) / delta_vdd
+            if slope_mv_per_v > 0:
+                estimate = first_vdd - first_value / slope_mv_per_v
+                if 0 <= estimate < first_vdd:
+                    return {
+                        "estimated_vdd_v": estimate,
+                        "low_vdd_v": first_vdd,
+                        "high_vdd_v": second_vdd,
+                        "low_margin_mv": first_value,
+                        "high_margin_mv": second_value,
+                        "slope_mv_per_v": slope_mv_per_v,
+                        "extrapolated": True,
+                        "method": "linear extrapolation from the two lowest imported VDD margins",
+                    }
     return None
 
 
@@ -3251,13 +3276,17 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
     closure = curve.get("eye_closure")
     if closure:
         x, _ = xy(float(closure["estimated_vdd_v"]), 0)
-        parts += [f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#FF9500" stroke-width="3" stroke-dasharray="8 6"/>',
-                  f'<text x="{x+12:.1f}" y="{top+28}" fill="#C56A00" font-size="16" font-weight="700">Estimated eye-closure VDD {closure["estimated_vdd_v"]:.4f} V</text>']
+        estimate_kind = "Extrapolated" if closure.get("extrapolated") else "Estimated"
+        dash = "4 5" if closure.get("extrapolated") else "8 6"
+        parts += [f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#FF9500" stroke-width="3" stroke-dasharray="{dash}"/>',
+                  f'<text x="{x+12:.1f}" y="{top+28}" fill="#C56A00" font-size="16" font-weight="700">{estimate_kind} eye-closure VDD {closure["estimated_vdd_v"]:.4f} V</text>']
+        if closure.get("extrapolated"):
+            parts.append(f'<text x="{x+12:.1f}" y="{top+52}" fill="#C56A00" font-size="14">Two-lowest-VDD slope: {closure["slope_mv_per_v"]:.2f} mV/V</text>')
     else:
         parts.append(f'<text x="{left+plot_w-8}" y="{top+28}" text-anchor="end" fill="#C56A00" font-size="16" font-weight="700">Eye-closure VDD not bracketed by imported points</text>')
     parts += [f'<text x="{left+plot_w/2}" y="{baseline_y+112}" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">Model VDD (V)</text>',
               f'<text x="38" y="{top+plot_h/2}" transform="rotate(-90 38 {top+plot_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">{label} (mV)</text>',
-              f'<text x="{width/2}" y="{height-18}" text-anchor="middle" fill="#6E6E73" font-size="14">Each point is the lowest measured cell result at that Model VDD. Eye closure is an interpolation estimate, not measured WT Vmin.</text>', '</svg>']
+              f'<text x="{width/2}" y="{height-18}" text-anchor="middle" fill="#6E6E73" font-size="14">Each point is the lowest measured cell result. Boundary uses interpolation when bracketed, otherwise qualified low-VDD linear extrapolation; it is not measured WT Vmin.</text>', '</svg>']
     return "".join(parts)
 
 
@@ -5998,8 +6027,9 @@ def launch_gui() -> None:
         if curve_result:
             curve = curve_result["curves"][curve_kind.get()]
             closure = curve.get("eye_closure")
+            estimate_kind = "extrapolated" if closure and closure.get("extrapolated") else "estimated"
             curve_summary.set(
-                f'{curve["label"]} eye-closure VDD: {closure["estimated_vdd_v"]:.4f} V'
+                f'{curve["label"]} {estimate_kind} eye-closure VDD: {closure["estimated_vdd_v"]:.4f} V'
                 if closure else f'{curve["label"]} eye-closure VDD not bracketed by imported points')
     for key, short_label, _label, _color in _ESTIMATE_VMIN_METRICS:
         ttk.Radiobutton(curve_switch, text=short_label, value=key, variable=curve_kind,
@@ -6150,8 +6180,9 @@ def launch_gui() -> None:
             x, y = xy(closure["estimated_vdd_v"], 0.0)
             curve_canvas.create_line(x, top_margin, x, top_margin + plot_height,
                                      fill="#FF9500", width=2, dash=(6, 4))
+            estimate_kind = "Extrapolated" if closure.get("extrapolated") else "Estimated"
             curve_canvas.create_text(x + 8, top_margin + 12,
-                                     text=f'Eye-closure VDD {closure["estimated_vdd_v"]:.4f} V',
+                                     text=f'{estimate_kind} eye-closure VDD {closure["estimated_vdd_v"]:.4f} V',
                                      anchor="w", fill="#C56A00", font=("Calibri", 12, "bold"))
         curve_canvas.create_text(left_margin + plot_width / 2, height - 24, text="Model VDD (V)",
                                  fill=TEXT, font=("Calibri", 12, "bold"))
@@ -6195,7 +6226,8 @@ def launch_gui() -> None:
             curve = analysis["curves"][curve_kind.get()]
             closure = curve.get("eye_closure")
             if closure:
-                summary = f'{curve["label"]} eye-closure VDD: {closure["estimated_vdd_v"]:.4f} V'
+                estimate_kind = "extrapolated" if closure.get("extrapolated") else "estimated"
+                summary = f'{curve["label"]} {estimate_kind} eye-closure VDD: {closure["estimated_vdd_v"]:.4f} V'
                 curve_summary_label.configure(fg="#C56A00")
             else:
                 summary = f'{curve["label"]} eye-closure VDD not bracketed by imported points'
