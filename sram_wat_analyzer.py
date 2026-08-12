@@ -3129,6 +3129,167 @@ def write_rsnm_vcc_curve_outputs(analysis: dict, out_dir: str | os.PathLike[str]
     return report
 
 
+_ESTIMATE_VMIN_METRICS = (
+    ("rsnm_mv", "RSNM", "Read SNM", "#007AFF"),
+    ("wsnm_mv", "WSNM", "Write SNM", "#AF52DE"),
+    ("write_margin_mv", "Write Margin", "Write Margin", "#34C759"),
+)
+
+
+def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list[dict[str, object]]:
+    """Read one or more Multi-Cell ``multi_chip_snm_summary.csv`` outputs.
+
+    Each source row represents one measured cell.  Values are grouped by Model
+    VDD and reduced conservatively to the minimum cell margin at that VDD.
+    Multiple wafer outputs at the same VDD may be supplied; the resulting
+    point is then the lowest value across all selected wafers.
+    """
+    grouped: dict[float, list[dict[str, object]]] = {}
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Multi-Cell summary was not found: {path}")
+        with path.open(newline="", encoding="utf-8-sig") as source:
+            reader = csv.DictReader(source)
+            required = {"lot_wafer", "chip_id", "model_vdd_v", "rsnm_mv", "wsnm_mv", "write_margin_mv"}
+            if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                raise ValueError(
+                    f"{path.name} is not a Multi-Cell multi_chip_snm_summary.csv export")
+            for number, raw in enumerate(reader, 2):
+                try:
+                    vdd = float(raw["model_vdd_v"])
+                    values = {key: float(raw[key]) for key, *_ in _ESTIMATE_VMIN_METRICS}
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{path.name} row {number}: invalid VDD or margin value") from exc
+                if not 0 < vdd <= SNM_PLOT_AXIS_MAX_V:
+                    raise ValueError(f"{path.name} row {number}: Model VDD must be within 0–{SNM_PLOT_AXIS_MAX_V:.2f} V")
+                grouped.setdefault(vdd, []).append({
+                    "lot_wafer": str(raw["lot_wafer"] or "Wafer"),
+                    "chip_id": str(raw["chip_id"] or "Unknown"), **values,
+                })
+    if len(grouped) < 2:
+        raise ValueError("Select Multi-Cell summaries from at least two Model VDD points")
+    rows: list[dict[str, object]] = []
+    for vdd in sorted(grouped):
+        samples = grouped[vdd]
+        row: dict[str, object] = {"vdd_v": vdd, "sample_count": len(samples),
+                                  "lot_wafers": sorted({str(item["lot_wafer"]) for item in samples})}
+        for key, *_ in _ESTIMATE_VMIN_METRICS:
+            winner = min(samples, key=lambda item: float(item[key]))
+            row[key] = float(winner[key])
+            row[f"{key}_chip_id"] = str(winner["chip_id"])
+            row[f"{key}_lot_wafer"] = str(winner["lot_wafer"])
+        rows.append(row)
+    return rows
+
+
+def _estimate_zero_boundary(rows: list[dict[str, object]], key: str) -> dict[str, object] | None:
+    """Linearly locate the first positive-to-zero margin boundary in measured points."""
+    for low, high in zip(rows, rows[1:]):
+        low_value, high_value = float(low[key]), float(high[key])
+        if low_value <= 0 < high_value:
+            if low_value == 0:
+                estimate = float(low["vdd_v"])
+            else:
+                estimate = float(low["vdd_v"]) + (0.0 - low_value) * (
+                    float(high["vdd_v"]) - float(low["vdd_v"])) / (high_value - low_value)
+            return {"estimated_vdd_v": estimate, "low_vdd_v": low["vdd_v"],
+                    "high_vdd_v": high["vdd_v"], "method": "linear interpolation of imported Multi-Cell margins"}
+    return None
+
+
+def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]]) -> dict:
+    """Build RSNM, WSNM and Write-Margin VDD trends from Multi-Cell summaries."""
+    if len(summary_rows) < 2:
+        raise ValueError("At least two Multi-Cell VDD summary points are required")
+    ordered = sorted(summary_rows, key=lambda row: float(row["vdd_v"]))
+    curves: dict[str, dict] = {}
+    for key, short_label, label, color in _ESTIMATE_VMIN_METRICS:
+        rows = [{"vdd_v": float(item["vdd_v"]), "margin_mv": float(item[key]),
+                 "chip_id": item[f"{key}_chip_id"], "lot_wafer": item[f"{key}_lot_wafer"],
+                 "sample_count": item["sample_count"], "valid": float(item[key]) > 0}
+                for item in ordered]
+        curves[key] = {"key": key, "short_label": short_label, "label": label,
+                       "color": color, "rows": rows,
+                       "eye_closure": _estimate_zero_boundary(ordered, key)}
+    return {"rows": ordered, "curves": curves,
+            "definition": "Each VDD point is the minimum per-cell margin in the imported Multi-Cell summary data."}
+
+
+def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -> str:
+    """Render one imported Multi-Cell conservative margin versus VDD curve."""
+    rows, color, label = curve["rows"], curve["color"], curve["label"]
+    left, top, plot_w, plot_h = 110, 105, 1050, 470
+    maximum = max((row["margin_mv"] for row in rows), default=50.0)
+    y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
+    def xy(vdd: float, value: float) -> tuple[float, float]:
+        return left + vdd / SNM_PLOT_AXIS_MAX_V * plot_w, top + (1 - value / y_max) * plot_h
+    baseline_y = top + plot_h
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        f'<text x="52" y="54" fill="#1D1D1F" font-size="38" font-weight="700">Estimated {label} versus Model VDD</text>',
+        f'<path d="M52 79 h38" stroke="{color}" stroke-width="4"/><text x="101" y="85" fill="#3A3A3C" font-size="16">Minimum cell value from imported Multi-Cell summaries</text>',
+    ]
+    for step in range(7):
+        voltage = step * .2; x, _ = xy(voltage, 0)
+        parts += [f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#E5E5EA"/>',
+                  f'<text x="{x:.1f}" y="{baseline_y+27}" text-anchor="middle" fill="#6E6E73" font-size="14">{voltage:.1f}</text>']
+    for step in range(6):
+        value = y_max * step / 5; _, y = xy(0, value)
+        parts += [f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA"/>',
+                  f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="14">{value:.0f}</text>']
+    points = [xy(row["vdd_v"], row["margin_mv"]) for row in rows]
+    parts.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x,y in points)}" fill="none" stroke="{color}" stroke-width="4" stroke-linejoin="round"/>')
+    for index, (row, (x, y)) in enumerate(zip(rows, points)):
+        anchor = "middle"; dy = -18 if index % 2 == 0 else 30
+        parts += [f'<path d="M{x:.1f} {y+6:.1f} V{baseline_y+35:.1f}" stroke="#B9D7FF" stroke-dasharray="4 5"/>',
+                  f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#FFFFFF" stroke="{color}" stroke-width="3"/>']
+        if row["margin_mv"] > 0:
+            parts.append(f'<text x="{x:.1f}" y="{y+dy:.1f}" text-anchor="{anchor}" fill="#1D1D1F" font-size="16" font-weight="700" style="paint-order:stroke;stroke:#FFFFFF;stroke-width:6">{row["margin_mv"]:.1f} mV</text>')
+        parts.append(f'<text x="{x:.1f}" y="{baseline_y+55:.1f}" text-anchor="middle" fill="#0062CC" font-size="14" font-weight="700">{row["vdd_v"]:.2f} V</text>')
+    closure = curve.get("eye_closure")
+    if closure:
+        x, _ = xy(float(closure["estimated_vdd_v"]), 0)
+        parts += [f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#FF9500" stroke-width="3" stroke-dasharray="8 6"/>',
+                  f'<text x="{x+12:.1f}" y="{top+28}" fill="#C56A00" font-size="16" font-weight="700">Estimated eye-closure VDD {closure["estimated_vdd_v"]:.4f} V</text>']
+    else:
+        parts.append(f'<text x="{left+plot_w-8}" y="{top+28}" text-anchor="end" fill="#C56A00" font-size="16" font-weight="700">Eye-closure VDD not bracketed by imported points</text>')
+    parts += [f'<text x="{left+plot_w/2}" y="{baseline_y+112}" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">Model VDD (V)</text>',
+              f'<text x="38" y="{top+plot_h/2}" transform="rotate(-90 38 {top+plot_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">{label} (mV)</text>',
+              f'<text x="{width/2}" y="{height-18}" text-anchor="middle" fill="#6E6E73" font-size="14">Each point is the lowest measured cell result at that Model VDD. Eye closure is an interpolation estimate, not measured WT Vmin.</text>', '</svg>']
+    return "".join(parts)
+
+
+def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
+                                source_paths: Iterable[str | os.PathLike[str]]) -> Path:
+    """Write all imported Multi-Cell estimate curves and an HTML selector report."""
+    out = Path(out_dir); image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from reportlab.graphics import renderPM
+        from svglib.svglib import svg2rlg
+    except ImportError as exc:
+        raise RuntimeError("PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
+    image_rows = []
+    for index, (key, _short, _label, _color) in enumerate(_ESTIMATE_VMIN_METRICS, 1):
+        svg_name = f"{index:02d}_{key}_estimate_vmin.svg"; png_name = svg_name.replace(".svg", ".png")
+        svg_path = image_dir / svg_name; svg_path.write_text(estimate_vmin_curve_svg(analysis["curves"][key]), encoding="utf-8")
+        drawing = svg2rlg(str(svg_path))
+        if drawing is None: raise RuntimeError("Could not render Estimate Vmin chart")
+        renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
+        image_rows.append((key, png_name))
+    with (out / "multi_chip_snm_summary_combined.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+        fields = ["vdd_v", "sample_count", "rsnm_mv", "rsnm_mv_lot_wafer", "rsnm_mv_chip_id", "wsnm_mv", "wsnm_mv_lot_wafer", "wsnm_mv_chip_id", "write_margin_mv", "write_margin_mv_lot_wafer", "write_margin_mv_chip_id"]
+        writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader(); writer.writerows({key: row.get(key) for key in fields} for row in analysis["rows"])
+    backup_dir = out / "imported_multi_chip_summaries"; backup_dir.mkdir(exist_ok=True)
+    for index, source in enumerate(source_paths, 1):
+        source_path = Path(source); shutil.copy2(source_path, backup_dir / f"{index:02d}_{source_path.name}")
+    sections = "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows)
+    report = out / "estimate_vmin_report.html"
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Estimate Vmin Curve</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1500px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}.note{{color:#6e6e73}}</style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1><p class="note">{html.escape(analysis["definition"])}</p>{sections}<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>.</p></main></body></html>''', encoding="utf-8")
+    return report
+
+
 def write_trip_margin_curve_svg(analysis: dict, width: int = 1280,
                                 height: int = 780) -> str:
     """Render WTM versus VDD with the same visual grammar as the RSNM curve."""
@@ -5263,8 +5424,7 @@ def launch_gui() -> None:
     mismatch_boundary_tab = ttk.Frame(notebook, style="Root.TFrame")
     training_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
-    notebook.add(curve_tab, text="RSNM vs VDD Curve")
-    notebook.add(write_margin_tab, text="Write Trip Margin")
+    notebook.add(curve_tab, text="Estimate Vmin Curve")
     notebook.add(mismatch_boundary_tab, text="RSNM Mismatch Boundary")
     notebook.add(training_tab, text="SRAM Training Lab")
 
@@ -5791,7 +5951,8 @@ def launch_gui() -> None:
     excel_analyze_button = ttk.Button(right_footer, text="Analyze Excel VDD Sweep", style="Quiet.TButton", command=execute_excel_sweep)
     excel_analyze_button.pack(fill="x", pady=(7, 0))
 
-    # Dedicated manual VDD / grouped PU-PG-PD curve-analysis tab.
+    # Estimate Vmin tab: consumes conservative results exported by the
+    # Multi-Cell 6T analysis rather than a second manual/IV input path.
     curve_tab.columnconfigure(0, weight=6)
     curve_tab.columnconfigure(1, weight=7)
     curve_tab.rowconfigure(0, weight=1)
@@ -5802,193 +5963,22 @@ def launch_gui() -> None:
     curve_chart_card.columnconfigure(0, weight=1)
     curve_chart_card.rowconfigure(3, weight=1)
 
-    ttk.Label(curve_input_card, text="Manual VDD Sweep Inputs", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(curve_input_card, text="Multi-Cell Estimate Vmin", style="Section.TLabel").pack(anchor="w")
     ttk.Label(curve_input_card,
-              text="Enter grouped PU / PG / PD Vt and Isat measured at each VDD. Blank rows are ignored.",
-              style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(2, 10))
-
-    curve_columns = (
-        ("vcc", "VDD", TEXT),
-        ("pu_vt", "PU Vt", RED), ("pu_ids", "PU Isat", RED),
-        ("pg_vt", "PG Vt", GREEN), ("pg_ids", "PG Isat", GREEN),
-        ("pd_vt", "PD Vt", BLUE), ("pd_ids", "PD Isat", BLUE),
-    )
-    curve_row_vars: list[dict[str, tk.StringVar]] = []
-    curve_table = ttk.Frame(curve_input_card, style="Card.TFrame")
-    curve_table.pack(fill="x")
-    curve_table.columnconfigure(0, minsize=30)
-    for column in range(1, len(curve_columns) + 1):
-        curve_table.columnconfigure(column, minsize=72, weight=1, uniform="curve_data")
-    tk.Label(curve_table, text="#", bg=CARD, fg=SECONDARY,
-             font=("Calibri", 9, "bold")).grid(
-                 row=0, column=0, padx=(0, 3), pady=(0, 3), sticky="ew")
-    for column, (_key, label, color) in enumerate(curve_columns, 1):
-        unit = "(V)" if _key == "vcc" or _key.endswith("_vt") else "(uA)"
-        tk.Label(curve_table, text=f"{label}\n{unit}", bg=CARD, fg=color,
-                 font=("Calibri", 8, "bold")).grid(
-                     row=0, column=column, padx=3, pady=(0, 3), sticky="ew")
-    curve_row_widgets: list[tk.Widget] = []
-
-    def default_curve_rows() -> list[dict[str, str]]:
-        base_vt = {"pu": .385, "pg": .365, "pd": .355}
-        base_ids = {"pu": 44.0, "pg": 82.0, "pd": 124.0}
-        calibration_vcc = .90
-
-        def scaled_ids(kind: str, vcc_v: float) -> float:
-            denominator = calibration_vcc - base_vt[kind]
-            overdrive = max(vcc_v - base_vt[kind], 0.0)
-            return base_ids[kind] * (overdrive / denominator) ** 2
-
-        result = []
-        for vcc_v in (.30, .34, .35, .36, .37, .38, .40, .45, .50, .60, .80, .90, 1.00, 1.20):
-            row = {"vcc": f"{vcc_v:.2f}"}
-            for kind in ("pu", "pg", "pd"):
-                row[f"{kind}_vt"] = f"{base_vt[kind]:.3f}"
-                row[f"{kind}_ids"] = f"{scaled_ids(kind, vcc_v):.4g}"
-            result.append(row)
-        return result
-
-    def paste_curve_grid(event: tk.Event, start_row: int, start_column: int) -> str:
-        """Paste a rectangular tab-delimited Excel range into the VDD table."""
-        try:
-            clipboard = event.widget.clipboard_get()
-        except tk.TclError:
-            return "break"
-        rows = [line.split("\t") for line in clipboard.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
-        if rows and not any(cell.strip() for cell in rows[-1]):
-            rows.pop()
-        if not rows:
-            return "break"
-
-        # Copying a whole Excel table often includes its header.  Ignore that
-        # one row while still accepting ordinary numeric first rows.
-        first_row = " ".join(cell.strip().lower() for cell in rows[0])
-        if "vdd" in first_row and ("pu" in first_row or "isat" in first_row):
-            rows.pop(0)
-        if not rows:
-            return "break"
-        if start_row + len(rows) > 20:
-            messagebox.showwarning("Excel paste", "The VDD sweep table supports at most 20 rows.")
-            return "break"
-
-        while len(curve_row_vars) < start_row + len(rows):
-            curve_row_vars.append({key: tk.StringVar() for key, _label, _color in curve_columns})
-        for row_offset, source_row in enumerate(rows):
-            for column_offset, value in enumerate(source_row):
-                column = start_column + column_offset
-                if column >= len(curve_columns):
-                    break
-                key = curve_columns[column][0]
-                curve_row_vars[start_row + row_offset][key].set(value.strip())
-        rebuild_curve_rows()
-        curve_status.set(f"Pasted {len(rows)} Excel row(s); review values, then analyze")
-        curve_status_label.configure(fg=SECONDARY)
-        return "break"
-
-    def rebuild_curve_rows() -> None:
-        for child in curve_row_widgets:
-            child.destroy()
-        curve_row_widgets.clear()
-        for row_index, variables in enumerate(curve_row_vars):
-            number_label = tk.Label(curve_table, text=str(row_index + 1), bg=CARD, fg=SECONDARY,
-                                    font=("Calibri", 8))
-            number_label.grid(row=row_index + 1, column=0, padx=(0, 3), pady=2, sticky="ew")
-            curve_row_widgets.append(number_label)
-            for column, (key, _label, _color) in enumerate(curve_columns, 1):
-                entry = ttk.Entry(curve_table, textvariable=variables[key], width=7,
-                                  style="Apple.TEntry")
-                entry.grid(row=row_index + 1, column=column, padx=3, pady=2, sticky="ew")
-                entry.bind("<Control-v>",
-                           lambda event, r=row_index, c=column - 1: paste_curve_grid(event, r, c))
-                curve_row_widgets.append(entry)
-
-    def append_curve_row(data: dict[str, object] | None = None) -> None:
-        if len(curve_row_vars) >= 20:
-            messagebox.showinfo("VDD sweep", "A maximum of 20 manual rows is supported.")
-            return
-        data = data or {}
-        curve_row_vars.append({key: tk.StringVar(value=str(data.get(key, "")))
-                               for key, _label, _color in curve_columns})
-        rebuild_curve_rows()
-
-    def remove_curve_row() -> None:
-        if len(curve_row_vars) <= 2:
-            messagebox.showinfo("VDD sweep", "Keep at least two input rows.")
-            return
-        curve_row_vars.pop()
-        rebuild_curve_rows()
-
-    def restore_curve_example() -> None:
-        curve_row_vars.clear()
-        for data in default_curve_rows():
-            append_curve_row(data)
-        curve_status.set("Example restored; edit the values and analyze")
-        curve_status_label.configure(fg=SECONDARY)
-
-    def import_iv_curve_excel() -> None:
-        selected = filedialog.askopenfilename(
-            title="Import PU / PG / PD raw IV Curve Excel",
-            filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
-        if not selected:
-            return
-        try:
-            fallback_vt = {
-                family: statlib.fmean(float(wat_values[f"{family}{side}_vt"].get()) for side in ("1", "2"))
-                for family in ("pu", "pg", "pd")
-            }
-            lot, points, extracted = read_iv_curve_excel(selected, fallback_vt)
-            imported_rows = [{
-                "vcc": f"{point.vcc_v:.6g}",
-                "pu_vt": f"{point.pu.vt:.6g}", "pu_ids": f"{point.pu.ids:.6g}",
-                "pg_vt": f"{point.pg.vt:.6g}", "pg_ids": f"{point.pg.ids:.6g}",
-                "pd_vt": f"{point.pd.vt:.6g}", "pd_ids": f"{point.pd.ids:.6g}",
-            } for point in points]
-            curve_row_vars.clear()
-            for row in imported_rows:
-                curve_row_vars.append({key: tk.StringVar(value=value) for key, value in row.items()})
-            rebuild_curve_rows()
-            values["corner"].set(lot)
-            curve_status.set(f"Imported {len(points)} IV-curve VDD point(s); Idsat extracted at Vg = VDD ({len(extracted)} curves)")
-            curve_status_label.configure(fg=GREEN)
-        except Exception as exc:
-            messagebox.showerror("IV curve import", str(exc))
-
-    def save_iv_curve_template() -> None:
-        selected = filedialog.asksaveasfilename(
-            title="Save Raw IV Curve Excel Template", initialfile="HV28_IV_Curve_Raw_Data_Template.xlsx",
-            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")])
-        if not selected:
-            return
-        try:
-            template = write_iv_curve_excel_template(selected)
-            curve_status.set(f"IV curve template saved: {template.name}")
-            curve_status_label.configure(fg=GREEN)
-        except Exception as exc:
-            messagebox.showerror("IV curve template", str(exc))
-
-    saved_curve_rows = saved_state.get("rsnm_vcc_rows", [])
-    initial_curve_rows = (saved_curve_rows if isinstance(saved_curve_rows, list) and
-                          len(saved_curve_rows) >= 2 else default_curve_rows())
-    for saved_row in initial_curve_rows[:20]:
-        append_curve_row(saved_row if isinstance(saved_row, dict) else {})
-
-    curve_controls = ttk.Frame(curve_input_card, style="Card.TFrame")
-    curve_controls.pack(fill="x", pady=(10, 7))
-    ttk.Button(curve_controls, text="+ Add Row", style="Quiet.TButton",
-               command=append_curve_row).pack(side="left")
-    ttk.Button(curve_controls, text="Remove Last", style="Quiet.TButton",
-               command=remove_curve_row).pack(side="left", padx=(7, 0))
-    ttk.Button(curve_controls, text="Paste Excel", style="Quiet.TButton",
-               command=lambda: paste_curve_grid(type("PasteEvent", (), {"widget": root})(), 0, 0)).pack(side="left", padx=(7, 0))
-    ttk.Button(curve_controls, text="Import IV Curve...", style="Quiet.TButton",
-               command=import_iv_curve_excel).pack(side="left", padx=(7, 0))
-    ttk.Button(curve_controls, text="IV Template...", style="Quiet.TButton",
-               command=save_iv_curve_template).pack(side="left", padx=(7, 0))
-    ttk.Button(curve_controls, text="Restore Example", style="Quiet.TButton",
-               command=restore_curve_example).pack(side="right")
-    ttk.Label(curve_input_card,
-              text="Excel: select the first target cell and press Ctrl+V to paste a tab-delimited range. Import IV Curve reads PU/PG/PD raw Id-Vg sheets and extracts |Idsat| at Vg = Model VDD. Grouped rows map PU/PG/PD symmetrically to both sides of the 6T cell.",
-              style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(0, 9))
+              text="Select one or more multi_chip_snm_summary.csv files exported by 6T Bitcell Analysis. The selected data must contain at least two Model VDD values; each VDD point uses the minimum measured cell result.",
+              style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(2, 12))
+    selected_summary_paths: list[str] = []
+    selected_summary_text = tk.StringVar(value="No Multi-Cell summary selected")
+    tk.Label(curve_input_card, textvariable=selected_summary_text, bg=CARD, fg=SECONDARY,
+             font=("Calibri", 10), anchor="w", justify="left", wraplength=560).pack(fill="x", pady=(0, 10))
+    saved_summary_paths = saved_state.get("estimate_vmin_summary_paths", [])
+    if isinstance(saved_summary_paths, list):
+        selected_summary_paths.extend(
+            str(item) for item in saved_summary_paths if Path(str(item)).is_file())
+    if selected_summary_paths:
+        selected_summary_text.set(
+            f"{len(selected_summary_paths)} previously selected summary file(s)\n" +
+            "\n".join(Path(item).name for item in selected_summary_paths[:5]))
 
     curve_status = tk.StringVar(value="Ready to analyze the VDD sweep")
     curve_status_label = tk.Label(curve_input_card, textvariable=curve_status, bg=CARD, fg=SECONDARY,
@@ -5998,12 +5988,23 @@ def launch_gui() -> None:
                                      style="Apple.Horizontal.TProgressbar")
     curve_progress.pack(fill="x", pady=(0, 9))
 
-    ttk.Label(curve_chart_card, text="Estimated Read SNM Curve", style="ChartTitle.TLabel").grid(
-        row=0, column=0, sticky="w")
-    ttk.Label(curve_chart_card,
-              text="X: Model VDD (V)  /  Y: RSNM (mV). Vertical guides map each point to VDD; X marks indicate no valid butterfly eye.",
-              style="Meta.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 6))
-    curve_summary = tk.StringVar(value="Analyze at least two VDD rows to display the curve.")
+    curve_kind = tk.StringVar(value="rsnm_mv")
+    curve_title = tk.StringVar(value="Estimate Vmin Curve")
+    ttk.Label(curve_chart_card, textvariable=curve_title, style="ChartTitle.TLabel").grid(row=0, column=0, sticky="w")
+    curve_switch = ttk.Frame(curve_chart_card, style="Card.TFrame")
+    curve_switch.grid(row=1, column=0, sticky="w", pady=(4, 6))
+    def select_curve_kind() -> None:
+        draw_curve_chart()
+        if curve_result:
+            curve = curve_result["curves"][curve_kind.get()]
+            closure = curve.get("eye_closure")
+            curve_summary.set(
+                f'{curve["label"]} eye-closure VDD: {closure["estimated_vdd_v"]:.4f} V'
+                if closure else f'{curve["label"]} eye-closure VDD not bracketed by imported points')
+    for key, short_label, _label, _color in _ESTIMATE_VMIN_METRICS:
+        ttk.Radiobutton(curve_switch, text=short_label, value=key, variable=curve_kind,
+                        command=select_curve_kind).pack(side="left", padx=(0, 12))
+    curve_summary = tk.StringVar(value="Import at least two Multi-Cell summary CSV files to display an estimate curve.")
     curve_summary_label = tk.Label(curve_chart_card, textvariable=curve_summary, bg=CARD, fg=SECONDARY,
                                    font=("Calibri", 10, "bold"), anchor="w", justify="left")
     curve_summary_label.grid(row=2, column=0, sticky="ew", pady=(0, 6))
@@ -6021,13 +6022,15 @@ def launch_gui() -> None:
         plot_width = width - left_margin - right_margin
         plot_height = height - top_margin - bottom_margin
         if not curve_result:
-            curve_canvas.create_text(width / 2, height / 2, text="RSNM curve will appear here",
+            curve_canvas.create_text(width / 2, height / 2, text="Estimate Vmin curve will appear here",
                                      fill=SECONDARY, font=("Calibri", 13))
             return
-        rows = curve_result["rows"]
-        valid_rows = [row for row in rows if row["rsnm_mv"] is not None]
-        max_rsnm = max((row["rsnm_mv"] for row in valid_rows), default=50.0)
+        curve = curve_result["curves"][curve_kind.get()]
+        rows = curve["rows"]
+        max_rsnm = max((row["margin_mv"] for row in rows), default=50.0)
         y_max = max(50.0, math.ceil(max_rsnm / 50.0) * 50.0)
+        color = curve["color"]
+        curve_title.set(f'Estimated {curve["label"]} Curve')
 
         def xy(vcc_v: float, rsnm_mv: float) -> tuple[float, float]:
             return (left_margin + vcc_v / SNM_PLOT_AXIS_MAX_V * plot_width,
@@ -6051,27 +6054,26 @@ def launch_gui() -> None:
                                  left_margin + plot_width, top_margin + plot_height, fill=TEXT, width=2)
 
         display_points: list[tuple[float, float]] = []
-        closure = curve_result.get("eye_closure")
+        closure = curve.get("eye_closure")
         if closure:
-            display_points.append(xy(closure["estimated_vcc_v"], 0.0))
-        display_points.extend(xy(row["vcc_v"], row["rsnm_mv"]) for row in valid_rows)
+            display_points.append(xy(closure["estimated_vdd_v"], 0.0))
+        display_points.extend(xy(row["vdd_v"], row["margin_mv"]) for row in rows)
         baseline_y = top_margin + plot_height
-        voltage_labels = [(xy(row["vcc_v"], 0.0)[0], f'{row["vcc_v"]:.2f} V')
-                          for row in valid_rows]
+        voltage_labels = [(xy(row["vdd_v"], 0.0)[0], f'{row["vdd_v"]:.2f} V') for row in rows]
         voltage_label_rows = _stagger_label_rows(
             voltage_labels, character_width=7.2, minimum_gap=7.0)
         voltage_label_y = [baseline_y + 44 + label_row * 18
                            for label_row in voltage_label_rows]
-        for row, label_y in zip(valid_rows, voltage_label_y):
-            guide_x, guide_y = xy(row["vcc_v"], row["rsnm_mv"])
+        for row, label_y in zip(rows, voltage_label_y):
+            guide_x, guide_y = xy(row["vdd_v"], row["margin_mv"])
             curve_canvas.create_line(guide_x, guide_y + 5, guide_x, label_y - 13,
                                      fill="#B9D7FF", width=1, dash=(3, 4))
             curve_canvas.create_text(
-                guide_x, label_y, text=f'{row["vcc_v"]:.2f} V',
+                guide_x, label_y, text=f'{row["vdd_v"]:.2f} V',
                 fill="#0062CC", font=("Calibri", 11, "bold"))
         if len(display_points) >= 2:
             curve_canvas.create_line(*[coordinate for point in display_points for coordinate in point],
-                                     fill=BLUE, width=3, smooth=False)
+                                     fill=color, width=3, smooth=False)
 
         curve_segment_boxes = [
             (int(min(first[0], second[0]) - 5), int(min(first[1], second[1]) - 5),
@@ -6094,15 +6096,17 @@ def launch_gui() -> None:
             (0, -22, "s"), (0, 22, "n"),
             (-22, 0, "e"), (22, 0, "w"),
         )
-        for index, row in enumerate(valid_rows):
-            x, y = xy(row["vcc_v"], row["rsnm_mv"])
-            curve_canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=CARD, outline=BLUE, width=2)
+        for index, row in enumerate(rows):
+            x, y = xy(row["vdd_v"], row["margin_mv"])
+            curve_canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=CARD, outline=color, width=2)
+            if row["margin_mv"] <= 0:
+                continue
             ordered_candidates = label_candidates[index % 4:] + label_candidates[:index % 4]
             chosen_item = None
             for label_dx, label_dy, label_anchor in ordered_candidates:
                 label_item = curve_canvas.create_text(
                     x + label_dx, y + label_dy,
-                    text=f'{row["rsnm_mv"]:.1f} mV', fill=TEXT,
+                    text=f'{row["margin_mv"]:.1f} mV', fill=TEXT,
                     anchor=label_anchor, font=("Calibri", 11, "bold"))
                 bbox = curve_canvas.bbox(label_item)
                 within_plot = bool(bbox and bbox[0] >= left_margin + 3 and
@@ -6126,7 +6130,7 @@ def launch_gui() -> None:
             if chosen_item is None:
                 fallback_y = max(top_margin + 12, min(y - 14, baseline_y - 12))
                 chosen_item = curve_canvas.create_text(
-                    x, fallback_y, text=f'{row["rsnm_mv"]:.1f} mV', fill=TEXT,
+                    x, fallback_y, text=f'{row["margin_mv"]:.1f} mV', fill=TEXT,
                     anchor="s", font=("Calibri", 11, "bold"))
                 fallback_bbox = curve_canvas.bbox(chosen_item)
                 if fallback_bbox:
@@ -6137,21 +6141,21 @@ def launch_gui() -> None:
                         fill=CARD, outline="")
                     curve_canvas.tag_lower(label_background, chosen_item)
         for row in rows:
-            if row["valid_eye"]:
+            if row["valid"]:
                 continue
-            x, y = xy(row["vcc_v"], 0.0)
+            x, y = xy(row["vdd_v"], 0.0)
             curve_canvas.create_line(x - 4, y - 4, x + 4, y + 4, fill=SECONDARY, width=2)
             curve_canvas.create_line(x + 4, y - 4, x - 4, y + 4, fill=SECONDARY, width=2)
         if closure:
-            x, y = xy(closure["estimated_vcc_v"], 0.0)
+            x, y = xy(closure["estimated_vdd_v"], 0.0)
             curve_canvas.create_line(x, top_margin, x, top_margin + plot_height,
                                      fill="#FF9500", width=2, dash=(6, 4))
             curve_canvas.create_text(x + 8, top_margin + 12,
-                                     text=f'Eye-closure VDD {closure["estimated_vcc_v"]:.4f} V',
+                                     text=f'Eye-closure VDD {closure["estimated_vdd_v"]:.4f} V',
                                      anchor="w", fill="#C56A00", font=("Calibri", 12, "bold"))
         curve_canvas.create_text(left_margin + plot_width / 2, height - 24, text="Model VDD (V)",
                                  fill=TEXT, font=("Calibri", 12, "bold"))
-        curve_canvas.create_text(18, top_margin + plot_height / 2, text="Read SNM (mV)", angle=90,
+        curve_canvas.create_text(18, top_margin + plot_height / 2, text=f'{curve["label"]} (mV)', angle=90,
                                  fill=TEXT, font=("Calibri", 12, "bold"))
 
     curve_canvas.bind("<Configure>", draw_curve_chart)
@@ -6159,36 +6163,19 @@ def launch_gui() -> None:
 
     curve_result_queue: queue.Queue = queue.Queue()
 
-    def collect_curve_inputs() -> tuple[list[RsnmVccPoint], Config]:
-        points: list[RsnmVccPoint] = []
-        for row_number, variables in enumerate(curve_row_vars, 1):
-            raw = {key: variable.get().strip() for key, variable in variables.items()}
-            if not any(raw.values()):
-                continue
-            missing = [label for key, label, _color in curve_columns if not raw[key]]
-            if missing:
-                raise ValueError(f'Row {row_number}: missing {", ".join(missing)}')
-            points.append(RsnmVccPoint(
-                float(raw["vcc"]),
-                MosWat(float(raw["pu_vt"]), float(raw["pu_ids"])),
-                MosWat(float(raw["pg_vt"]), float(raw["pg_ids"])),
-                MosWat(float(raw["pd_vt"]), float(raw["pd_ids"])),
-            ))
-        resolved_assumptions = {}
-        for key, _label, _unit in assumption_specs:
-            raw = assumption_values[key].get().strip()
-            resolved_assumptions[key] = getattr(config_defaults, key) if not raw else float(raw)
-        cfg = Config(nominal_vdd=float(numeric["nominal_vdd"].get()),
-                     wat_vdd=float(numeric["wat_vdd"].get()), **resolved_assumptions)
-        validate_config(cfg)
-        return points, cfg
+    def import_multi_cell_summaries() -> None:
+        selected = filedialog.askopenfilenames(title="Import Multi-Cell SNM Summary CSV", initialdir=values["out"].get(), filetypes=[("Multi-Cell summary CSV", "*.csv"), ("All files", "*.*")])
+        if not selected: return
+        selected_summary_paths[:] = list(selected)
+        selected_summary_text.set(f"{len(selected_summary_paths)} summary file(s) selected\n" + "\n".join(Path(item).name for item in selected_summary_paths[:5]))
+        curve_status.set("Ready to estimate Vmin curves from imported Multi-Cell summaries")
+        curve_status_label.configure(fg=SECONDARY)
 
-    def curve_worker(points: list[RsnmVccPoint], cfg: Config,
-                     out_path: Path, wafer_id: str) -> None:
+    def curve_worker(summary_paths: list[str], out_path: Path, wafer_id: str) -> None:
         try:
-            analysis = analyze_rsnm_vcc_curve(points, cfg)
-            run_dir = create_run_output_dir(out_path, wafer_id, "rsnm_vdd_curve")
-            report = write_rsnm_vcc_curve_outputs(analysis, run_dir)
+            analysis = analyze_estimate_vmin_curves(read_multi_chip_snm_summary(summary_paths))
+            run_dir = create_run_output_dir(out_path, wafer_id, "estimate_vmin_curve")
+            report = write_estimate_vmin_outputs(analysis, run_dir, summary_paths)
             curve_result_queue.put((True, analysis, report))
         except Exception as exc:
             curve_result_queue.put((False, None, exc))
@@ -6205,12 +6192,13 @@ def launch_gui() -> None:
         if ok:
             curve_result = analysis
             curve_report_path = Path(payload)
-            closure = analysis.get("eye_closure")
+            curve = analysis["curves"][curve_kind.get()]
+            closure = curve.get("eye_closure")
             if closure:
-                summary = f'Estimated eye-closure VDD: {closure["estimated_vcc_v"]:.4f} V'
+                summary = f'{curve["label"]} eye-closure VDD: {closure["estimated_vdd_v"]:.4f} V'
                 curve_summary_label.configure(fg="#C56A00")
             else:
-                summary = "Eye-closure VDD not bracketed by the entered rows"
+                summary = f'{curve["label"]} eye-closure VDD not bracketed by imported points'
                 curve_summary_label.configure(fg=SECONDARY)
             curve_summary.set(summary)
             curve_status.set(
@@ -6219,27 +6207,25 @@ def launch_gui() -> None:
             curve_open_button.state(["!disabled"])
             draw_curve_chart()
         else:
-            curve_status.set("RSNM curve analysis could not be completed")
+            curve_status.set("Estimate Vmin analysis could not be completed")
             curve_status_label.configure(fg=RED)
-            messagebox.showerror("RSNM vs VDD analysis", str(payload))
+            messagebox.showerror("Estimate Vmin Curve", str(payload))
 
     def execute_curve_analysis() -> None:
-        try:
-            points, cfg = collect_curve_inputs()
-        except Exception as exc:
-            curve_status.set("Check the VDD sweep input values")
+        if not selected_summary_paths:
+            curve_status.set("Select at least one Multi-Cell summary CSV file")
             curve_status_label.configure(fg=RED)
-            messagebox.showerror("Invalid VDD sweep input", str(exc))
+            messagebox.showerror("Estimate Vmin Curve", "Select Multi-Cell summary CSV data containing at least two Model VDD points.")
             return
-        curve_status.set("Calculating Read SNM at each VDD point...")
+        curve_status.set("Combining minimum RSNM / WSNM / Write Margin by Model VDD...")
         curve_status_label.configure(fg=BLUE)
         curve_analyze_button.state(["disabled"])
         curve_open_button.state(["disabled"])
         curve_progress.start(10)
-        wafer_id = values["corner"].get().strip() or "Manual"
+        wafer_id = values["corner"].get().strip() or "Multi_Cell"
         output_path = Path(values["out"].get())
         threading.Thread(target=curve_worker,
-                         args=(points, cfg, output_path, wafer_id), daemon=True).start()
+                         args=(list(selected_summary_paths), output_path, wafer_id), daemon=True).start()
         root.after(80, poll_curve_result)
 
     def open_curve_report() -> None:
@@ -6248,7 +6234,9 @@ def launch_gui() -> None:
 
     curve_action_row = ttk.Frame(curve_input_card, style="Card.TFrame")
     curve_action_row.pack(side="bottom", fill="x", pady=(8, 0))
-    curve_analyze_button = ttk.Button(curve_action_row, text="Analyze RSNM vs VDD",
+    ttk.Button(curve_action_row, text="Import Multi-Cell Summary CSV...", style="Quiet.TButton",
+               command=import_multi_cell_summaries).pack(fill="x", pady=(0, 7))
+    curve_analyze_button = ttk.Button(curve_action_row, text="Analyze Estimate Vmin Curves",
                                       style="Accent.TButton", command=execute_curve_analysis)
     curve_analyze_button.pack(fill="x")
     curve_open_button = ttk.Button(curve_action_row, text="Open HTML Result",
@@ -6557,10 +6545,7 @@ def launch_gui() -> None:
             "numeric": {key: variable.get() for key, variable in numeric.items()},
             "assumptions": {key: variable.get() for key, variable in assumption_values.items()},
             "training": {key: variable.get() for key, variable in training_values.items()},
-            "rsnm_vcc_rows": [
-                {key: variable.get() for key, variable in row.items()}
-                for row in curve_row_vars
-            ],
+            "estimate_vmin_summary_paths": list(selected_summary_paths),
         }
         try:
             save_gui_state(state)

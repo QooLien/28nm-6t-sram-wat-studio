@@ -9,12 +9,12 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve,
+    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve,
     analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     educational_sram_metrics,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
-    read_iv_curve_excel, read_multi_chip_6t_excel, read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
+    read_iv_curve_excel, read_multi_chip_6t_excel, read_multi_chip_snm_summary, read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_mismatch_boundary_outputs,
     write_iv_curve_excel_template, write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
@@ -570,6 +570,24 @@ class AnalyzerTests(unittest.TestCase):
                           (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
             self.assertIn(">-44.00</text>",
                           (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
+
+    def test_multi_cell_summary_builds_three_estimate_vmin_curves(self):
+        with tempfile.TemporaryDirectory() as td:
+            fields = ["lot_wafer", "chip_id", "model_vdd_v", "rsnm_mv", "wsnm_mv", "write_margin_mv"]
+            paths = []
+            for vdd, rsnm, wsnm, write_margin in ((.40, 0.0, 0.0, 0.0), (.60, 80.0, 50.0, 40.0)):
+                path = Path(td) / f"summary_{vdd:.2f}.csv"
+                with path.open("w", newline="", encoding="utf-8-sig") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader()
+                    writer.writerow({"lot_wafer": "W01", "chip_id": "C01", "model_vdd_v": vdd,
+                                     "rsnm_mv": rsnm + 5, "wsnm_mv": wsnm + 5, "write_margin_mv": write_margin + 5})
+                    writer.writerow({"lot_wafer": "W01", "chip_id": "C02", "model_vdd_v": vdd,
+                                     "rsnm_mv": rsnm, "wsnm_mv": wsnm, "write_margin_mv": write_margin})
+                paths.append(path)
+            result = analyze_estimate_vmin_curves(read_multi_chip_snm_summary(paths))
+            self.assertEqual(set(result["curves"]), {"rsnm_mv", "wsnm_mv", "write_margin_mv"})
+            self.assertEqual(result["curves"]["rsnm_mv"]["rows"][0]["chip_id"], "C02")
+            self.assertAlmostEqual(result["curves"]["write_margin_mv"]["eye_closure"]["estimated_vdd_v"], .40)
 
     def test_single_and_multi_chip_use_identical_snm_calculation(self):
         """One multi-chip row must numerically match the 6T single-cell result."""
