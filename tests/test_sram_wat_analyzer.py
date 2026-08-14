@@ -605,7 +605,7 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("Largest RSNM slope", svg)
         self.assertIn("0.50 V", svg)
         stacked = estimate_vmin_stacked_svg(result)
-        self.assertIn("Estimate Vmin Curves — Stacked View", stacked)
+        self.assertIn("Estimate Vmin Curves - Comparison View", stacked)
         self.assertIn("WL Write Margin", stacked)
 
     def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):

@@ -3611,7 +3611,7 @@ def write_assist_sensitivity_svg(analysis: dict, width: int = 1280,
     return "".join(parts)
 
 
-def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 1120) -> str:
+def _legacy_estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 1120) -> str:
     """Four aligned VDD trend panels, each retaining its own mV scale."""
     left, right, top, bottom = 125, 65, 92, 58
     panel_gap = 22
@@ -3644,6 +3644,76 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 1
             parts += [f'<path d="M{marker_x:.1f} {panel_top} V{panel_bottom}" stroke="#FF385C" stroke-width="2" stroke-dasharray="5 5"/>',
                       f'<text x="{marker_x+7:.1f}" y="{panel_top+19:.1f}" fill="#C13515" font-size="13" font-weight="700">Largest slope: {marker["vdd_v"]:.2f} V</text>']
     parts += [f'<text x="{left+plot_w/2}" y="{height-16}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
+    return "".join(parts)
+
+
+def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 920) -> str:
+    """Render paired comparison panels for SNM and the two write margins."""
+    groups = (
+        ("Read / Write SNM", ("rsnm_mv", "wsnm_mv")),
+        ("Write Margin / WL Write Margin", ("write_margin_mv", "wl_write_margin_mv")),
+    )
+    # Reserve independent bands for the report header, each panel header,
+    # axis tick labels and the next panel.  This prevents the lower title and
+    # legend from colliding with the upper panel's VDD labels.
+    left, right, top, bottom, gap = 125, 65, 148, 72, 104
+    plot_w = width - left - right
+    panel_h = (height - top - bottom - gap) / len(groups)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="56" y="52" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
+        '<text x="56" y="78" fill="#6E6E73" font-size="16">Top: Read / Write SNM. Bottom: normal-BL and WL write margins. X-axis is Model VDD (V).</text>',
+    ]
+    for index, (group_label, keys) in enumerate(groups):
+        panel_top = top + index * (panel_h + gap)
+        panel_bottom = panel_top + panel_h
+        curves = [analysis["curves"][key] for key in keys]
+        maximum = max((row["margin_mv"] for curve in curves for row in curve["rows"]), default=50.0)
+        y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
+
+        def xy(vdd: float, margin: float) -> tuple[float, float]:
+            return (left + vdd / SNM_PLOT_AXIS_MAX_V * plot_w,
+                    panel_top + (1 - margin / y_max) * panel_h)
+
+        header_y = panel_top - 38
+        parts.append(f'<text x="{left}" y="{header_y:.1f}" fill="#1D1D1F" font-size="21" font-weight="700">{group_label}</text>')
+        legend_x = left + 360
+        for curve in curves:
+            parts += [f'<path d="M{legend_x} {header_y-6:.1f} h26" stroke="{curve["color"]}" stroke-width="4"/>',
+                      f'<text x="{legend_x+34}" y="{header_y:.1f}" fill="#3A3A3C" font-size="15">{curve["label"]}</text>']
+            legend_x += 220
+        for step in range(5):
+            margin = y_max * step / 4
+            _x, y = xy(0, margin)
+            parts += [f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA"/>',
+                      f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{margin:.0f}</text>']
+        for vdd_step in range(7):
+            x, _y = xy(vdd_step * .2, 0)
+            parts.append(f'<path d="M{x:.1f} {panel_top} V{panel_bottom}" stroke="#F1F1F4"/>')
+        for curve in curves:
+            points = [xy(row["vdd_v"], row["margin_mv"]) for row in curve["rows"]]
+            point_string = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+            parts.append(f'<polyline points="{point_string}" fill="none" stroke="{curve["color"]}" stroke-width="3.5"/>')
+            for _row, (x, y) in zip(curve["rows"], points):
+                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
+        if "rsnm_mv" in keys:
+            rows = analysis["curves"]["rsnm_mv"]["rows"]
+            if len(rows) >= 2:
+                _low, marker = max(
+                    zip(rows, rows[1:]),
+                    key=lambda pair: abs((pair[1]["margin_mv"] - pair[0]["margin_mv"]) /
+                                         (pair[1]["vdd_v"] - pair[0]["vdd_v"])))
+                marker_x, _marker_y = xy(marker["vdd_v"], marker["margin_mv"])
+                parts += [f'<path d="M{marker_x:.1f} {panel_top} V{panel_bottom}" stroke="#FF385C" stroke-width="2" stroke-dasharray="5 5"/>',
+                          f'<text x="{marker_x+8:.1f}" y="{panel_top+20:.1f}" fill="#C13515" font-size="13" font-weight="700">Largest RSNM slope: {marker["vdd_v"]:.2f} V</text>']
+        for vdd_step in range(7):
+            voltage = vdd_step * .2
+            x, _y = xy(voltage, 0)
+            parts.append(f'<text x="{x:.1f}" y="{panel_bottom+23:.1f}" text-anchor="middle" fill="#6E6E73" font-size="12">{voltage:.1f}</text>')
+        center_y = panel_top + panel_h / 2
+        parts.append(f'<text x="36" y="{center_y:.1f}" transform="rotate(-90 36 {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">Margin (mV)</text>')
+    parts += [f'<text x="{left+plot_w/2}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
     return "".join(parts)
 
 
@@ -6331,29 +6401,57 @@ def launch_gui() -> None:
                                      fill=SECONDARY, font=("Calibri", 13))
             return
         if curve_kind.get() == "stacked":
-            curve_title.set("Estimate Vmin Curves - Stacked")
-            panel_height = max(90, (height - 30) / len(_ESTIMATE_VMIN_METRICS))
-            for panel, (key, _short, label, color) in enumerate(_ESTIMATE_VMIN_METRICS):
-                curve = curve_result["curves"][key]; rows = curve["rows"]
-                panel_top = 18 + panel * panel_height; panel_bottom = panel_top + panel_height - 28
-                maximum = max((row["margin_mv"] for row in rows), default=50.0)
+            curve_title.set("Estimate Vmin Curves - Comparison View")
+            groups = (
+                ("Read / Write SNM", ("rsnm_mv", "wsnm_mv")),
+                ("Write Margin / WL Write Margin", ("write_margin_mv", "wl_write_margin_mv")),
+            )
+            panel_gap = 74
+            panel_height = max(112, (height - 64 - panel_gap) / 2)
+            for panel, (group_label, keys) in enumerate(groups):
+                panel_top = 38 + panel * (panel_height + panel_gap)
+                panel_bottom = panel_top + panel_height - 28
+                curves = [curve_result["curves"][key] for key in keys]
+                maximum = max((row["margin_mv"] for curve in curves for row in curve["rows"]), default=50.0)
                 y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
+
                 def stacked_xy(vdd: float, margin: float) -> tuple[float, float]:
                     return (left_margin + vdd / SNM_PLOT_AXIS_MAX_V * plot_width,
                             panel_top + (1 - margin / y_max) * (panel_bottom - panel_top))
-                curve_canvas.create_text(left_margin, panel_top, text=f"{label} (mV)", anchor="w",
-                                         fill=TEXT, font=("Calibri", 10, "bold"))
-                curve_canvas.create_line(left_margin, panel_bottom, left_margin + plot_width, panel_bottom, fill="#E5E5EA")
-                points = [stacked_xy(row["vdd_v"], row["margin_mv"]) for row in rows]
-                curve_canvas.create_line(*[coordinate for point in points for coordinate in point], fill=color, width=2)
-                for row, (x, y) in zip(rows, points):
-                    curve_canvas.create_oval(x-3, y-3, x+3, y+3, fill=CARD, outline=color, width=2)
-                    curve_canvas.create_text(x, panel_bottom + 12, text=f'{row["vdd_v"]:.2f}', fill=SECONDARY, font=("Calibri", 8))
-                if key == "rsnm_mv" and len(rows) >= 2:
-                    _low, marker = max(zip(rows, rows[1:]), key=lambda pair: abs((pair[1]["margin_mv"]-pair[0]["margin_mv"])/(pair[1]["vdd_v"]-pair[0]["vdd_v"])))
-                    x, _ = stacked_xy(marker["vdd_v"], marker["margin_mv"])
-                    curve_canvas.create_line(x, panel_top+12, x, panel_bottom, fill="#FF385C", dash=(4, 4))
-                    curve_canvas.create_text(x+5, panel_top+15, text=f'{marker["vdd_v"]:.2f} V', anchor="w", fill="#C13515", font=("Calibri", 9, "bold"))
+
+                curve_canvas.create_text(left_margin, panel_top - 20, text=group_label, anchor="w",
+                                         fill=TEXT, font=("Calibri", 11, "bold"))
+                legend_x = left_margin + 190
+                for curve in curves:
+                    curve_canvas.create_line(legend_x, panel_top - 21, legend_x + 16, panel_top - 21,
+                                             fill=curve["color"], width=3)
+                    curve_canvas.create_text(legend_x + 21, panel_top - 21, text=curve["label"], anchor="w",
+                                             fill=SECONDARY, font=("Calibri", 9, "bold"))
+                    legend_x += 140
+                for step in range(5):
+                    margin = y_max * step / 4
+                    _x, y = stacked_xy(0, margin)
+                    curve_canvas.create_line(left_margin, y, left_margin + plot_width, y, fill="#E5E5EA")
+                    curve_canvas.create_text(left_margin - 8, y, text=f"{margin:.0f}", anchor="e",
+                                             fill=SECONDARY, font=("Calibri", 8))
+                for vdd_step in range(7):
+                    x, _y = stacked_xy(vdd_step * .2, 0)
+                    curve_canvas.create_line(x, panel_top, x, panel_bottom, fill="#F1F1F4")
+                    curve_canvas.create_text(x, panel_bottom + 13, text=f"{vdd_step*.2:.1f}",
+                                             fill=SECONDARY, font=("Calibri", 8))
+                for curve in curves:
+                    points = [stacked_xy(row["vdd_v"], row["margin_mv"]) for row in curve["rows"]]
+                    if len(points) >= 2:
+                        curve_canvas.create_line(*[coordinate for point in points for coordinate in point], fill=curve["color"], width=2)
+                    for _row, (x, y) in zip(curve["rows"], points):
+                        curve_canvas.create_oval(x-3, y-3, x+3, y+3, fill=CARD, outline=curve["color"], width=2)
+                if "rsnm_mv" in keys:
+                    rows = curve_result["curves"]["rsnm_mv"]["rows"]
+                    if len(rows) >= 2:
+                        _low, marker = max(zip(rows, rows[1:]), key=lambda pair: abs((pair[1]["margin_mv"] - pair[0]["margin_mv"]) / (pair[1]["vdd_v"] - pair[0]["vdd_v"])))
+                        x, _ = stacked_xy(marker["vdd_v"], marker["margin_mv"])
+                        curve_canvas.create_line(x, panel_top, x, panel_bottom, fill="#FF385C", dash=(4, 4))
+                        curve_canvas.create_text(x + 5, panel_top + 8, text=f"Largest slope\n{marker['vdd_v']:.2f} V", anchor="nw", fill="#C13515", font=("Calibri", 8, "bold"))
             curve_canvas.create_text(left_margin + plot_width / 2, height - 8, text="Model VDD (V)", fill=TEXT, font=("Calibri", 11, "bold"))
             return
         curve = curve_result["curves"][curve_kind.get()]
@@ -6459,18 +6557,37 @@ def launch_gui() -> None:
                     break
                 curve_canvas.delete(label_item)
             if chosen_item is None:
-                fallback_y = max(top_margin + 12, min(y - 14, baseline_y - 12))
-                chosen_item = curve_canvas.create_text(
-                    x, fallback_y, text=f'{row["margin_mv"]:.1f} mV', fill=TEXT,
-                    anchor="s", font=("Calibri", 11, "bold"))
-                fallback_bbox = curve_canvas.bbox(chosen_item)
-                if fallback_bbox:
-                    placed_label_boxes.append(fallback_bbox)
-                    label_background = curve_canvas.create_rectangle(
-                        fallback_bbox[0] - 2, fallback_bbox[1] - 1,
-                        fallback_bbox[2] + 2, fallback_bbox[3] + 1,
-                        fill=CARD, outline="")
-                    curve_canvas.tag_lower(label_background, chosen_item)
+                # Close VDD sweeps can put several values in the same few
+                # pixels.  Prefer a clearly separated label over a label that
+                # overlaps another value or hides the curve.
+                fallback_candidates = (
+                    (0, -38, "s"), (0, 38, "n"),
+                    (-38, -26, "se"), (38, -26, "sw"),
+                    (-38, 26, "ne"), (38, 26, "nw"),
+                    (0, -58, "s"), (0, 58, "n"),
+                )
+                for label_dx, label_dy, label_anchor in fallback_candidates:
+                    label_item = curve_canvas.create_text(
+                        x + label_dx, y + label_dy,
+                        text=f'{row["margin_mv"]:.1f} mV', fill=TEXT,
+                        anchor=label_anchor, font=("Calibri", 11, "bold"))
+                    fallback_bbox = curve_canvas.bbox(label_item)
+                    within_plot = bool(fallback_bbox and fallback_bbox[0] >= left_margin + 3 and
+                                       fallback_bbox[2] <= left_margin + plot_width - 3 and
+                                       fallback_bbox[1] >= top_margin + 3 and
+                                       fallback_bbox[3] <= baseline_y - 3)
+                    collision = bool(fallback_bbox and any(
+                        boxes_overlap(fallback_bbox, used) for used in placed_label_boxes))
+                    if fallback_bbox and within_plot and not collision:
+                        placed_label_boxes.append(fallback_bbox)
+                        label_background = curve_canvas.create_rectangle(
+                            fallback_bbox[0] - 2, fallback_bbox[1] - 1,
+                            fallback_bbox[2] + 2, fallback_bbox[3] + 1,
+                            fill=CARD, outline="")
+                        curve_canvas.tag_lower(label_background, label_item)
+                        chosen_item = label_item
+                        break
+                    curve_canvas.delete(label_item)
         for row in rows:
             if row["valid"]:
                 continue
