@@ -606,7 +606,14 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("0.50 V", svg)
         stacked = estimate_vmin_stacked_svg(result)
         self.assertIn("Estimate Vmin Curves - Comparison View", stacked)
-        self.assertIn("WL Write Margin", stacked)
+        self.assertIn("BL Write Margin / WL Write Margin", stacked)
+        self.assertIn("SNM (mV)", stacked)
+        self.assertIn("Vtrip (mV)", stacked)
+        self.assertIn('stroke-dasharray="10 7"', stacked)
+        self.assertIn("overlap 3/3 VDD point(s)", stacked)
+        self.assertIn("Delta +0.0 mV overlap", stacked)
+        transparent = estimate_vmin_stacked_svg(result, transparent_background=True)
+        self.assertNotIn('<rect width="100%" height="100%" fill="#FFFFFF"/>', transparent)
 
     def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):
         rows = []

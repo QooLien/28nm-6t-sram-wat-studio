@@ -3266,9 +3266,28 @@ def write_rsnm_vcc_curve_outputs(analysis: dict, out_dir: str | os.PathLike[str]
 _ESTIMATE_VMIN_METRICS = (
     ("rsnm_mv", "RSNM", "Read SNM", "#007AFF"),
     ("wsnm_mv", "WSNM", "Write SNM", "#AF52DE"),
-    ("write_margin_mv", "Write Margin", "Write Margin", "#34C759"),
+    ("write_margin_mv", "Write Margin", "BL Write Margin", "#34C759"),
     ("wl_write_margin_mv", "WL Write Margin", "WL Write Margin", "#FF385C"),
 )
+
+_VTRIP_OVERLAP_TOLERANCE_MV = 0.1
+
+
+def _paired_vtrip_deltas(analysis: dict) -> list[dict[str, float | bool]]:
+    """Pair BL/WL write-trip results by VDD and calculate WL minus BL."""
+    bl_rows = {float(row["vdd_v"]): row
+               for row in analysis["curves"]["write_margin_mv"]["rows"]}
+    wl_rows = {float(row["vdd_v"]): row
+               for row in analysis["curves"]["wl_write_margin_mv"]["rows"]}
+    paired = []
+    for vdd in sorted(bl_rows.keys() & wl_rows.keys()):
+        bl_value = float(bl_rows[vdd]["margin_mv"])
+        wl_value = float(wl_rows[vdd]["margin_mv"])
+        delta = wl_value - bl_value
+        paired.append({"vdd_v": vdd, "bl_mv": bl_value, "wl_mv": wl_value,
+                       "delta_mv": delta,
+                       "overlap": abs(delta) <= _VTRIP_OVERLAP_TOLERANCE_MV})
+    return paired
 
 
 def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list[dict[str, object]]:
@@ -3464,10 +3483,19 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
     # VDD trends can be reviewed together without mixing their mV scales.
     stacked_svg = image_dir / "05_estimate_vmin_stacked.svg"
     stacked_png = image_dir / "05_estimate_vmin_stacked.png"
+    transparent_svg = image_dir / "05_estimate_vmin_stacked_transparent.svg"
+    transparent_png = image_dir / "05_estimate_vmin_stacked_transparent.png"
     stacked_svg.write_text(estimate_vmin_stacked_svg(analysis), encoding="utf-8")
     drawing = svg2rlg(str(stacked_svg))
     if drawing is None: raise RuntimeError("Could not render stacked Estimate Vmin chart")
     renderPM.drawToFile(drawing, str(stacked_png), fmt="PNG", dpi=180, backend="rlPyCairo")
+    transparent_svg.write_text(
+        estimate_vmin_stacked_svg(analysis, transparent_background=True), encoding="utf-8")
+    transparent_drawing = svg2rlg(str(transparent_svg))
+    if transparent_drawing is None:
+        raise RuntimeError("Could not render transparent stacked Estimate Vmin chart")
+    renderPM.drawToFile(transparent_drawing, str(transparent_png), fmt="PNG", dpi=180,
+                        bg=None, backend="rlPyCairo", backendFmt="RGBA")
     with (out / "multi_chip_snm_summary_combined.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         fields = ["vdd_v", "sample_count"] + [field for key, *_ in _ESTIMATE_VMIN_METRICS
                   for field in (key, f"{key}_lot_wafer", f"{key}_chip_id")]
@@ -3475,7 +3503,7 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
     backup_dir = out / "imported_multi_chip_summaries"; backup_dir.mkdir(exist_ok=True)
     for index, source in enumerate(source_paths, 1):
         source_path = Path(source); shutil.copy2(source_path, backup_dir / f"{index:02d}_{source_path.name}")
-    sections = '<section><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows)
+    sections = '<section><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows)
     report = out / "estimate_vmin_report.html"
     report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Estimate Vmin Curve</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1500px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}.note{{color:#6e6e73}}</style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1><p class="note">{html.escape(analysis["definition"])}</p>{sections}<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>.</p></main></body></html>''', encoding="utf-8")
     return report
@@ -3647,11 +3675,13 @@ def _legacy_estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height:
     return "".join(parts)
 
 
-def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 920) -> str:
+def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 920,
+                              transparent_background: bool = False) -> str:
     """Render paired comparison panels for SNM and the two write margins."""
     groups = (
-        ("Read / Write SNM", ("rsnm_mv", "wsnm_mv")),
-        ("Write Margin / WL Write Margin", ("write_margin_mv", "wl_write_margin_mv")),
+        ("Read / Write SNM", ("rsnm_mv", "wsnm_mv"), "SNM (mV)"),
+        ("BL Write Margin / WL Write Margin",
+         ("write_margin_mv", "wl_write_margin_mv"), "Vtrip (mV)"),
     )
     # Reserve independent bands for the report header, each panel header,
     # axis tick labels and the next panel.  This prevents the lower title and
@@ -3661,11 +3691,14 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
     panel_h = (height - top - bottom - gap) / len(groups)
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
-        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-        '<text x="56" y="52" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
-        '<text x="56" y="78" fill="#6E6E73" font-size="16">Top: Read / Write SNM. Bottom: normal-BL and WL write margins. X-axis is Model VDD (V).</text>',
     ]
-    for index, (group_label, keys) in enumerate(groups):
+    if not transparent_background:
+        parts.append('<rect width="100%" height="100%" fill="#FFFFFF"/>')
+    parts += [
+        '<text x="56" y="52" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
+        '<text x="56" y="78" fill="#6E6E73" font-size="16">Top: Read / Write SNM. Bottom: BL and WL write-trip margins. X-axis is Model VDD (V).</text>',
+    ]
+    for index, (group_label, keys, y_axis_label) in enumerate(groups):
         panel_top = top + index * (panel_h + gap)
         panel_bottom = panel_top + panel_h
         curves = [analysis["curves"][key] for key in keys]
@@ -3680,9 +3713,14 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
         parts.append(f'<text x="{left}" y="{header_y:.1f}" fill="#1D1D1F" font-size="21" font-weight="700">{group_label}</text>')
         legend_x = left + 360
         for curve in curves:
-            parts += [f'<path d="M{legend_x} {header_y-6:.1f} h26" stroke="{curve["color"]}" stroke-width="4"/>',
+            legend_dash = ' stroke-dasharray="8 5"' if curve["key"] == "wl_write_margin_mv" else ""
+            parts += [f'<path d="M{legend_x} {header_y-6:.1f} h26" stroke="{curve["color"]}" stroke-width="4"{legend_dash}/>',
                       f'<text x="{legend_x+34}" y="{header_y:.1f}" fill="#3A3A3C" font-size="15">{curve["label"]}</text>']
             legend_x += 220
+        if "write_margin_mv" in keys:
+            delta_rows = _paired_vtrip_deltas(analysis)
+            overlap_count = sum(bool(row["overlap"]) for row in delta_rows)
+            parts.append(f'<text x="{left+plot_w}" y="{header_y+24:.1f}" text-anchor="end" fill="#6E6E73" font-size="13">Delta Vtrip = WL - BL; overlap {overlap_count}/{len(delta_rows)} VDD point(s)</text>')
         for step in range(5):
             margin = y_max * step / 4
             _x, y = xy(0, margin)
@@ -3694,9 +3732,24 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
         for curve in curves:
             points = [xy(row["vdd_v"], row["margin_mv"]) for row in curve["rows"]]
             point_string = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
-            parts.append(f'<polyline points="{point_string}" fill="none" stroke="{curve["color"]}" stroke-width="3.5"/>')
+            dash = ' stroke-dasharray="10 7"' if curve["key"] == "wl_write_margin_mv" else ""
+            parts.append(f'<polyline points="{point_string}" fill="none" stroke="{curve["color"]}" stroke-width="3.5"{dash}/>')
             for _row, (x, y) in zip(curve["rows"], points):
-                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
+                if curve["key"] == "wl_write_margin_mv":
+                    parts.append(f'<polygon points="{x:.1f},{y-5:.1f} {x+5:.1f},{y:.1f} {x:.1f},{y+5:.1f} {x-5:.1f},{y:.1f}" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
+                else:
+                    parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
+        if "write_margin_mv" in keys:
+            for delta_index, delta_row in enumerate(_paired_vtrip_deltas(analysis)):
+                x, bl_y = xy(float(delta_row["vdd_v"]), float(delta_row["bl_mv"]))
+                _x, wl_y = xy(float(delta_row["vdd_v"]), float(delta_row["wl_mv"]))
+                if delta_row["overlap"]:
+                    center_y = (bl_y + wl_y) / 2
+                    parts.append(f'<circle cx="{x:.1f}" cy="{center_y:.1f}" r="8" fill="none" stroke="#FF9500" stroke-width="2"/>')
+                label_y = max(panel_top + 16, min(bl_y, wl_y) - 13 - (delta_index % 2) * 16)
+                delta_color = "#C56A00" if delta_row["overlap"] else "#3A3A3C"
+                overlap_text = " overlap" if delta_row["overlap"] else ""
+                parts.append(f'<text x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle" fill="{delta_color}" font-size="12" font-weight="700" style="paint-order:stroke;stroke:#FFFFFF;stroke-width:5">Delta {float(delta_row["delta_mv"]):+.1f} mV{overlap_text}</text>')
         if "rsnm_mv" in keys:
             rows = analysis["curves"]["rsnm_mv"]["rows"]
             if len(rows) >= 2:
@@ -3712,7 +3765,7 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
             x, _y = xy(voltage, 0)
             parts.append(f'<text x="{x:.1f}" y="{panel_bottom+23:.1f}" text-anchor="middle" fill="#6E6E73" font-size="12">{voltage:.1f}</text>')
         center_y = panel_top + panel_h / 2
-        parts.append(f'<text x="36" y="{center_y:.1f}" transform="rotate(-90 36 {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">Margin (mV)</text>')
+        parts.append(f'<text x="36" y="{center_y:.1f}" transform="rotate(-90 36 {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_axis_label}</text>')
     parts += [f'<text x="{left+plot_w/2}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
     return "".join(parts)
 
@@ -6366,7 +6419,12 @@ def launch_gui() -> None:
         draw_curve_chart()
         if curve_result:
             if curve_kind.get() == "stacked":
-                curve_summary.set("Stacked view: each panel retains its own margin (mV) scale; X-axis is Model VDD.")
+                delta_rows = _paired_vtrip_deltas(curve_result)
+                overlap_count = sum(bool(row["overlap"]) for row in delta_rows)
+                maximum_delta = max((abs(float(row["delta_mv"])) for row in delta_rows), default=0.0)
+                curve_summary.set(
+                    f"Comparison view: BL/WL overlap {overlap_count}/{len(delta_rows)} VDD point(s); "
+                    f"maximum |Delta Vtrip| = {maximum_delta:.1f} mV.")
                 return
             curve = curve_result["curves"][curve_kind.get()]
             closure = curve.get("eye_closure")
@@ -6403,12 +6461,13 @@ def launch_gui() -> None:
         if curve_kind.get() == "stacked":
             curve_title.set("Estimate Vmin Curves - Comparison View")
             groups = (
-                ("Read / Write SNM", ("rsnm_mv", "wsnm_mv")),
-                ("Write Margin / WL Write Margin", ("write_margin_mv", "wl_write_margin_mv")),
+                ("Read / Write SNM", ("rsnm_mv", "wsnm_mv"), "SNM (mV)"),
+                ("BL Write Margin / WL Write Margin",
+                 ("write_margin_mv", "wl_write_margin_mv"), "Vtrip (mV)"),
             )
             panel_gap = 74
             panel_height = max(112, (height - 64 - panel_gap) / 2)
-            for panel, (group_label, keys) in enumerate(groups):
+            for panel, (group_label, keys, y_axis_label) in enumerate(groups):
                 panel_top = 38 + panel * (panel_height + panel_gap)
                 panel_bottom = panel_top + panel_height - 28
                 curves = [curve_result["curves"][key] for key in keys]
@@ -6421,10 +6480,14 @@ def launch_gui() -> None:
 
                 curve_canvas.create_text(left_margin, panel_top - 20, text=group_label, anchor="w",
                                          fill=TEXT, font=("Calibri", 11, "bold"))
+                curve_canvas.create_text(15, (panel_top + panel_bottom) / 2,
+                                         text=y_axis_label, angle=90, fill=TEXT,
+                                         font=("Calibri", 9, "bold"))
                 legend_x = left_margin + 190
                 for curve in curves:
                     curve_canvas.create_line(legend_x, panel_top - 21, legend_x + 16, panel_top - 21,
-                                             fill=curve["color"], width=3)
+                                             fill=curve["color"], width=3,
+                                             dash=(7, 4) if curve["key"] == "wl_write_margin_mv" else None)
                     curve_canvas.create_text(legend_x + 21, panel_top - 21, text=curve["label"], anchor="w",
                                              fill=SECONDARY, font=("Calibri", 9, "bold"))
                     legend_x += 140
@@ -6442,9 +6505,34 @@ def launch_gui() -> None:
                 for curve in curves:
                     points = [stacked_xy(row["vdd_v"], row["margin_mv"]) for row in curve["rows"]]
                     if len(points) >= 2:
-                        curve_canvas.create_line(*[coordinate for point in points for coordinate in point], fill=curve["color"], width=2)
+                        curve_canvas.create_line(
+                            *[coordinate for point in points for coordinate in point],
+                            fill=curve["color"], width=2,
+                            dash=(8, 5) if curve["key"] == "wl_write_margin_mv" else None)
                     for _row, (x, y) in zip(curve["rows"], points):
-                        curve_canvas.create_oval(x-3, y-3, x+3, y+3, fill=CARD, outline=curve["color"], width=2)
+                        if curve["key"] == "wl_write_margin_mv":
+                            curve_canvas.create_polygon(x, y-4, x+4, y, x, y+4, x-4, y,
+                                                        fill=CARD, outline=curve["color"], width=2)
+                        else:
+                            curve_canvas.create_oval(x-3, y-3, x+3, y+3,
+                                                     fill=CARD, outline=curve["color"], width=2)
+                if "write_margin_mv" in keys:
+                    delta_rows = _paired_vtrip_deltas(curve_result)
+                    for delta_index, delta_row in enumerate(delta_rows):
+                        x, bl_y = stacked_xy(float(delta_row["vdd_v"]), float(delta_row["bl_mv"]))
+                        _x, wl_y = stacked_xy(float(delta_row["vdd_v"]), float(delta_row["wl_mv"]))
+                        if delta_row["overlap"]:
+                            center_y = (bl_y + wl_y) / 2
+                            curve_canvas.create_oval(x-7, center_y-7, x+7, center_y+7,
+                                                     outline="#FF9500", width=2)
+                        if len(delta_rows) <= 8:
+                            label_y = max(panel_top + 12,
+                                          min(bl_y, wl_y) - 10 - (delta_index % 2) * 13)
+                            curve_canvas.create_text(
+                                x, label_y,
+                                text=f'Delta {float(delta_row["delta_mv"]):+.1f}',
+                                fill="#C56A00" if delta_row["overlap"] else SECONDARY,
+                                font=("Calibri", 8, "bold"))
                 if "rsnm_mv" in keys:
                     rows = curve_result["curves"]["rsnm_mv"]["rows"]
                     if len(rows) >= 2:
@@ -6655,21 +6743,30 @@ def launch_gui() -> None:
         if ok:
             curve_result = analysis
             curve_report_path = Path(payload)
-            curve = analysis["curves"][curve_kind.get()]
-            closure = curve.get("eye_closure")
-            if closure:
-                estimate_kind = "extrapolated" if closure.get("extrapolated") else "estimated"
-                summary = f'{curve["label"]} {estimate_kind} eye-closure VDD: {closure["estimated_vdd_v"]:.4f} V'
-                curve_summary_label.configure(fg="#C56A00")
-            else:
-                summary = f'{curve["label"]} eye-closure VDD not bracketed by imported points'
+            if curve_kind.get() == "stacked":
+                delta_rows = _paired_vtrip_deltas(analysis)
+                overlap_count = sum(bool(row["overlap"]) for row in delta_rows)
+                maximum_delta = max((abs(float(row["delta_mv"])) for row in delta_rows), default=0.0)
+                summary = (f"Comparison view: BL/WL overlap {overlap_count}/{len(delta_rows)} VDD point(s); "
+                           f"maximum |Delta Vtrip| = {maximum_delta:.1f} mV.")
                 curve_summary_label.configure(fg=SECONDARY)
+            else:
+                curve = analysis["curves"][curve_kind.get()]
+                closure = curve.get("eye_closure")
+                if closure:
+                    estimate_kind = "extrapolated" if closure.get("extrapolated") else "estimated"
+                    summary = f'{curve["label"]} {estimate_kind} eye-closure VDD: {closure["estimated_vdd_v"]:.4f} V'
+                    curve_summary_label.configure(fg="#C56A00")
+                else:
+                    summary = f'{curve["label"]} eye-closure VDD not bracketed by imported points'
+                    curve_summary_label.configure(fg=SECONDARY)
             curve_summary.set(summary)
             curve_status.set(
                 f"Complete - {len(analysis['rows'])} VDD point(s); saved to {Path(payload).parent}")
             curve_status_label.configure(fg=GREEN)
             curve_open_button.state(["!disabled"])
             curve_stacked_button.state(["!disabled"])
+            curve_transparent_button.state(["!disabled"])
             draw_curve_chart()
         else:
             curve_status.set("Estimate Vmin analysis could not be completed")
@@ -6687,6 +6784,7 @@ def launch_gui() -> None:
         curve_analyze_button.state(["disabled"])
         curve_open_button.state(["disabled"])
         curve_stacked_button.state(["disabled"])
+        curve_transparent_button.state(["disabled"])
         curve_progress.start(10)
         wafer_id = values["corner"].get().strip() or "Multi_Cell"
         output_path = Path(values["out"].get())
@@ -6705,6 +6803,14 @@ def launch_gui() -> None:
         if stacked_png.exists():
             webbrowser.open(stacked_png.resolve().as_uri())
 
+    def open_transparent_stacked_curve_png() -> None:
+        if not curve_report_path:
+            return
+        transparent_png = (curve_report_path.parent / "images" /
+                           "05_estimate_vmin_stacked_transparent.png")
+        if transparent_png.exists():
+            webbrowser.open(transparent_png.resolve().as_uri())
+
     curve_action_row = ttk.Frame(curve_input_card, style="Card.TFrame")
     curve_action_row.pack(side="bottom", fill="x", pady=(8, 0))
     ttk.Button(curve_action_row, text="Import Multi-Cell Summary CSV...", style="Quiet.TButton",
@@ -6720,6 +6826,11 @@ def launch_gui() -> None:
                                       style="Quiet.TButton", command=open_stacked_curve_png)
     curve_stacked_button.pack(fill="x", pady=(7, 0))
     curve_stacked_button.state(["disabled"])
+    curve_transparent_button = ttk.Button(
+        curve_action_row, text="Open Transparent PNG", style="Quiet.TButton",
+        command=open_transparent_stacked_curve_png)
+    curve_transparent_button.pack(fill="x", pady=(7, 0))
+    curve_transparent_button.state(["disabled"])
 
     # Independent write-trip analysis. It intentionally reuses the same manual
     # VDD/WAT rows so Read and Write trends are compared from identical inputs.
