@@ -1015,21 +1015,24 @@ class AsymmetricSram6T:
 
     def write_butterfly(self, vdd: float, low_bitline: float,
                         high_bitline: float | None = None,
-                        points: int = 401) -> dict:
+                        points: int = 401,
+                        wordline_low: float | None = None,
+                        wordline_high: float | None = None) -> dict:
         """Write butterfly retaining all six left/right WAT objects."""
         high_bl = vdd if high_bitline is None else high_bitline
-        wl = self.cfg.write_wordline_over_vdd * vdd
+        wl_low = self.cfg.write_wordline_over_vdd * vdd if wordline_low is None else wordline_low
+        wl_high = self.cfg.write_wordline_over_vdd * vdd if wordline_high is None else wordline_high
         n = max(21, int(points))
         low_curve = [
             (vdd * index / (n - 1),
              self.left.transfer_with_bitline(
-                 vdd * index / (n - 1), vdd, low_bitline, wl))
+                 vdd * index / (n - 1), vdd, low_bitline, wl_low))
             for index in range(n)
         ]
         high_curve = [
             (vdd * index / (n - 1),
              self.right.transfer_with_bitline(
-                 vdd * index / (n - 1), vdd, high_bl, wl))
+                 vdd * index / (n - 1), vdd, high_bl, wl_high))
             for index in range(n)
         ]
         mirrored_high = _inverse_vtc(high_curve)
@@ -1041,7 +1044,8 @@ class AsymmetricSram6T:
         fitted.update({
             "low_bitline_v": low_bitline,
             "high_bitline_v": high_bl,
-            "wordline_v": wl,
+            "wordline_low_v": wl_low,
+            "wordline_high_v": wl_high,
             "coordinate_definition": {
                 "x": "right storage-node voltage (PUR/PGR/PDR, high-BLB side)",
                 "y": "left storage-node voltage (PUL/PGL/PDL, low-BL side)",
@@ -1168,6 +1172,131 @@ def write_snm_vs_bitline(vdd: float,
         "write_trip_bl_v": write_trip,
         "required_bl_swing_v": (vdd - write_trip if write_trip is not None else None),
         "points": rows,
+    }
+
+
+def write_snm_vs_wordline(vdd: float,
+                          butterfly_at_wl: Callable[[float, int], dict],
+                          sweep_points: int = 37,
+                          fit_points: int = 401) -> dict:
+    """Find the minimum low-side WL drive that still closes the write eye.
+
+    This is deliberately a split-WL *sensitivity* experiment: BL=0 V and
+    BLB=VDD are fixed while only PGL's gate is swept.  It is not a normal
+    single-wordline 6T operating mode.  A lower WL trip means more tolerance
+    to reduced access drive.
+    """
+    if not math.isfinite(vdd) or vdd <= 0:
+        raise ValueError("VDD must be a positive finite value")
+    sweep_points = max(9, int(sweep_points))
+    fit_points = max(101, int(fit_points))
+    cache: dict[float, dict] = {}
+
+    def solve(wordline_v: float) -> dict:
+        key = round(min(vdd, max(0.0, wordline_v)), 12)
+        if key not in cache:
+            cache[key] = butterfly_at_wl(key, fit_points)
+        return cache[key]
+
+    def write_enabled(result: dict) -> bool:
+        # A closed write eye means that the original stored state has lost its
+        # static stability and the low BL can force the intended write state.
+        return not bool(result.get("snm_v", 0.0) > max(1e-9, vdd / fit_points / 2.0))
+
+    rows = []
+    for index in range(sweep_points):
+        wl = vdd * index / (sweep_points - 1)
+        fitted = solve(wl)
+        rows.append({
+            "wordline_v": wl,
+            "cell_write_snm_mv": fitted.get("snm_mv", 0.0),
+            "upper_left_snm_mv": fitted.get("snm_upper_left_mv", 0.0),
+            "lower_right_snm_mv": fitted.get("snm_lower_right_mv", 0.0),
+            "write_enabled": write_enabled(fitted),
+        })
+
+    disabled_at_zero = not write_enabled(solve(0.0))
+    enabled_at_vdd = write_enabled(solve(vdd))
+    if disabled_at_zero and enabled_at_vdd:
+        low_wl, high_wl = 0.0, vdd
+        for _ in range(26):
+            mid = (low_wl + high_wl) / 2.0
+            if write_enabled(solve(mid)):
+                high_wl = mid
+            else:
+                low_wl = mid
+        trip = (low_wl + high_wl) / 2.0
+        status = "VALID"
+        reason = "Minimum split-WL drive bracketed between write-disabled and write-enabled states"
+    elif enabled_at_vdd:
+        trip = 0.0
+        status = "ALWAYS ENABLED"
+        reason = "Write eye is already closed at WL=0 V in this compact model"
+    else:
+        trip = None
+        status = "NO WRITE"
+        reason = "Write eye remains open even at WL=VDD"
+
+    return {
+        "method": "Split-WL sensitivity: sweep PGL gate from 0 V to VDD at BL=0 V and BLB=VDD",
+        "vdd_v": vdd,
+        "low_bitline_v": 0.0,
+        "high_bitline_v": vdd,
+        "status": status,
+        "reason": reason,
+        "write_trip_wl_v": trip,
+        "wl_drive_tolerance_v": (vdd - trip if trip is not None else None),
+        "points": rows,
+    }
+
+
+def analyze_bl_wl_write_assist_sensitivity(cell: SixTWatCell, cfg: Config,
+                                            vdd: float,
+                                            fit_points: int = 401) -> dict:
+    """Compare BL write tolerance with an assumed low-side split-WL assist.
+
+    Both measurements use the same six independent WAT devices.  BL sweep is
+    the conventional write-trip experiment (common WL=VDD). WL sweep drives
+    only PGL while PGR stays at VDD, therefore it reports a hypothetical
+    access-drive sensitivity rather than a production 6T write specification.
+    """
+    if not math.isfinite(vdd) or not 0 < vdd <= SNM_PLOT_AXIS_MAX_V:
+        raise ValueError(f"Model VDD must be > 0 and <= {SNM_PLOT_AXIS_MAX_V:.2f} V")
+    point_cfg = replace(cfg, nominal_vdd=vdd, wat_vdd=vdd, grid_points=max(201, int(fit_points)))
+    model = AsymmetricSram6T(cell, point_cfg)
+    bl = write_snm_vs_bitline(
+        vdd,
+        lambda bitline, points: model.write_butterfly(
+            vdd, bitline, vdd, points, wordline_low=vdd, wordline_high=vdd),
+        fit_points=fit_points)
+    wl = write_snm_vs_wordline(
+        vdd,
+        lambda wordline, points: model.write_butterfly(
+            vdd, 0.0, vdd, points, wordline_low=wordline, wordline_high=vdd),
+        fit_points=fit_points)
+    bl_trip = bl["write_trip_bl_v"]
+    wl_trip = wl["write_trip_wl_v"]
+    bl_tolerance = None if bl_trip is None else bl_trip / vdd
+    wl_tolerance = None if wl_trip is None else 1.0 - wl_trip / vdd
+    if bl_tolerance is None or wl_tolerance is None:
+        limiting = "Not comparable: one or both compact-model boundaries were not bracketed"
+    elif abs(bl_tolerance - wl_tolerance) < .02:
+        limiting = "Comparable normalized BL and WL tolerance"
+    elif bl_tolerance < wl_tolerance:
+        limiting = "BL is more limiting at this VDD (smaller normalized tolerance)"
+    else:
+        limiting = "PGL split-WL drive is more limiting at this VDD (smaller normalized tolerance)"
+    return {
+        "model": "BL conventional write-trip plus PGL-only split-WL sensitivity",
+        "lot_wafer": cell.corner,
+        "vdd_v": vdd,
+        "bl": bl,
+        "wl": wl,
+        "bl_write_tolerance": bl_tolerance,
+        "wl_drive_tolerance": wl_tolerance,
+        "limiting_control": limiting,
+        "caveat": ("BL result is conventional write-trip sensitivity. WL result assumes PGL has an independent "
+                   "wordline while PGR remains at VDD; use it only as a write-assist/mismatch sensitivity study."),
     }
 
 
@@ -3399,6 +3528,80 @@ def write_write_trip_margin_outputs(analysis: dict,
     return report
 
 
+def write_assist_sensitivity_svg(analysis: dict, width: int = 1280,
+                                 height: int = 610) -> str:
+    """Render BL and split-WL sensitivity on a shared normalized control axis."""
+    vdd = float(analysis["vdd_v"])
+    left, top, plot_w, plot_h = 105, 105, 1060, 350
+    baseline = top + plot_h
+    blue, purple, grid = "#FF385C", "#460479", "#DDDDDD"
+
+    def xy(x: float, y_mv: float) -> tuple[float, float]:
+        return left + x / vdd * plot_w, baseline - y_mv / max(vdd * 1000.0, 1.0) * plot_h
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="BL and WL write assist sensitivity" style="font-family:Calibri,Arial,sans-serif">',
+             '<rect width="100%" height="100%" fill="white"/>',
+             '<text x="60" y="48" fill="#222222" font-size="28" font-weight="700">BL / WL Write Assist Sensitivity</text>',
+             f'<text x="60" y="76" fill="#6A6A6A" font-size="16">Model VDD = {vdd:.3f} V · WSNM closes when PG can force the intended write state</text>']
+    for index in range(6):
+        value = vdd * index / 5.0
+        x, y = xy(value, 0)
+        parts += [f'<path d="M{x:.1f} {top} V{baseline}" stroke="{grid}"/>',
+                  f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="{grid}"/>',
+                  f'<text x="{x:.1f}" y="{baseline+25}" text-anchor="middle" fill="#6A6A6A" font-size="14">{value:.2f}</text>',
+                  f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6A6A6A" font-size="14">{value*1000:.0f}</text>']
+    series = ((analysis["bl"]["points"], "write_bl_v", "BL sweep / common WL=VDD", blue),
+              (analysis["wl"]["points"], "wordline_v", "PGL-only split-WL sweep / BL=0", purple))
+    for rows, x_key, label, color in series:
+        points = " ".join(f'{xy(float(row[x_key]), float(row.get("cell_write_snm_mv") or 0.0))[0]:.1f},{xy(float(row[x_key]), float(row.get("cell_write_snm_mv") or 0.0))[1]:.1f}' for row in rows)
+        parts += [f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="4"/>']
+        lx = 90 if x_key == "write_bl_v" else 510
+        parts += [f'<path d="M{lx} 92 h34" stroke="{color}" stroke-width="4"/>',
+                  f'<text x="{lx+44}" y="98" fill="#3F3F3F" font-size="15">{label}</text>']
+    for boundary, key, color, prefix in ((analysis["bl"], "write_trip_bl_v", blue, "BL trip"),
+                                         (analysis["wl"], "write_trip_wl_v", purple, "PGL WL trip")):
+        trip = boundary.get(key)
+        if trip is not None:
+            x, _ = xy(float(trip), 0)
+            parts += [f'<path d="M{x:.1f} {top} V{baseline}" stroke="{color}" stroke-width="3" stroke-dasharray="7 6"/>',
+                      f'<text x="{x+8:.1f}" y="{top+22}" fill="{color}" font-size="15" font-weight="700">{prefix} {float(trip):.3f} V</text>']
+    bl_pct = analysis.get("bl_write_tolerance")
+    wl_pct = analysis.get("wl_drive_tolerance")
+    summary = (f'BL tolerance = {bl_pct*100:.1f}% VDD' if bl_pct is not None else 'BL tolerance: not bracketed')
+    summary += '   ·   '
+    summary += (f'PGL WL tolerance = {wl_pct*100:.1f}% VDD' if wl_pct is not None else 'PGL WL tolerance: not bracketed')
+    parts += [f'<text x="{width/2}" y="{height-72}" text-anchor="middle" fill="#222222" font-size="19" font-weight="700">{html.escape(summary)}</text>',
+              f'<text x="{width/2}" y="{height-42}" text-anchor="middle" fill="#6A6A6A" font-size="15">{html.escape(str(analysis["limiting_control"]))}</text>',
+              f'<text x="{width/2}" y="{height-17}" text-anchor="middle" fill="#6A6A6A" font-size="13">Split-WL is a sensitivity assumption, not standard single-WL 6T operation.</text>',
+              f'<text x="{left+plot_w/2}" y="{baseline+56}" text-anchor="middle" fill="#222222" font-size="18">Swept control voltage (V)</text>',
+              f'<text x="32" y="{top+plot_h/2}" transform="rotate(-90 32 {top+plot_h/2})" text-anchor="middle" fill="#222222" font-size="18">Write SNM / closing-eye proxy (mV)</text>', '</svg>']
+    return "".join(parts)
+
+
+def write_bl_wl_write_assist_outputs(analysis: dict, out_dir: str | os.PathLike[str]) -> Path:
+    """Write a self-contained HTML/CSV sensitivity record for one fixed VDD."""
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    svg = write_assist_sensitivity_svg(analysis)
+    (out / "bl_wl_write_assist_sensitivity.svg").write_text(svg, encoding="utf-8")
+    rows = []
+    for item in analysis["bl"]["points"]:
+        rows.append({"sweep": "BL common-WL", "control_v": item["write_bl_v"],
+                     "write_snm_mv": item["cell_write_snm_mv"], "write_enabled": not item["eye_open"]})
+    for item in analysis["wl"]["points"]:
+        rows.append({"sweep": "PGL split-WL", "control_v": item["wordline_v"],
+                     "write_snm_mv": item["cell_write_snm_mv"], "write_enabled": item["write_enabled"]})
+    with open(out / "bl_wl_write_assist_sensitivity.csv", "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    (out / "bl_wl_write_assist_sensitivity.json").write_text(json.dumps(analysis, indent=2), encoding="utf-8")
+    report = out / "bl_wl_write_assist_sensitivity.html"
+    lot_label = html.escape(str(analysis["lot_wafer"]))
+    vdd_label = float(analysis["vdd_v"])
+    limiting = html.escape(str(analysis["limiting_control"]))
+    caveat = html.escape(str(analysis["caveat"]))
+    report.write_text(f'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><title>HV28 SRAM BL/WL Write Assist Sensitivity</title><style>body{{margin:0;padding:32px;background:#fff;color:#222;font:16px/1.5 Calibri,"Microsoft JhengHei",Arial,sans-serif}}main{{max-width:1280px;margin:auto}}section{{border:1px solid #ebebeb;border-radius:20px;padding:24px;margin:18px 0}}object{{width:100%;height:auto}}.note{{color:#6a6a6a}}</style></head><body><main><h1>BL / WL Write Assist Sensitivity</h1><p>Lot/Wafer: {lot_label} · Model VDD={vdd_label:.3f} V</p><section><object type="image/svg+xml" data="bl_wl_write_assist_sensitivity.svg"></object></section><section><h2>Interpretation</h2><p>{limiting}</p><p class="note">{caveat}</p></section></main></body></html>''', encoding="utf-8")
+    return report
+
+
 def butterfly_svg(items: list[dict], vdd: float, width: int = 900, height: int = 590) -> str:
     left, top, right, bottom = 62, 25, 18, 55
     pw, ph = width-left-right, height-top-bottom
@@ -4705,7 +4908,6 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     # the minimum reported SNM.  This lets the VTC overlay be audited without
     # accidentally combining a square from one cell with WAT data from another.
     source_cell = worst["cell"]
-    dominant = analysis.get("dominant_read_driver" if mode == "read" else "dominant_write_driver")
     raw_idsat_ua = worst.get("raw_idsat_ua", {})
     source_values = (
         ("PUL", source_cell.pu1), ("PUR", source_cell.pu2),
@@ -4723,21 +4925,12 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     ]
     for index, (name, mos) in enumerate(source_values):
         y = table_top + 70 + index * 22
-        is_vt_driver = bool(dominant and dominant["device"] == name and dominant["parameter"] == "vt")
-        is_ids_driver = bool(dominant and dominant["device"] == name and dominant["parameter"] == "idsat")
-        vt_fill = "#FF3B30" if is_vt_driver else "#3A3A3C"
-        ids_fill = "#FF3B30" if is_ids_driver else "#3A3A3C"
-        vt_weight = ' font-weight="700"' if is_vt_driver else ""
-        ids_weight = ' font-weight="700"' if is_ids_driver else ""
         ids_display = raw_idsat_ua.get(name.lower(), mos.ids)
         card_text += [
             f'<text x="{card_x+28}" y="{y}" fill="#1D1D1F" font-size="14" font-weight="700">{name}</text>',
-            f'<text x="{card_x+145}" y="{y}" fill="{vt_fill}" font-size="14"{vt_weight}>{mos.vt:.4f}</text>',
-            f'<text x="{card_x+270}" y="{y}" fill="{ids_fill}" font-size="14"{ids_weight}>{ids_display:.2f}</text>',
+            f'<text x="{card_x+145}" y="{y}" fill="#3A3A3C" font-size="14">{mos.vt:.4f}</text>',
+            f'<text x="{card_x+270}" y="{y}" fill="#3A3A3C" font-size="14">{ids_display:.2f}</text>',
         ]
-    driver_note = (f'Red bold: {dominant["device"]} {dominant["parameter_label"]} is the largest adverse shift vs wafer median.'
-                   if dominant else 'No single adverse parameter differs from the wafer median.')
-    card_text.append(f'<text x="{card_x+24}" y="{card_y+card_h-18}" fill="#6E6E73" font-size="12">{html.escape(driver_note)}</text>')
     parts += [f'<text x="{left+plot_w/2:.1f}" y="{top+plot_h+82}" text-anchor="middle" fill="#1D1D1F" font-size="19">Vin (V)</text>',
               f'<text x="70" y="{top+plot_h/2:.1f}" transform="rotate(-90 70 {top+plot_h/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="19">Vout (V)</text>',
               *card_text,
@@ -5342,8 +5535,12 @@ def launch_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-    BG, CARD, TEXT, SECONDARY = "#F5F5F7", "#FFFFFF", "#1D1D1F", "#6E6E73"
-    BLUE, BLUE_DARK, BORDER, GREEN, RED = "#007AFF", "#0062CC", "#D2D2D7", "#34C759", "#FF3B30"
+    # Airbnb-inspired workspace tokens: generous white space, quiet neutral
+    # surfaces and one deliberate Rausch-red action color.  Only presentation
+    # changes here; all 6T WAT calculation paths remain untouched.
+    BG, CARD, TEXT, SECONDARY = "#FFFFFF", "#FFFFFF", "#222222", "#6A6A6A"
+    BLUE, BLUE_DARK, BORDER, GREEN, RED = "#FF385C", "#E00B41", "#DDDDDD", "#460479", "#C13515"
+    ACCENT, SURFACE, HOVER = "#92174D", "#F7F7F7", "#F2F2F2"
     root = tk.Tk()
     root.title("HV28 SRAM Analysis")
     root.geometry("1180x940")
@@ -5361,31 +5558,33 @@ def launch_gui() -> None:
     style = ttk.Style(root)
     style.theme_use("clam")
     style.configure("Root.TFrame", background=BG)
-    style.configure("Card.TFrame", background=CARD, relief="flat")
-    style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Calibri", 24, "bold"))
+    style.configure("Card.TFrame", background=CARD, relief="flat", borderwidth=0)
+    style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Calibri", 22, "bold"))
     style.configure("Subtitle.TLabel", background=BG, foreground=SECONDARY, font=("Calibri", 10))
     style.configure("Section.TLabel", background=CARD, foreground=TEXT, font=("Calibri", 13, "bold"))
     style.configure("ChartTitle.TLabel", background=CARD, foreground=TEXT,
                     font=("Calibri", 18, "bold"))
     style.configure("Body.TLabel", background=CARD, foreground=TEXT, font=("Calibri", 10))
     style.configure("Meta.TLabel", background=CARD, foreground=SECONDARY, font=("Calibri", 9))
-    style.configure("Apple.TEntry", fieldbackground="#F2F2F7", foreground=TEXT, bordercolor="#E5E5EA",
-                    lightcolor="#E5E5EA", darkcolor="#E5E5EA", padding=(8, 6))
-    style.map("Apple.TEntry", bordercolor=[("focus", BLUE)])
+    style.configure("Apple.TEntry", fieldbackground=CARD, foreground=TEXT, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER, padding=(11, 8))
+    style.map("Apple.TEntry", bordercolor=[("focus", BLUE)], lightcolor=[("focus", BLUE)])
     style.configure("Accent.TButton", background=BLUE, foreground="white", borderwidth=0,
-                    font=("Calibri", 11, "bold"), padding=(18, 11))
-    style.map("Accent.TButton", background=[("pressed", BLUE_DARK), ("active", "#1689FF"), ("disabled", "#A7CFFF")])
-    style.configure("Quiet.TButton", background="#E9E9ED", foreground=TEXT, borderwidth=0, padding=(10, 7))
-    style.map("Quiet.TButton", background=[("pressed", "#D8D8DC"), ("active", "#E2E2E7")])
-    style.configure("Apple.Horizontal.TProgressbar", background=BLUE, troughcolor="#E5E5EA", borderwidth=0)
-    style.configure("Apple.TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 10))
-    style.configure("Apple.TNotebook.Tab", background="#E9E9ED", foreground=TEXT,
-                    borderwidth=0, padding=(18, 9), font=("Calibri", 10, "bold"))
-    style.map("Apple.TNotebook.Tab", background=[("selected", CARD), ("active", "#F0F0F4")],
-              foreground=[("selected", BLUE)],
+                    font=("Calibri", 11, "bold"), padding=(22, 12))
+    style.map("Accent.TButton", background=[("pressed", BLUE_DARK), ("active", "#FF5A78"), ("disabled", "#FFD1DA")])
+    style.configure("Quiet.TButton", background=CARD, foreground=TEXT, borderwidth=1,
+                    relief="solid", padding=(12, 8))
+    style.map("Quiet.TButton", background=[("pressed", SURFACE), ("active", SURFACE)],
+              bordercolor=[("active", "#C1C1C1")])
+    style.configure("Apple.Horizontal.TProgressbar", background=BLUE, troughcolor="#EBEBEB", borderwidth=0)
+    style.configure("Apple.TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 16))
+    style.configure("Apple.TNotebook.Tab", background=BG, foreground=SECONDARY,
+                    borderwidth=0, padding=(18, 12), font=("Calibri", 10, "bold"))
+    style.map("Apple.TNotebook.Tab", background=[("selected", BG), ("active", BG)],
+              foreground=[("selected", TEXT), ("active", TEXT)],
               font=[("selected", ("Calibri", 12, "bold")),
                     ("!selected", ("Calibri", 10, "bold"))],
-              padding=[("selected", (22, 12)), ("!selected", (18, 9))])
+              padding=[("selected", (22, 12)), ("!selected", (18, 12))])
 
     saved_state = load_gui_state()
 
@@ -5437,23 +5636,26 @@ def launch_gui() -> None:
         for key, _label, _unit in assumption_specs
     }
 
-    shell = ttk.Frame(root, style="Root.TFrame", padding=(28, 22, 28, 24)); shell.pack(fill="both", expand=True)
-    header = ttk.Frame(shell, style="Root.TFrame"); header.pack(fill="x", pady=(0, 18))
+    shell = ttk.Frame(root, style="Root.TFrame", padding=(40, 24, 40, 30)); shell.pack(fill="both", expand=True)
+    header = ttk.Frame(shell, style="Root.TFrame"); header.pack(fill="x", pady=(0, 22))
     ttk.Label(header, text="HV28 SRAM Analysis", style="Title.TLabel").pack(side="left")
-    badge = tk.Label(header, text="  WAT STUDIO  ", bg="#E5F1FF", fg=BLUE,
-                     font=("Calibri", 9, "bold"), padx=7, pady=4)
-    badge.pack(side="left", padx=12, pady=(7, 0))
-    ttk.Label(header, text="Object-oriented 6T bitcell analysis", style="Subtitle.TLabel").pack(side="right", pady=(10, 0))
+    badge = tk.Label(header, text="  WAT STUDIO  ", bg="#FFF1F3", fg=BLUE,
+                     font=("Calibri", 9, "bold"), padx=10, pady=6)
+    badge.pack(side="left", padx=14, pady=(4, 0))
+    ttk.Label(header, text="6T WAT-calibrated analysis workspace", style="Subtitle.TLabel").pack(side="right", pady=(7, 0))
 
     notebook = ttk.Notebook(shell, style="Apple.TNotebook")
     notebook.pack(fill="both", expand=True)
     bitcell_tab = ttk.Frame(notebook, style="Root.TFrame")
     curve_tab = ttk.Frame(notebook, style="Root.TFrame")
     write_margin_tab = ttk.Frame(notebook, style="Root.TFrame")
+    write_assist_tab = ttk.Frame(notebook, style="Root.TFrame")
     mismatch_boundary_tab = ttk.Frame(notebook, style="Root.TFrame")
     training_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
     notebook.add(curve_tab, text="Estimate Vmin Curve")
+    notebook.add(write_margin_tab, text="Write Trip Margin")
+    notebook.add(write_assist_tab, text="BL / WL Assist")
     notebook.add(mismatch_boundary_tab, text="RSNM Mismatch Boundary")
     notebook.add(training_tab, text="SRAM Training Lab")
 
@@ -6416,6 +6618,157 @@ def launch_gui() -> None:
         command=open_wtm_report)
     wtm_open_button.pack(fill="x", pady=(7, 0))
     wtm_open_button.state(["disabled"])
+
+    # Fixed-VDD BL / WL write-assist sensitivity.  BL uses the normal shared
+    # wordline condition; WL uses an explicitly labelled PGL-only split-WL
+    # assumption so it cannot be mistaken for normal 6T operation.
+    write_assist_tab.columnconfigure(0, weight=4)
+    write_assist_tab.columnconfigure(1, weight=8)
+    write_assist_tab.rowconfigure(0, weight=1)
+    assist_input_card = ttk.Frame(write_assist_tab, style="Card.TFrame", padding=22)
+    assist_chart_card = ttk.Frame(write_assist_tab, style="Card.TFrame", padding=22)
+    assist_input_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+    assist_chart_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    assist_chart_card.columnconfigure(0, weight=1)
+    assist_chart_card.rowconfigure(3, weight=1)
+    ttk.Label(assist_input_card, text="BL / WL Write Assist Sensitivity", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(
+        assist_input_card,
+        text=("Fixed Model VDD. Compare the conventional BL write-trip with a PGL-only split-WL "
+              "sensitivity sweep using the current independent 6T WAT data."),
+        style="Meta.TLabel", wraplength=390).pack(anchor="w", pady=(4, 14))
+    assist_note = tk.Frame(assist_input_card, bg="#FFF1F3", padx=14, pady=12)
+    assist_note.pack(fill="x", pady=(0, 14))
+    tk.Label(assist_note, text="Sensitivity assumption", bg="#FFF1F3", fg=TEXT,
+             font=("Calibri", 11, "bold"), anchor="w").pack(fill="x")
+    tk.Label(
+        assist_note,
+        text=("BL: common WL=VDD, BL sweeps 0→VDD.\n"
+              "WL: BL=0, BLB=VDD; only PGL WL sweeps 0→VDD while PGR remains VDD.\n"
+              "WL result is not a standard single-WL 6T specification."),
+        bg="#FFF1F3", fg=SECONDARY, font=("Calibri", 9), justify="left",
+        wraplength=365, anchor="w").pack(fill="x", pady=(5, 0))
+    ttk.Label(assist_input_card, text="Uses current 6T Bitcell inputs and Model VDD", style="Body.TLabel").pack(anchor="w")
+    ttk.Button(assist_input_card, text="Edit 6T WAT inputs", style="Quiet.TButton",
+               command=lambda: notebook.select(bitcell_tab)).pack(fill="x", pady=(6, 0))
+    assist_status = tk.StringVar(value="Ready to compare BL and PGL WL sensitivity")
+    assist_status_label = tk.Label(assist_input_card, textvariable=assist_status, bg=CARD, fg=SECONDARY,
+                                   font=("Calibri", 9), justify="left", anchor="w", wraplength=390)
+    assist_status_label.pack(fill="x", pady=(16, 6))
+    assist_progress = ttk.Progressbar(assist_input_card, mode="indeterminate",
+                                      style="Apple.Horizontal.TProgressbar")
+    assist_progress.pack(fill="x")
+
+    ttk.Label(assist_chart_card, text="Write-control tolerance at fixed Model VDD",
+              style="ChartTitle.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(assist_chart_card,
+              text="Higher normalized tolerance means the selected control can deviate farther while write remains enabled.",
+              style="Meta.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 8))
+    assist_summary = tk.StringVar(value="Run analysis to compare BL and PGL split-WL tolerance.")
+    assist_summary_label = tk.Label(assist_chart_card, textvariable=assist_summary, bg=CARD, fg=SECONDARY,
+                                    font=("Calibri", 10, "bold"), justify="left", anchor="w", wraplength=740)
+    assist_summary_label.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+    assist_canvas = tk.Canvas(assist_chart_card, bg=CARD, highlightthickness=0, bd=0, width=720, height=450)
+    assist_canvas.grid(row=3, column=0, sticky="nsew")
+    assist_canvas.create_text(360, 220, text="BL / WL tolerance comparison will appear here",
+                              fill=SECONDARY, font=("Calibri", 13))
+    assist_result_queue: queue.Queue = queue.Queue()
+    assist_report_path: Path | None = None
+
+    def draw_assist_chart(analysis: dict) -> None:
+        canvas = assist_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 720); height = max(canvas.winfo_height(), 450)
+        left, right, top, bottom = 95, 55, 72, 82
+        plot_w, plot_h = width - left - right, height - top - bottom
+        canvas.create_text(left, 30, text=f'Model VDD = {analysis["vdd_v"]:.3f} V', anchor="w",
+                           fill=TEXT, font=("Calibri", 13, "bold"))
+        for index in range(6):
+            y = top + plot_h - plot_h * index / 5
+            canvas.create_line(left, y, left + plot_w, y, fill="#EBEBEB")
+            canvas.create_text(left - 12, y, text=f"{index * 20}%", anchor="e", fill=SECONDARY,
+                               font=("Calibri", 10))
+        canvas.create_line(left, top, left, top + plot_h, fill="#C1C1C1")
+        canvas.create_line(left, top + plot_h, left + plot_w, top + plot_h, fill="#C1C1C1")
+        entries = (("BL tolerance", analysis.get("bl_write_tolerance"), "#FF385C",
+                    analysis["bl"].get("write_trip_bl_v"), "BL trip"),
+                   ("PGL WL tolerance", analysis.get("wl_drive_tolerance"), "#460479",
+                    analysis["wl"].get("write_trip_wl_v"), "Minimum PGL WL"))
+        x_positions = (left + plot_w * .28, left + plot_w * .70)
+        for x, (label, tolerance, color, trip, trip_label) in zip(x_positions, entries):
+            value = 0.0 if tolerance is None else max(0.0, min(1.0, float(tolerance)))
+            bar_h = plot_h * value
+            canvas.create_rectangle(x - 58, top + plot_h - bar_h, x + 58, top + plot_h,
+                                    fill=color, outline="")
+            canvas.create_text(x, top + plot_h - bar_h - 16,
+                               text="Not bracketed" if tolerance is None else f"{value * 100:.1f}% VDD",
+                               fill=color, font=("Calibri", 13, "bold"))
+            canvas.create_text(x, top + plot_h + 24, text=label, fill=TEXT,
+                               font=("Calibri", 11, "bold"))
+            trip_text = "not bracketed" if trip is None else f"{trip_label}: {float(trip):.3f} V"
+            canvas.create_text(x, top + plot_h + 46, text=trip_text, fill=SECONDARY,
+                               font=("Calibri", 10))
+        canvas.create_text(left + plot_w / 2, height - 15,
+                           text="Compare normalized headroom; BL and WL trip voltages are not directly interchangeable.",
+                           fill=SECONDARY, font=("Calibri", 10))
+
+    def assist_worker(cell: SixTWatCell, cfg: Config, vdd: float, out_path: Path) -> None:
+        try:
+            analysis = analyze_bl_wl_write_assist_sensitivity(cell, cfg, vdd)
+            run_dir = create_run_output_dir(out_path, cell.corner, "bl_wl_write_assist_sensitivity")
+            report = write_bl_wl_write_assist_outputs(analysis, run_dir)
+            assist_result_queue.put((True, analysis, report))
+        except Exception as exc:
+            assist_result_queue.put((False, None, exc))
+
+    def poll_assist_result() -> None:
+        nonlocal assist_report_path
+        try:
+            ok, analysis, payload = assist_result_queue.get_nowait()
+        except queue.Empty:
+            root.after(80, poll_assist_result); return
+        assist_progress.stop(); assist_analyze_button.state(["!disabled"])
+        if ok:
+            assist_report_path = Path(payload)
+            assist_summary.set(str(analysis["limiting_control"]))
+            assist_summary_label.configure(fg=BLUE)
+            assist_status.set(f"Complete - sensitivity record saved to {assist_report_path.parent}")
+            assist_status_label.configure(fg=GREEN)
+            draw_assist_chart(analysis)
+            assist_open_button.state(["!disabled"])
+        else:
+            assist_status.set("BL / WL sensitivity analysis could not be completed")
+            assist_status_label.configure(fg=RED)
+            messagebox.showerror("BL / WL Write Assist Sensitivity", str(payload))
+
+    def execute_assist_analysis() -> None:
+        try:
+            cell, cfg, _targets = collect_inputs()
+            vdd = float(numeric["nominal_vdd"].get())
+        except Exception as exc:
+            assist_status.set("Check 6T WAT inputs and Model VDD")
+            assist_status_label.configure(fg=RED)
+            messagebox.showerror("Invalid write-assist input", str(exc)); return
+        assist_status.set("Sweeping BL and PGL split-WL at the selected Model VDD...")
+        assist_status_label.configure(fg=BLUE)
+        assist_analyze_button.state(["disabled"]); assist_open_button.state(["disabled"])
+        assist_progress.start(10)
+        threading.Thread(target=assist_worker, args=(cell, cfg, vdd, Path(values["out"].get())), daemon=True).start()
+        root.after(80, poll_assist_result)
+
+    def open_assist_report() -> None:
+        if assist_report_path and assist_report_path.exists():
+            webbrowser.open(assist_report_path.resolve().as_uri())
+
+    assist_actions = ttk.Frame(assist_input_card, style="Card.TFrame")
+    assist_actions.pack(side="bottom", fill="x", pady=(18, 0))
+    assist_analyze_button = ttk.Button(assist_actions, text="Analyze BL / WL Sensitivity",
+                                       style="Accent.TButton", command=execute_assist_analysis)
+    assist_analyze_button.pack(fill="x")
+    assist_open_button = ttk.Button(assist_actions, text="Open HTML Result", style="Quiet.TButton",
+                                    command=open_assist_report)
+    assist_open_button.pack(fill="x", pady=(7, 0))
+    assist_open_button.state(["disabled"])
 
     # One-factor-at-a-time Vt/Idsat boundary search for the two Read-SNM eyes.
     mismatch_boundary_tab.columnconfigure(0, weight=1)

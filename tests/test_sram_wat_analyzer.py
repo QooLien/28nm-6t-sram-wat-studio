@@ -10,7 +10,7 @@ from sram_wat_analyzer import (
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg,
-    analyze_write_trip_margin_curve,
+    analyze_bl_wl_write_assist_sensitivity, analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     educational_sram_metrics,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
@@ -18,6 +18,7 @@ from sram_wat_analyzer import (
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_mismatch_boundary_outputs,
     write_iv_curve_excel_template, write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
+    write_assist_sensitivity_svg, write_bl_wl_write_assist_outputs,
     write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
 
@@ -697,6 +698,25 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((report.parent / "write_trip_margin_curve.csv").exists())
             self.assertTrue((report.parent / "images" /
                              "01_write_trip_margin_vs_model_vdd.png").exists())
+
+    def test_bl_wl_write_assist_sensitivity_uses_same_six_mos_cell(self):
+        mos = {
+            "pu1": MosWat(.385, 44.0), "pu2": MosWat(.385, 44.0),
+            "pg1": MosWat(.365, 82.0), "pg2": MosWat(.365, 82.0),
+            "pd1": MosWat(.355, 124.0), "pd2": MosWat(.355, 124.0),
+        }
+        analysis = analyze_bl_wl_write_assist_sensitivity(
+            SixTWatCell("ASSIST", **mos), self.cfg, .90, fit_points=201)
+        self.assertEqual(analysis["bl"]["wordline_v"], .90)
+        self.assertEqual(analysis["wl"]["low_bitline_v"], 0.0)
+        self.assertIsNotNone(analysis["bl_write_tolerance"])
+        self.assertIsNotNone(analysis["wl_drive_tolerance"])
+        self.assertIn("PGL", analysis["caveat"])
+        self.assertIn("BL / WL Write Assist Sensitivity", write_assist_sensitivity_svg(analysis))
+        with tempfile.TemporaryDirectory() as td:
+            report = write_bl_wl_write_assist_outputs(analysis, Path(td) / "assist")
+            self.assertTrue(report.exists())
+            self.assertTrue((report.parent / "bl_wl_write_assist_sensitivity.csv").exists())
 
 
 if __name__ == "__main__":
