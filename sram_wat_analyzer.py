@@ -2524,6 +2524,11 @@ def _multi_cell_metrics(cell: SixTWatCell, cfg: Config, vdd: float,
         "write": write,
         "wsnm_mv": write.get("snm_mv"),
         "write_margin_mv": write_margin_mv,
+        # In the current WAT compact model, BL trip and split-WL trip are
+        # complementary controls of the same PG overdrive.  The normalized WL
+        # tolerance is therefore the same numeric margin until independent
+        # driver/boost/parasitic data is supplied.
+        "wl_write_margin_mv": write_margin_mv,
         "cell_ratio_beta": min(item["cell_ratio_beta"] for item in side_ratios),
         "pull_up_ratio_beta": min(item["pull_up_ratio_beta"] for item in side_ratios),
     }
@@ -3262,6 +3267,7 @@ _ESTIMATE_VMIN_METRICS = (
     ("rsnm_mv", "RSNM", "Read SNM", "#007AFF"),
     ("wsnm_mv", "WSNM", "Write SNM", "#AF52DE"),
     ("write_margin_mv", "Write Margin", "Write Margin", "#34C759"),
+    ("wl_write_margin_mv", "WL Write Margin", "WL Write Margin", "#FF385C"),
 )
 
 
@@ -3287,7 +3293,9 @@ def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list
             for number, raw in enumerate(reader, 2):
                 try:
                     vdd = float(raw["model_vdd_v"])
-                    values = {key: float(raw[key]) for key, *_ in _ESTIMATE_VMIN_METRICS}
+                    values = {key: float(raw[key]) if raw.get(key) not in (None, "")
+                              else float(raw["write_margin_mv"])
+                              for key, *_ in _ESTIMATE_VMIN_METRICS}
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"{path.name} row {number}: invalid VDD or margin value") from exc
                 if not 0 < vdd <= SNM_PLOT_AXIS_MAX_V:
@@ -3359,13 +3367,19 @@ def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]]) -> dict:
     ordered = sorted(summary_rows, key=lambda row: float(row["vdd_v"]))
     curves: dict[str, dict] = {}
     for key, short_label, label, color in _ESTIMATE_VMIN_METRICS:
+        # Older summary files and hand-built datasets do not contain the WL
+        # metric.  In this compact symmetric-cell estimate, it is the same
+        # PG-overdrive write margin until dedicated WL-driver data is added.
+        curve_source_rows = [{**item, key: item.get(key, item["write_margin_mv"])}
+                             for item in ordered]
         rows = [{"vdd_v": float(item["vdd_v"]), "margin_mv": float(item[key]),
-                 "chip_id": item[f"{key}_chip_id"], "lot_wafer": item[f"{key}_lot_wafer"],
+                 "chip_id": item.get(f"{key}_chip_id", item.get("write_margin_mv_chip_id", "Unknown")),
+                 "lot_wafer": item.get(f"{key}_lot_wafer", item.get("write_margin_mv_lot_wafer", "Wafer")),
                  "sample_count": item["sample_count"], "valid": float(item[key]) > 0}
-                for item in ordered]
+                for item in curve_source_rows]
         curves[key] = {"key": key, "short_label": short_label, "label": label,
                        "color": color, "rows": rows,
-                       "eye_closure": _estimate_zero_boundary(ordered, key)}
+                       "eye_closure": _estimate_zero_boundary(curve_source_rows, key)}
     return {"rows": ordered, "curves": curves,
             "definition": "Each VDD point is the minimum per-cell margin in the imported Multi-Cell summary data."}
 
@@ -3402,6 +3416,16 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
         if row["margin_mv"] > 0:
             parts.append(f'<text x="{x:.1f}" y="{y+dy:.1f}" text-anchor="{anchor}" fill="#1D1D1F" font-size="16" font-weight="700" style="paint-order:stroke;stroke:#FFFFFF;stroke-width:6">{row["margin_mv"]:.1f} mV</text>')
         parts.append(f'<text x="{x:.1f}" y="{baseline_y+55:.1f}" text-anchor="middle" fill="#0062CC" font-size="14" font-weight="700">{row["vdd_v"]:.2f} V</text>')
+    if curve["key"] == "rsnm_mv" and len(rows) >= 2:
+        left_row, right_row = max(
+            zip(rows, rows[1:]),
+            key=lambda pair: abs((pair[1]["margin_mv"] - pair[0]["margin_mv"]) /
+                                 (pair[1]["vdd_v"] - pair[0]["vdd_v"])) )
+        marker_row = right_row
+        marker_x, marker_y = xy(marker_row["vdd_v"], marker_row["margin_mv"])
+        parts += [f'<path d="M{marker_x:.1f} {top} V{baseline_y}" stroke="#FF385C" stroke-width="2" stroke-dasharray="5 5"/>',
+                  f'<text x="{marker_x+8:.1f}" y="{top+76}" fill="#C13515" font-size="14" font-weight="700">Largest RSNM slope</text>',
+                  f'<text x="{marker_x+8:.1f}" y="{top+96}" fill="#C13515" font-size="14">{marker_row["vdd_v"]:.2f} V</text>']
     closure = curve.get("eye_closure")
     if closure:
         x, _ = xy(float(closure["estimated_vdd_v"]), 0)
@@ -3436,13 +3460,22 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         if drawing is None: raise RuntimeError("Could not render Estimate Vmin chart")
         renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
         image_rows.append((key, png_name))
+    # The stacked export is intentionally a single portable PNG so its four
+    # VDD trends can be reviewed together without mixing their mV scales.
+    stacked_svg = image_dir / "05_estimate_vmin_stacked.svg"
+    stacked_png = image_dir / "05_estimate_vmin_stacked.png"
+    stacked_svg.write_text(estimate_vmin_stacked_svg(analysis), encoding="utf-8")
+    drawing = svg2rlg(str(stacked_svg))
+    if drawing is None: raise RuntimeError("Could not render stacked Estimate Vmin chart")
+    renderPM.drawToFile(drawing, str(stacked_png), fmt="PNG", dpi=180, backend="rlPyCairo")
     with (out / "multi_chip_snm_summary_combined.csv").open("w", newline="", encoding="utf-8-sig") as stream:
-        fields = ["vdd_v", "sample_count", "rsnm_mv", "rsnm_mv_lot_wafer", "rsnm_mv_chip_id", "wsnm_mv", "wsnm_mv_lot_wafer", "wsnm_mv_chip_id", "write_margin_mv", "write_margin_mv_lot_wafer", "write_margin_mv_chip_id"]
+        fields = ["vdd_v", "sample_count"] + [field for key, *_ in _ESTIMATE_VMIN_METRICS
+                  for field in (key, f"{key}_lot_wafer", f"{key}_chip_id")]
         writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader(); writer.writerows({key: row.get(key) for key in fields} for row in analysis["rows"])
     backup_dir = out / "imported_multi_chip_summaries"; backup_dir.mkdir(exist_ok=True)
     for index, source in enumerate(source_paths, 1):
         source_path = Path(source); shutil.copy2(source_path, backup_dir / f"{index:02d}_{source_path.name}")
-    sections = "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows)
+    sections = '<section><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows)
     report = out / "estimate_vmin_report.html"
     report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Estimate Vmin Curve</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1500px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}.note{{color:#6e6e73}}</style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1><p class="note">{html.escape(analysis["definition"])}</p>{sections}<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>.</p></main></body></html>''', encoding="utf-8")
     return report
@@ -3575,6 +3608,42 @@ def write_assist_sensitivity_svg(analysis: dict, width: int = 1280,
               f'<text x="{width/2}" y="{height-17}" text-anchor="middle" fill="#6A6A6A" font-size="13">Split-WL is a sensitivity assumption, not standard single-WL 6T operation.</text>',
               f'<text x="{left+plot_w/2}" y="{baseline+56}" text-anchor="middle" fill="#222222" font-size="18">Swept control voltage (V)</text>',
               f'<text x="32" y="{top+plot_h/2}" transform="rotate(-90 32 {top+plot_h/2})" text-anchor="middle" fill="#222222" font-size="18">Write SNM / closing-eye proxy (mV)</text>', '</svg>']
+    return "".join(parts)
+
+
+def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 1120) -> str:
+    """Four aligned VDD trend panels, each retaining its own mV scale."""
+    left, right, top, bottom = 125, 65, 92, 58
+    panel_gap = 22
+    panel_h = (height - top - bottom - panel_gap * (len(_ESTIMATE_VMIN_METRICS) - 1)) / len(_ESTIMATE_VMIN_METRICS)
+    plot_w = width - left - right
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
+             '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+             '<text x="56" y="52" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves — Stacked View</text>',
+             '<text x="56" y="78" fill="#6E6E73" font-size="16">Each panel uses its own margin scale; X-axis is Model VDD (V).</text>']
+    for index, (key, _short, label, color) in enumerate(_ESTIMATE_VMIN_METRICS):
+        curve = analysis["curves"][key]; rows = curve["rows"]
+        panel_top = top + index * (panel_h + panel_gap); panel_bottom = panel_top + panel_h
+        maximum = max((row["margin_mv"] for row in rows), default=50.0)
+        y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
+        def xy(vdd: float, margin: float) -> tuple[float, float]:
+            return left + vdd / SNM_PLOT_AXIS_MAX_V * plot_w, panel_top + (1 - margin / y_max) * panel_h
+        parts += [f'<text x="{left}" y="{panel_top-6:.1f}" fill="#1D1D1F" font-size="18" font-weight="700">{label} (mV)</text>']
+        for step in range(4):
+            margin = y_max * step / 3; _x, y = xy(0, margin)
+            parts += [f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA"/>',
+                      f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{margin:.0f}</text>']
+        points = [xy(row["vdd_v"], row["margin_mv"]) for row in rows]
+        parts.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x,y in points)}" fill="none" stroke="{color}" stroke-width="3"/>')
+        for row, (x, y) in zip(rows, points):
+            parts += [f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{color}" stroke-width="2"/>',
+                      f'<text x="{x:.1f}" y="{panel_bottom+17:.1f}" text-anchor="middle" fill="#6E6E73" font-size="11">{row["vdd_v"]:.2f}</text>']
+        if key == "rsnm_mv" and len(rows) >= 2:
+            _low, marker = max(zip(rows, rows[1:]), key=lambda pair: abs((pair[1]["margin_mv"]-pair[0]["margin_mv"])/(pair[1]["vdd_v"]-pair[0]["vdd_v"])))
+            marker_x, _marker_y = xy(marker["vdd_v"], marker["margin_mv"])
+            parts += [f'<path d="M{marker_x:.1f} {panel_top} V{panel_bottom}" stroke="#FF385C" stroke-width="2" stroke-dasharray="5 5"/>',
+                      f'<text x="{marker_x+7:.1f}" y="{panel_top+19:.1f}" fill="#C13515" font-size="13" font-weight="700">Largest slope: {marker["vdd_v"]:.2f} V</text>']
+    parts += [f'<text x="{left+plot_w/2}" y="{height-16}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
     return "".join(parts)
 
 
@@ -4968,6 +5037,7 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                     "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
                     "upper_rsnm_mv": row["upper_rsnm_mv"], "lower_rsnm_mv": row["lower_rsnm_mv"],
                     "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
+                    "wl_write_margin_mv": row["wl_write_margin_mv"],
                     "cell_ratio_beta": row["cell_ratio_beta"],
                     "pull_up_ratio_beta": row["pull_up_ratio_beta"],
                     "is_worst_rsnm": row["chip_id"] == analysis["worst_rsnm"]["chip_id"],
@@ -5654,8 +5724,6 @@ def launch_gui() -> None:
     training_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
     notebook.add(curve_tab, text="Estimate Vmin Curve")
-    notebook.add(write_margin_tab, text="Write Trip Margin")
-    notebook.add(write_assist_tab, text="BL / WL Assist")
     notebook.add(mismatch_boundary_tab, text="RSNM Mismatch Boundary")
     notebook.add(training_tab, text="SRAM Training Lab")
 
@@ -6227,6 +6295,9 @@ def launch_gui() -> None:
     def select_curve_kind() -> None:
         draw_curve_chart()
         if curve_result:
+            if curve_kind.get() == "stacked":
+                curve_summary.set("Stacked view: each panel retains its own margin (mV) scale; X-axis is Model VDD.")
+                return
             curve = curve_result["curves"][curve_kind.get()]
             closure = curve.get("eye_closure")
             estimate_kind = "extrapolated" if closure and closure.get("extrapolated") else "estimated"
@@ -6236,6 +6307,8 @@ def launch_gui() -> None:
     for key, short_label, _label, _color in _ESTIMATE_VMIN_METRICS:
         ttk.Radiobutton(curve_switch, text=short_label, value=key, variable=curve_kind,
                         command=select_curve_kind).pack(side="left", padx=(0, 12))
+    ttk.Radiobutton(curve_switch, text="Stacked", value="stacked", variable=curve_kind,
+                    command=select_curve_kind).pack(side="left", padx=(0, 12))
     curve_summary = tk.StringVar(value="Import at least two Multi-Cell summary CSV files to display an estimate curve.")
     curve_summary_label = tk.Label(curve_chart_card, textvariable=curve_summary, bg=CARD, fg=SECONDARY,
                                    font=("Calibri", 10, "bold"), anchor="w", justify="left")
@@ -6256,6 +6329,32 @@ def launch_gui() -> None:
         if not curve_result:
             curve_canvas.create_text(width / 2, height / 2, text="Estimate Vmin curve will appear here",
                                      fill=SECONDARY, font=("Calibri", 13))
+            return
+        if curve_kind.get() == "stacked":
+            curve_title.set("Estimate Vmin Curves - Stacked")
+            panel_height = max(90, (height - 30) / len(_ESTIMATE_VMIN_METRICS))
+            for panel, (key, _short, label, color) in enumerate(_ESTIMATE_VMIN_METRICS):
+                curve = curve_result["curves"][key]; rows = curve["rows"]
+                panel_top = 18 + panel * panel_height; panel_bottom = panel_top + panel_height - 28
+                maximum = max((row["margin_mv"] for row in rows), default=50.0)
+                y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
+                def stacked_xy(vdd: float, margin: float) -> tuple[float, float]:
+                    return (left_margin + vdd / SNM_PLOT_AXIS_MAX_V * plot_width,
+                            panel_top + (1 - margin / y_max) * (panel_bottom - panel_top))
+                curve_canvas.create_text(left_margin, panel_top, text=f"{label} (mV)", anchor="w",
+                                         fill=TEXT, font=("Calibri", 10, "bold"))
+                curve_canvas.create_line(left_margin, panel_bottom, left_margin + plot_width, panel_bottom, fill="#E5E5EA")
+                points = [stacked_xy(row["vdd_v"], row["margin_mv"]) for row in rows]
+                curve_canvas.create_line(*[coordinate for point in points for coordinate in point], fill=color, width=2)
+                for row, (x, y) in zip(rows, points):
+                    curve_canvas.create_oval(x-3, y-3, x+3, y+3, fill=CARD, outline=color, width=2)
+                    curve_canvas.create_text(x, panel_bottom + 12, text=f'{row["vdd_v"]:.2f}', fill=SECONDARY, font=("Calibri", 8))
+                if key == "rsnm_mv" and len(rows) >= 2:
+                    _low, marker = max(zip(rows, rows[1:]), key=lambda pair: abs((pair[1]["margin_mv"]-pair[0]["margin_mv"])/(pair[1]["vdd_v"]-pair[0]["vdd_v"])))
+                    x, _ = stacked_xy(marker["vdd_v"], marker["margin_mv"])
+                    curve_canvas.create_line(x, panel_top+12, x, panel_bottom, fill="#FF385C", dash=(4, 4))
+                    curve_canvas.create_text(x+5, panel_top+15, text=f'{marker["vdd_v"]:.2f} V', anchor="w", fill="#C13515", font=("Calibri", 9, "bold"))
+            curve_canvas.create_text(left_margin + plot_width / 2, height - 8, text="Model VDD (V)", fill=TEXT, font=("Calibri", 11, "bold"))
             return
         curve = curve_result["curves"][curve_kind.get()]
         rows = curve["rows"]
@@ -6378,6 +6477,20 @@ def launch_gui() -> None:
             x, y = xy(row["vdd_v"], 0.0)
             curve_canvas.create_line(x - 4, y - 4, x + 4, y + 4, fill=SECONDARY, width=2)
             curve_canvas.create_line(x + 4, y - 4, x - 4, y + 4, fill=SECONDARY, width=2)
+        # Highlight the operating-voltage interval where RSNM changes most
+        # rapidly.  The right-hand point marks the requested VDD node.
+        if curve["key"] == "rsnm_mv" and len(rows) >= 2:
+            _left_row, slope_row = max(
+                zip(rows, rows[1:]),
+                key=lambda pair: abs((pair[1]["margin_mv"] - pair[0]["margin_mv"]) /
+                                     (pair[1]["vdd_v"] - pair[0]["vdd_v"])))
+            marker_x, _ = xy(slope_row["vdd_v"], slope_row["margin_mv"])
+            curve_canvas.create_line(marker_x, top_margin, marker_x, baseline_y,
+                                     fill="#FF385C", width=2, dash=(5, 5))
+            curve_canvas.create_text(marker_x + 7, top_margin + 12,
+                                     text=f"Largest RSNM slope\n{slope_row['vdd_v']:.2f} V",
+                                     anchor="nw", fill="#C13515",
+                                     font=("Calibri", 10, "bold"), justify="left")
         if closure:
             x, y = xy(closure["estimated_vdd_v"], 0.0)
             curve_canvas.create_line(x, top_margin, x, top_margin + plot_height,
@@ -6439,6 +6552,7 @@ def launch_gui() -> None:
                 f"Complete - {len(analysis['rows'])} VDD point(s); saved to {Path(payload).parent}")
             curve_status_label.configure(fg=GREEN)
             curve_open_button.state(["!disabled"])
+            curve_stacked_button.state(["!disabled"])
             draw_curve_chart()
         else:
             curve_status.set("Estimate Vmin analysis could not be completed")
@@ -6455,6 +6569,7 @@ def launch_gui() -> None:
         curve_status_label.configure(fg=BLUE)
         curve_analyze_button.state(["disabled"])
         curve_open_button.state(["disabled"])
+        curve_stacked_button.state(["disabled"])
         curve_progress.start(10)
         wafer_id = values["corner"].get().strip() or "Multi_Cell"
         output_path = Path(values["out"].get())
@@ -6465,6 +6580,13 @@ def launch_gui() -> None:
     def open_curve_report() -> None:
         if curve_report_path and curve_report_path.exists():
             webbrowser.open(curve_report_path.resolve().as_uri())
+
+    def open_stacked_curve_png() -> None:
+        if not curve_report_path:
+            return
+        stacked_png = curve_report_path.parent / "images" / "05_estimate_vmin_stacked.png"
+        if stacked_png.exists():
+            webbrowser.open(stacked_png.resolve().as_uri())
 
     curve_action_row = ttk.Frame(curve_input_card, style="Card.TFrame")
     curve_action_row.pack(side="bottom", fill="x", pady=(8, 0))
@@ -6477,6 +6599,10 @@ def launch_gui() -> None:
                                    style="Quiet.TButton", command=open_curve_report)
     curve_open_button.pack(fill="x", pady=(7, 0))
     curve_open_button.state(["disabled"])
+    curve_stacked_button = ttk.Button(curve_action_row, text="Open Stacked PNG",
+                                      style="Quiet.TButton", command=open_stacked_curve_png)
+    curve_stacked_button.pack(fill="x", pady=(7, 0))
+    curve_stacked_button.state(["disabled"])
 
     # Independent write-trip analysis. It intentionally reuses the same manual
     # VDD/WAT rows so Read and Write trends are compared from identical inputs.

@@ -9,7 +9,7 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg,
+    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg, estimate_vmin_stacked_svg,
     analyze_bl_wl_write_assist_sensitivity, analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     educational_sram_metrics,
@@ -572,7 +572,7 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn(">-44.00</text>",
                           (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
 
-    def test_multi_cell_summary_builds_three_estimate_vmin_curves(self):
+    def test_multi_cell_summary_builds_four_estimate_vmin_curves(self):
         with tempfile.TemporaryDirectory() as td:
             fields = ["lot_wafer", "chip_id", "model_vdd_v", "rsnm_mv", "wsnm_mv", "write_margin_mv"]
             paths = []
@@ -586,9 +586,27 @@ class AnalyzerTests(unittest.TestCase):
                                      "rsnm_mv": rsnm, "wsnm_mv": wsnm, "write_margin_mv": write_margin})
                 paths.append(path)
             result = analyze_estimate_vmin_curves(read_multi_chip_snm_summary(paths))
-            self.assertEqual(set(result["curves"]), {"rsnm_mv", "wsnm_mv", "write_margin_mv"})
+            self.assertEqual(set(result["curves"]), {"rsnm_mv", "wsnm_mv", "write_margin_mv", "wl_write_margin_mv"})
             self.assertEqual(result["curves"]["rsnm_mv"]["rows"][0]["chip_id"], "C02")
             self.assertAlmostEqual(result["curves"]["write_margin_mv"]["eye_closure"]["estimated_vdd_v"], .40)
+            self.assertAlmostEqual(result["curves"]["wl_write_margin_mv"]["eye_closure"]["estimated_vdd_v"], .40)
+
+    def test_estimate_vmin_marks_largest_rsnm_slope_and_renders_stacked_view(self):
+        rows = []
+        for vdd, rsnm in ((.40, 10.0), (.50, 90.0), (.80, 120.0)):
+            row = {"vdd_v": vdd, "sample_count": 1}
+            for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
+                row[key] = rsnm
+                row[f"{key}_chip_id"] = "C01"
+                row[f"{key}_lot_wafer"] = "W01"
+            rows.append(row)
+        result = analyze_estimate_vmin_curves(rows)
+        svg = estimate_vmin_curve_svg(result["curves"]["rsnm_mv"])
+        self.assertIn("Largest RSNM slope", svg)
+        self.assertIn("0.50 V", svg)
+        stacked = estimate_vmin_stacked_svg(result)
+        self.assertIn("Estimate Vmin Curves — Stacked View", stacked)
+        self.assertIn("WL Write Margin", stacked)
 
     def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):
         rows = []
