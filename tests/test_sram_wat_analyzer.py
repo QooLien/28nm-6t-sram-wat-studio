@@ -9,7 +9,7 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg, estimate_vmin_stacked_svg,
+    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg,
     analyze_bl_wl_write_assist_sensitivity, analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     educational_sram_metrics,
@@ -591,6 +591,13 @@ class AnalyzerTests(unittest.TestCase):
             self.assertAlmostEqual(result["curves"]["write_margin_mv"]["eye_closure"]["estimated_vdd_v"], .40)
             self.assertAlmostEqual(result["curves"]["wl_write_margin_mv"]["eye_closure"]["estimated_vdd_v"], .40)
 
+    def test_estimate_vmin_summary_rejects_excel_with_clear_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "wrong_input.xlsx"
+            path.write_bytes(b"PK\x03\x04\x98 binary Excel data")
+            with self.assertRaisesRegex(ValueError, "select multi_chip_snm_summary.csv"):
+                read_multi_chip_snm_summary([path])
+
     def test_estimate_vmin_marks_largest_rsnm_slope_and_renders_stacked_view(self):
         rows = []
         for vdd, rsnm in ((.40, 10.0), (.50, 90.0), (.80, 120.0)):
@@ -645,6 +652,61 @@ class AnalyzerTests(unittest.TestCase):
             rows.append(row)
         result = analyze_estimate_vmin_curves(rows)
         self.assertIsNone(result["curves"]["rsnm_mv"]["eye_closure"])
+
+    def test_estimate_vmin_builds_per_vdd_cr_pr_and_family_wat_shmoo(self):
+        rows = []
+        for vdd in (.60, .80):
+            samples = []
+            for index, scale in enumerate((.75, 1.0), 1):
+                samples.append({
+                    "lot_wafer": "W01", "chip_id": f"C{index:02d}",
+                    "rsnm_mv": 80*scale, "wsnm_mv": 65*scale,
+                    "write_margin_mv": 55*scale, "wl_write_margin_mv": 50*scale,
+                    "cell_ratio_beta": 1.2+index*.1, "pull_up_ratio_beta": 1.5+index*.1,
+                    "pu_vt_v": .38, "pu_idsat_ua": 44*scale,
+                    "pg_vt_v": .36, "pg_idsat_ua": 82*scale,
+                    "pd_vt_v": .35, "pd_idsat_ua": 124*scale,
+                })
+            row = {"vdd_v": vdd, "sample_count": 2, "samples": samples}
+            for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv", "wl_write_margin_mv"):
+                row[key] = min(item[key] for item in samples)
+                row[f"{key}_chip_id"] = "C01"; row[f"{key}_lot_wafer"] = "W01"
+            rows.append(row)
+        analysis = analyze_estimate_vmin_curves(rows)
+        self.assertEqual(len(analysis["ratio_shmoos"]), 2)
+        shmoo = analysis["ratio_shmoos"][0]
+        self.assertTrue(shmoo["has_family_wat"])
+        self.assertFalse(shmoo["samples"][0]["best_region"])
+        self.assertTrue(shmoo["samples"][1]["best_region"])
+        self.assertAlmostEqual(shmoo["samples"][0]["read_score"], .75)
+        self.assertAlmostEqual(shmoo["samples"][0]["write_score"], .75)
+        svg = estimate_vmin_ratio_shmoo_svg(shmoo)
+        self.assertAlmostEqual(shmoo["samples"][1]["write_contention"], 1/1.7)
+        self.assertIn("Read / Write Drive-Balance Shmoo", svg)
+        self.assertIn("PU tuning", svg)
+        self.assertIn("Upper-left = preferred direction", svg)
+        self.assertIn("Weakest: C01", svg)
+
+    def test_estimate_vmin_balance_does_not_reward_large_residual_wsnm(self):
+        samples = [
+            {"lot_wafer": "W01", "chip_id": "GOOD", "rsnm_mv": 90.0,
+             "wsnm_mv": 10.0, "write_margin_mv": 80.0,
+             "cell_ratio_beta": 1.5, "pull_up_ratio_beta": 1.8},
+            {"lot_wafer": "W01", "chip_id": "RESIDUAL_EYE", "rsnm_mv": 90.0,
+             "wsnm_mv": 999.0, "write_margin_mv": 20.0,
+             "cell_ratio_beta": 1.4, "pull_up_ratio_beta": 1.6},
+        ]
+        row = {"vdd_v": .8, "sample_count": 2, "samples": samples}
+        for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv", "wl_write_margin_mv"):
+            row[key] = min(float(item.get(key, item["write_margin_mv"])) for item in samples)
+            row[f"{key}_chip_id"] = "GOOD"
+            row[f"{key}_lot_wafer"] = "W01"
+        second_row = {**row, "vdd_v": .9, "samples": [dict(item) for item in samples]}
+        shmoo = analyze_estimate_vmin_curves([row, second_row])["ratio_shmoos"][0]
+        by_chip = {sample["chip_id"]: sample for sample in shmoo["samples"]}
+        self.assertTrue(by_chip["GOOD"]["best_region"])
+        self.assertFalse(by_chip["RESIDUAL_EYE"]["best_region"])
+        self.assertAlmostEqual(by_chip["RESIDUAL_EYE"]["balanced_score"], .25)
 
     def test_single_and_multi_chip_use_identical_snm_calculation(self):
         """One multi-chip row must numerically match the 6T single-cell result."""

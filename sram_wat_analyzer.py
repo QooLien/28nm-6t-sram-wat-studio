@@ -3303,32 +3303,53 @@ def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list
         path = Path(raw_path)
         if not path.is_file():
             raise FileNotFoundError(f"Multi-Cell summary was not found: {path}")
-        with path.open(newline="", encoding="utf-8-sig") as source:
-            reader = csv.DictReader(source)
-            required = {"lot_wafer", "chip_id", "model_vdd_v", "rsnm_mv", "wsnm_mv", "write_margin_mv"}
-            if not reader.fieldnames or not required.issubset(reader.fieldnames):
-                raise ValueError(
-                    f"{path.name} is not a Multi-Cell multi_chip_snm_summary.csv export")
-            for number, raw in enumerate(reader, 2):
-                try:
-                    vdd = float(raw["model_vdd_v"])
-                    values = {key: float(raw[key]) if raw.get(key) not in (None, "")
-                              else float(raw["write_margin_mv"])
-                              for key, *_ in _ESTIMATE_VMIN_METRICS}
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"{path.name} row {number}: invalid VDD or margin value") from exc
-                if not 0 < vdd <= SNM_PLOT_AXIS_MAX_V:
-                    raise ValueError(f"{path.name} row {number}: Model VDD must be within 0–{SNM_PLOT_AXIS_MAX_V:.2f} V")
-                grouped.setdefault(vdd, []).append({
-                    "lot_wafer": str(raw["lot_wafer"] or "Wafer"),
-                    "chip_id": str(raw["chip_id"] or "Unknown"), **values,
-                })
+        if path.suffix.lower() != ".csv":
+            raise ValueError(
+                f"{path.name} is not a CSV summary. In Estimate Vmin Curve, select "
+                "multi_chip_snm_summary.csv files, not the original Excel (.xlsx) input files.")
+        try:
+            with path.open(newline="", encoding="utf-8-sig") as source:
+                reader = csv.DictReader(source)
+                required = {"lot_wafer", "chip_id", "model_vdd_v", "rsnm_mv", "wsnm_mv", "write_margin_mv"}
+                if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                    raise ValueError(
+                        f"{path.name} is not a Multi-Cell multi_chip_snm_summary.csv export")
+                for number, raw in enumerate(reader, 2):
+                    try:
+                        vdd = float(raw["model_vdd_v"])
+                        values = {key: float(raw[key]) if raw.get(key) not in (None, "")
+                                  else float(raw["write_margin_mv"])
+                                  for key, *_ in _ESTIMATE_VMIN_METRICS}
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"{path.name} row {number}: invalid VDD or margin value") from exc
+                    if not 0 < vdd <= SNM_PLOT_AXIS_MAX_V:
+                        raise ValueError(f"{path.name} row {number}: Model VDD must be within 0–{SNM_PLOT_AXIS_MAX_V:.2f} V")
+                    sample = {
+                        "lot_wafer": str(raw["lot_wafer"] or "Wafer"),
+                        "chip_id": str(raw["chip_id"] or "Unknown"), **values,
+                    }
+                    # Optional fields added by newer Multi-Cell exports. Keeping
+                    # them optional preserves compatibility with legacy summaries.
+                    for field in ("cell_ratio_beta", "pull_up_ratio_beta",
+                                  "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
+                                  "pd_vt_v", "pd_idsat_ua"):
+                        if raw.get(field) not in (None, ""):
+                            try:
+                                sample[field] = float(raw[field])
+                            except (TypeError, ValueError) as exc:
+                                raise ValueError(f"{path.name} row {number}: invalid {field}") from exc
+                    grouped.setdefault(vdd, []).append(sample)
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"{path.name} is not UTF-8 CSV text. Select the generated "
+                "multi_chip_snm_summary.csv file instead of an Excel or binary file.") from exc
     if len(grouped) < 2:
         raise ValueError("Select Multi-Cell summaries from at least two Model VDD points")
     rows: list[dict[str, object]] = []
     for vdd in sorted(grouped):
         samples = grouped[vdd]
         row: dict[str, object] = {"vdd_v": vdd, "sample_count": len(samples),
+                                  "samples": samples,
                                   "lot_wafers": sorted({str(item["lot_wafer"]) for item in samples})}
         for key, *_ in _ESTIMATE_VMIN_METRICS:
             winner = min(samples, key=lambda item: float(item[key]))
@@ -3337,6 +3358,69 @@ def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list
             row[f"{key}_lot_wafer"] = str(winner["lot_wafer"])
         rows.append(row)
     return rows
+
+
+def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Build same-VDD drive-balance shmoos and actionable target deltas."""
+    shmoos: list[dict[str, object]] = []
+    # Read stability and write ability are independent responses.  Use RSNM
+    # and the BL Write Trip Margin once each; residual WSNM is retained as a
+    # diagnostic and WL margin is currently derived from the same compact
+    # write model, so neither is double-counted in the balance score.
+    metric_keys = ("rsnm_mv", "write_margin_mv")
+    family_fields = tuple(field for family in ("pu", "pg", "pd")
+                          for field in (f"{family}_vt_v", f"{family}_idsat_ua"))
+    for row in rows:
+        samples = [dict(sample) for sample in row.get("samples", [])
+                   if "cell_ratio_beta" in sample and "pull_up_ratio_beta" in sample]
+        if not samples:
+            continue
+        maxima = {key: max(max(float(sample.get(key, sample.get("write_margin_mv", 0.0))), 0.0)
+                           for sample in samples) for key in metric_keys}
+        for sample in samples:
+            normalized = {
+                key: (max(float(sample.get(key, 0.0)), 0.0) / maxima[key]
+                      if maxima[key] > 0 else 0.0)
+                for key in metric_keys
+            }
+            sample["read_score"] = normalized["rsnm_mv"]
+            sample["write_score"] = normalized["write_margin_mv"]
+            sample["balanced_score"] = min(sample["read_score"], sample["write_score"])
+            sample["write_contention"] = 1.0 / float(sample["pull_up_ratio_beta"])
+        best_score = max(float(sample["balanced_score"]) for sample in samples)
+        best_cutoff = best_score * 0.90
+        for sample in samples:
+            sample["best_region"] = float(sample["balanced_score"]) >= best_cutoff
+        preferred = [sample for sample in samples if sample["best_region"]]
+        target_fields = ["cell_ratio_beta", "pull_up_ratio_beta", "write_contention"]
+        if all(all(field in sample for field in family_fields) for sample in samples):
+            target_fields.extend(family_fields)
+        target = {field: statlib.median(float(sample[field]) for sample in preferred)
+                  for field in target_fields}
+        target["chip_id"] = "PREFERRED_CENTER"
+        target["balanced_score"] = statlib.median(
+            float(sample["balanced_score"]) for sample in preferred)
+        weakest = min(samples, key=lambda sample: float(sample["balanced_score"]))
+        for sample in samples:
+            sample["target_cr"] = target["cell_ratio_beta"]
+            sample["target_write_contention"] = target["write_contention"]
+            sample["delta_cr"] = target["cell_ratio_beta"] - float(sample["cell_ratio_beta"])
+            sample["delta_write_contention"] = target["write_contention"] - float(sample["write_contention"])
+            for field in family_fields:
+                if field in target and field in sample:
+                    sample[f"delta_{field}"] = float(target[field]) - float(sample[field])
+        shmoos.append({"vdd_v": float(row["vdd_v"]), "samples": samples,
+                        "best_score": best_score, "best_cutoff": best_cutoff,
+                        "target": target, "weakest": weakest,
+                        "has_family_wat": all(all(field in sample for field in family_fields)
+                                              for sample in samples),
+                        "definition": ("Balanced score is the minimum of normalized RSNM and "
+                                       "BL Write Trip Margin within one Model VDD; residual WSNM "
+                                       "is reported separately as a write-eye diagnostic. "
+                                       "preferred region is at least 90% of the highest score. "
+                                       "X=beta_PU/beta_PG=1/PR (left is easier write); "
+                                       "Y=beta_PD/beta_PG=CR (up is stronger read).")})
+    return shmoos
 
 
 def _estimate_zero_boundary(rows: list[dict[str, object]], key: str) -> dict[str, object] | None:
@@ -3400,7 +3484,98 @@ def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]]) -> dict:
                        "color": color, "rows": rows,
                        "eye_closure": _estimate_zero_boundary(curve_source_rows, key)}
     return {"rows": ordered, "curves": curves,
+            "ratio_shmoos": _build_estimate_vmin_ratio_shmoos(ordered),
             "definition": "Each VDD point is the minimum per-cell margin in the imported Multi-Cell summary data."}
+
+
+def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height: int = 1040) -> str:
+    """Render upper-left-good drive balance plus PU/PG/PD tuning views."""
+    samples = shmoo["samples"]
+    panels = [("write_contention", "cell_ratio_beta", "Read / Write Drive-Balance Shmoo",
+               "Write contention = beta_PU / beta_PG = 1/PR (lower is better)",
+               "Read cell ratio = beta_PD / beta_PG = CR (higher is better)")]
+    if shmoo.get("has_family_wat"):
+        panels.extend([
+            ("pu_idsat_ua", "pu_vt_v", "PU tuning — upper-left weakens write contention",
+             "PU Idsat (uA) — lower is easier write", "PU |Vt| (V) — higher is easier write"),
+            ("pg_vt_v", "pg_idsat_ua", "PG tuning — Read / Write trade-off",
+             "PG Vt (V)", "PG Idsat (uA)"),
+            ("pd_vt_v", "pd_idsat_ua", "PD tuning — upper-left strengthens read",
+             "PD Vt (V) — lower is stronger", "PD Idsat (uA) — higher is stronger"),
+        ])
+    panel_w, panel_h = 590, 350
+    origins = ((95, 155), (765, 155), (95, 600), (765, 600))
+
+    def score_color(item: dict) -> str:
+        return "#00C93A" if item["best_region"] else "#FF3B30"
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
+             '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+             f'<text x="56" y="52" fill="#1D1D1F" font-size="34" font-weight="700">Model VDD {shmoo["vdd_v"]:.3f} V - Drive-Balance Shmoo</text>',
+             '<text x="56" y="82" fill="#6E6E73" font-size="15">Upper-left = preferred direction. Red = weak; green = strong; purple ring = relative preferred region (not silicon Pass/Fail).</text>',
+             '<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#007AFF"/></marker></defs>']
+    for panel_index, ((x_key, y_key, title, x_label, y_label), (left, top)) in enumerate(zip(panels, origins)):
+        xs = [float(item[x_key]) for item in samples]; ys = [float(item[y_key]) for item in samples]
+        x_min, x_max = min(xs), max(xs); y_min, y_max = min(ys), max(ys)
+        x_pad = max((x_max-x_min)*.10, max(abs(x_min), 1.0)*.01)
+        y_pad = max((y_max-y_min)*.10, max(abs(y_min), 1.0)*.01)
+        x_min -= x_pad; x_max += x_pad; y_min -= y_pad; y_max += y_pad
+        def xy(x: float, y: float) -> tuple[float, float]:
+            return (left+(x-x_min)/(x_max-x_min)*panel_w,
+                    top+(1-(y-y_min)/(y_max-y_min))*panel_h)
+        parts += [f'<rect x="{left}" y="{top}" width="{panel_w}" height="{panel_h}" fill="#FAFAFA" stroke="#D2D2D7"/>',
+                  f'<text x="{left}" y="{top-24}" fill="#1D1D1F" font-size="21" font-weight="700">{title}</text>']
+        if panel_index == 0:
+            # Data-driven shmoo background: nearest measured-cell classification
+            # of the observed balanced score.  This visualizes the current measured
+            # population without pretending the upper-left extreme is always
+            # a guaranteed silicon pass region.
+            grid_cols, grid_rows = 18, 12
+            for gy_index in range(grid_rows):
+                for gx_index in range(grid_cols):
+                    gx_value = x_min + (gx_index + .5) / grid_cols * (x_max - x_min)
+                    gy_value = y_max - (gy_index + .5) / grid_rows * (y_max - y_min)
+                    nearest = min(samples, key=lambda item: (
+                        ((gx_value - float(item[x_key])) / (x_max - x_min)) ** 2 +
+                        ((gy_value - float(item[y_key])) / (y_max - y_min)) ** 2))
+                    fill = "#71E68B" if nearest["best_region"] else "#FFB0A8"
+                    parts.append(
+                        f'<rect x="{left+gx_index*panel_w/grid_cols:.1f}" '
+                        f'y="{top+gy_index*panel_h/grid_rows:.1f}" '
+                        f'width="{panel_w/grid_cols+0.5:.1f}" height="{panel_h/grid_rows+0.5:.1f}" '
+                        f'fill="{fill}" opacity="0.38"/>')
+        for step in range(5):
+            gx = left+panel_w*step/4; gy = top+panel_h*step/4
+            xv = x_min+(x_max-x_min)*step/4; yv = y_max-(y_max-y_min)*step/4
+            parts += [f'<path d="M{gx:.1f} {top} V{top+panel_h}" stroke="#E5E5EA"/>',
+                      f'<path d="M{left} {gy:.1f} H{left+panel_w}" stroke="#E5E5EA"/>',
+                      f'<text x="{gx:.1f}" y="{top+panel_h+22}" text-anchor="middle" fill="#6E6E73" font-size="12">{xv:.3g}</text>',
+                      f'<text x="{left-10}" y="{gy+4:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{yv:.3g}</text>']
+        for item in samples:
+            x, y = xy(float(item[x_key]), float(item[y_key])); score = float(item["balanced_score"])
+            ring, ring_width = ("#460479", 4) if item["best_region"] else ("#FFFFFF", 1.5)
+            parts += [f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="{score_color(item)}" stroke="{ring}" stroke-width="{ring_width}"/>',
+                      f'<title>{html.escape(str(item["lot_wafer"]))} / {html.escape(str(item["chip_id"]))}; score={score:.3f}; CR={float(item["cell_ratio_beta"]):.3f}; 1/PR={float(item["write_contention"]):.3f}</title>']
+        target = shmoo["target"]
+        if x_key in target and y_key in target:
+            tx, ty = xy(float(target[x_key]), float(target[y_key]))
+            parts += [f'<path d="M{tx-10:.1f} {ty} H{tx+10:.1f} M{tx} {ty-10:.1f} V{ty+10:.1f}" stroke="#460479" stroke-width="4"/>',
+                      f'<text x="{tx+12:.1f}" y="{ty-12:.1f}" fill="#460479" font-size="12" font-weight="700">Preferred center</text>']
+        if panel_index == 0:
+            weak = shmoo["weakest"]
+            wx, wy = xy(float(weak[x_key]), float(weak[y_key]))
+            tx, ty = xy(float(target[x_key]), float(target[y_key]))
+            parts += [f'<path d="M{wx:.1f} {wy:.1f} L{tx:.1f} {ty:.1f}" stroke="#007AFF" stroke-width="3" stroke-dasharray="7 5" marker-end="url(#arrow)"/>',
+                      f'<rect x="{wx-7:.1f}" y="{wy-7:.1f}" width="14" height="14" fill="#FF3B30" stroke="#FFFFFF" stroke-width="2"/>',
+                      f'<text x="{wx+12:.1f}" y="{wy+20:.1f}" fill="#C13515" font-size="12" font-weight="700">Weakest: {html.escape(str(weak["chip_id"]))}</text>',
+                      f'<text x="{left+12}" y="{top+22}" fill="#248A3D" font-size="14" font-weight="700">Preferred drive direction ↖</text>',
+                      f'<text x="{left+panel_w-12}" y="{top+panel_h-12}" text-anchor="end" fill="#C13515" font-size="14" font-weight="700">WEAK</text>']
+        parts += [f'<text x="{left+panel_w/2}" y="{top+panel_h+50}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{x_label}</text>',
+                  f'<text x="{left-62}" y="{top+panel_h/2}" transform="rotate(-90 {left-62} {top+panel_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{y_label}</text>']
+    if len(panels) == 1:
+        parts.append('<text x="765" y="210" fill="#C56A00" font-size="18" font-weight="700">PU/PG/PD Vt and Idsat are unavailable in this legacy summary.</text>')
+    parts += [f'<text x="{width/2}" y="{height-20}" text-anchor="middle" fill="#6E6E73" font-size="14">Arrow shows the weakest observed cell toward the median preferred center; empirical same-VDD guidance, not foundry sign-off.</text>', '</svg>']
+    return "".join(parts)
 
 
 def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -> str:
@@ -3496,6 +3671,37 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         raise RuntimeError("Could not render transparent stacked Estimate Vmin chart")
     renderPM.drawToFile(transparent_drawing, str(transparent_png), fmt="PNG", dpi=180,
                         bg=None, backend="rlPyCairo", backendFmt="RGBA")
+    shmoo_sections = []
+    shmoo_fields = ["vdd_v", "lot_wafer", "chip_id", "read_score", "write_score",
+                    "balanced_score", "best_region",
+                    "cell_ratio_beta", "pull_up_ratio_beta", "write_contention",
+                    "target_cr", "target_write_contention", "delta_cr", "delta_write_contention",
+                    "pu_vt_v", "pu_idsat_ua", "delta_pu_vt_v", "delta_pu_idsat_ua",
+                    "pg_vt_v", "pg_idsat_ua", "pd_vt_v", "pd_idsat_ua",
+                    "delta_pg_vt_v", "delta_pg_idsat_ua", "delta_pd_vt_v", "delta_pd_idsat_ua",
+                    "rsnm_mv", "wsnm_mv", "write_margin_mv", "wl_write_margin_mv"]
+    with (out / "estimate_vmin_cr_pr_shmoo.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=shmoo_fields); writer.writeheader()
+        for index, shmoo in enumerate(analysis.get("ratio_shmoos", []), 1):
+            svg_name = f"{index:02d}_vdd_{shmoo['vdd_v']:.3f}_cr_pr_shmoo.svg"
+            png_name = svg_name.replace(".svg", ".png")
+            svg_path = image_dir / svg_name
+            svg_path.write_text(estimate_vmin_ratio_shmoo_svg(shmoo), encoding="utf-8")
+            shmoo_drawing = svg2rlg(str(svg_path))
+            if shmoo_drawing is None:
+                raise RuntimeError("Could not render Estimate Vmin CR/PR shmoo")
+            renderPM.drawToFile(shmoo_drawing, str(image_dir / png_name), fmt="PNG",
+                                dpi=180, backend="rlPyCairo")
+            shmoo_sections.append(
+                f'<section><h2>Model VDD {shmoo["vdd_v"]:.3f} V — Drive-Balance Shmoo</h2>'
+                f'<p class="note">Preferred center: CR={shmoo["target"]["cell_ratio_beta"]:.3f}; '
+                f'PU/PG={shmoo["target"]["write_contention"]:.3f}. Upper-left is the preferred direction. '
+                'This is relative screening, not silicon Pass/Fail.</p>'
+                f'<img src="images/{png_name}" alt="Drive balance shmoo at Model VDD {shmoo["vdd_v"]:.3f} V"></section>')
+            for sample in shmoo["samples"]:
+                record = {key: sample.get(key, "") for key in shmoo_fields}
+                record["vdd_v"] = shmoo["vdd_v"]
+                writer.writerow(record)
     with (out / "multi_chip_snm_summary_combined.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         fields = ["vdd_v", "sample_count"] + [field for key, *_ in _ESTIMATE_VMIN_METRICS
                   for field in (key, f"{key}_lot_wafer", f"{key}_chip_id")]
@@ -3503,9 +3709,9 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
     backup_dir = out / "imported_multi_chip_summaries"; backup_dir.mkdir(exist_ok=True)
     for index, source in enumerate(source_paths, 1):
         source_path = Path(source); shutil.copy2(source_path, backup_dir / f"{index:02d}_{source_path.name}")
-    sections = '<section><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows)
+    sections = '<section><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows) + "".join(shmoo_sections)
     report = out / "estimate_vmin_report.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Estimate Vmin Curve</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1500px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}.note{{color:#6e6e73}}</style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1><p class="note">{html.escape(analysis["definition"])}</p>{sections}<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>.</p></main></body></html>''', encoding="utf-8")
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Estimate Vmin Curve</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1500px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}.note{{color:#6e6e73}}</style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1><p class="note">{html.escape(analysis["definition"])}</p><p class="note">Drive-Balance scoring uses the minimum of normalized RSNM (read stability) and BL Write Trip Margin (write ability) at each Model VDD. Residual WSNM remains a separate write-eye diagnostic and is not scored as larger-is-better. X=PU/PG=1/PR (left improves write); Y=PD/PG=CR (up improves read). Purple-ring points are within 90% of the best relative score.</p>{sections}<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. Per-cell target deltas: <code>estimate_vmin_cr_pr_shmoo.csv</code>.</p></main></body></html>''', encoding="utf-8")
     return report
 
 
@@ -5156,6 +5362,11 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         if drawing is None:
             raise RuntimeError("Could not render multi-chip VTC overlay")
         renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
+    def family_average(row: dict, family: str, attribute: str) -> float:
+        cell = row["cell"]
+        return (float(getattr(getattr(cell, f"{family}1"), attribute)) +
+                float(getattr(getattr(cell, f"{family}2"), attribute))) / 2.0
+
     export_rows = [{"lot_wafer": analysis["lot_wafer"], "chip_id": row["chip_id"],
                     "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
                     "upper_rsnm_mv": row["upper_rsnm_mv"], "lower_rsnm_mv": row["lower_rsnm_mv"],
@@ -5163,6 +5374,12 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                     "wl_write_margin_mv": row["wl_write_margin_mv"],
                     "cell_ratio_beta": row["cell_ratio_beta"],
                     "pull_up_ratio_beta": row["pull_up_ratio_beta"],
+                    "pu_vt_v": family_average(row, "pu", "vt"),
+                    "pu_idsat_ua": family_average(row, "pu", "ids"),
+                    "pg_vt_v": family_average(row, "pg", "vt"),
+                    "pg_idsat_ua": family_average(row, "pg", "ids"),
+                    "pd_vt_v": family_average(row, "pd", "vt"),
+                    "pd_idsat_ua": family_average(row, "pd", "ids"),
                     "is_worst_rsnm": row["chip_id"] == analysis["worst_rsnm"]["chip_id"],
                     "is_worst_rsnm_upper": row["chip_id"] == analysis["worst_rsnm_upper"]["chip_id"],
                     "is_worst_rsnm_lower": row["chip_id"] == analysis["worst_rsnm_lower"]["chip_id"],
