@@ -3263,7 +3263,7 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 780) -> 
         parts += [f'<path d="M{boundary_x:.1f} {top} V{top+plot_h}" stroke="#FF9500" stroke-width="3" stroke-dasharray="8 6"/>',
                   f'<circle cx="{boundary_x:.1f}" cy="{boundary_y:.1f}" r="7" fill="#FFFFFF" stroke="#FF9500" stroke-width="3"/>',
                   f'<rect x="{closure_left - 6:.1f}" y="{top + 8}" width="{closure_width + 12:.1f}" height="28" rx="6" fill="#FFF4DE" stroke="#F1D399"/>',
-                  f'<text x="{closure_label_x:.1f}" y="{top+28}" text-anchor="{closure_anchor}" fill="#C56A00" font-size="16" font-weight="700">{closure_text}</text>']
+                  f'<text x="{closure_left + closure_width / 2:.1f}" y="{top+28}" text-anchor="middle" fill="#C56A00" font-size="16" font-weight="700">{closure_text}</text>']
     else:
         parts.append(f'<text x="{left+plot_w-8}" y="{top+28}" text-anchor="end" fill="#C56A00" font-size="16" font-weight="700">Eye-closure VDD not bracketed by the entered rows</text>')
     parts += [
@@ -3445,6 +3445,10 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
             sample["balanced_score"] = min(sample["read_score"], sample["write_score"])
             sample["write_contention"] = 1.0 / float(sample["pull_up_ratio_beta"])
         best_score = max(float(sample["balanced_score"]) for sample in samples)
+        best_sample = max(
+            samples,
+            key=lambda sample: (float(sample["balanced_score"]),
+                                float(sample["read_score"]) + float(sample["write_score"])))
         best_cutoff = best_score * 0.90
         for sample in samples:
             sample["best_region"] = float(sample["balanced_score"]) >= best_cutoff
@@ -3468,7 +3472,7 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
                     sample[f"delta_{field}"] = float(target[field]) - float(sample[field])
         shmoos.append({"vdd_v": float(row["vdd_v"]), "samples": samples,
                         "best_score": best_score, "best_cutoff": best_cutoff,
-                        "target": target, "weakest": weakest,
+                        "target": target, "best": best_sample, "weakest": weakest,
                         "has_family_wat": all(all(field in sample for field in family_fields)
                                               for sample in samples),
                         "definition": ("Balanced score is the minimum of normalized RSNM and "
@@ -3636,7 +3640,7 @@ def _legacy_estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height
 
 
 def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
-                                  height: int = 900) -> str:
+                                  height: int = 930) -> str:
     """Render one focused drive-balance shmoo with a separate reading guide."""
     samples = shmoo["samples"]
     x_key, y_key = "write_contention", "cell_ratio_beta"
@@ -3724,20 +3728,51 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
         ]
 
     sample_positions = [xy(float(item[x_key]), float(item[y_key])) for item in samples]
-    for item, (x, y) in zip(samples, sample_positions):
+    for sample_index, (item, (x, y)) in enumerate(zip(samples, sample_positions), 1):
         score = float(item["balanced_score"])
-        parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5.5" fill="#26323D" stroke="#FFFFFF" stroke-width="1.2"><title>{html.escape(str(item["lot_wafer"]))} / {html.escape(str(item["chip_id"]))}; score={score:.3f}; CR={float(item["cell_ratio_beta"]):.3f}; 1/PR={float(item["write_contention"]):.3f}</title></circle>')
+        tooltip_rows = [
+            f'Cell: {item["chip_id"]} ({sample_index}/{len(samples)})',
+            f'Lot/Wafer: {item["lot_wafer"]}',
+            f'Model VDD: {shmoo["vdd_v"]:.3f} V',
+            f'RSNM: {float(item.get("rsnm_mv", 0.0)):.1f} mV',
+            f'BL Write Vtrip: {float(item.get("write_margin_mv", 0.0)):.1f} mV',
+            f'Balanced score: {score:.3f}',
+            f'CR = β_PD/β_PG: {float(item["cell_ratio_beta"]):.3f}',
+            f'1/PR = β_PU/β_PG: {float(item["write_contention"]):.3f}',
+        ]
+        for family, family_name in (("pu", "PU"), ("pg", "PG"), ("pd", "PD")):
+            vt_key, idsat_key = f"{family}_vt_v", f"{family}_idsat_ua"
+            if vt_key in item and idsat_key in item:
+                tooltip_rows.append(
+                    f'{family_name}: Vt {float(item[vt_key]):.4f} V / '
+                    f'Idsat {float(item[idsat_key]):.3f} µA')
+        tooltip_text = " | ".join(tooltip_rows)
+        tooltip_attr = html.escape(tooltip_text, quote=True)
+        native_title = html.escape("\n".join(tooltip_rows))
+        parts.append(
+            f'<circle class="measured-cell" data-cell-tooltip="{tooltip_attr}" '
+            f'cx="{x:.1f}" cy="{y:.1f}" r="6" fill="#26323D" '
+            f'stroke="#FFFFFF" stroke-width="1.2" tabindex="0">'
+            f'<title>{native_title}</title></circle>')
 
     target = shmoo["target"]
     tx, ty = xy(float(target[x_key]), float(target[y_key]))
+    best = shmoo.get("best") or max(
+        samples, key=lambda item: (float(item["balanced_score"]),
+                                  float(item["read_score"]) + float(item["write_score"])))
+    bx, by = xy(float(best[x_key]), float(best[y_key]))
     weak = shmoo["weakest"]
     wx, wy = xy(float(weak[x_key]), float(weak[y_key]))
     preferred_text = "Preferred center"
+    best_text = f'Best measured: {html.escape(str(best["chip_id"]))}'
     weak_text = f'Weakest: {html.escape(str(weak["chip_id"]))}'
     label_positions = _place_chart_labels(
-        [(tx, ty, preferred_text), (wx, wy, weak_text)], sample_positions,
+        [(tx, ty, preferred_text), (bx, by, best_text), (wx, wy, weak_text)],
+        sample_positions,
         (left + 8, top + 8, left + plot_w - 8, top + plot_h - 8), 14.0)
-    (preferred_x, preferred_y, preferred_anchor), (weak_x, weak_y, weak_anchor) = label_positions
+    ((preferred_x, preferred_y, preferred_anchor),
+     (best_x, best_y, best_anchor),
+     (weak_x, weak_y, weak_anchor)) = label_positions
 
     def label_left(x: float, anchor: str, text: str) -> float:
         label_width = max(42.0, len(text) * 14.0 * .56)
@@ -3745,15 +3780,20 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
 
     preferred_left = label_left(preferred_x, preferred_anchor, preferred_text)
     preferred_width = max(42.0, len(preferred_text) * 14.0 * .56)
+    best_left = label_left(best_x, best_anchor, best_text)
+    best_width = max(42.0, len(best_text) * 14.0 * .56)
     weak_left = label_left(weak_x, weak_anchor, weak_text)
     weak_width = max(42.0, len(weak_text) * 14.0 * .56)
     parts += [
         f'<path d="M{tx - 11:.1f} {ty}H{tx + 11:.1f}M{tx} {ty - 11:.1f}V{ty + 11:.1f}" stroke="#61308C" stroke-width="4"/>',
         f'<rect x="{preferred_left - 6:.1f}" y="{preferred_y - 18:.1f}" width="{preferred_width + 12:.1f}" height="24" rx="6" fill="#F5EFFA" stroke="#D8C8E6"/>',
-        f'<text x="{preferred_x:.1f}" y="{preferred_y:.1f}" text-anchor="{preferred_anchor}" fill="#61308C" font-size="14" font-weight="700">{preferred_text}</text>',
+        f'<text x="{preferred_left + preferred_width / 2:.1f}" y="{preferred_y:.1f}" text-anchor="middle" fill="#61308C" font-size="14" font-weight="700">{preferred_text}</text>',
+        f'<polygon points="{bx:.1f},{by - 10:.1f} {bx + 10:.1f},{by:.1f} {bx:.1f},{by + 10:.1f} {bx - 10:.1f},{by:.1f}" fill="#FFC447" stroke="#8A5A00" stroke-width="2"/>',
+        f'<rect x="{best_left - 6:.1f}" y="{best_y - 18:.1f}" width="{best_width + 12:.1f}" height="24" rx="6" fill="#FFF4DE" stroke="#E7C16B"/>',
+        f'<text x="{best_left + best_width / 2:.1f}" y="{best_y:.1f}" text-anchor="middle" fill="#8A5A00" font-size="14" font-weight="700">{best_text}</text>',
         f'<rect x="{wx - 7:.1f}" y="{wy - 7:.1f}" width="14" height="14" fill="#E4513B" stroke="#FFFFFF" stroke-width="2"/>',
         f'<rect x="{weak_left - 6:.1f}" y="{weak_y - 18:.1f}" width="{weak_width + 12:.1f}" height="24" rx="6" fill="#FFF1EF" stroke="#F0C1B9"/>',
-        f'<text x="{weak_x:.1f}" y="{weak_y:.1f}" text-anchor="{weak_anchor}" fill="#B2382B" font-size="14" font-weight="700">{weak_text}</text>',
+        f'<text x="{weak_left + weak_width / 2:.1f}" y="{weak_y:.1f}" text-anchor="middle" fill="#B2382B" font-size="14" font-weight="700">{weak_text}</text>',
     ]
 
     parts += [
@@ -3785,9 +3825,10 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
         f'<rect x="{side_x + 2}" y="{legend_y + 17}" width="17" height="17" fill="#FFF0C2"/><text x="{side_x + 34}" y="{legend_y + 31}" fill="#20262D" font-size="14">Next region (72–90%)</text>',
         f'<rect x="{side_x + 2}" y="{legend_y + 44}" width="17" height="17" fill="#F7C9C2"/><text x="{side_x + 34}" y="{legend_y + 58}" fill="#20262D" font-size="14">Lowest region (&lt;72%)</text>',
         f'<circle cx="{side_x + 10}" cy="{legend_y + 85}" r="6" fill="#26323D"/><text x="{side_x + 34}" y="{legend_y + 90}" fill="#20262D" font-size="14">Measured cell</text>',
-        f'<path d="M{side_x + 1} {legend_y + 112}H{side_x + 19}M{side_x + 10} {legend_y + 103}V{legend_y + 121}" stroke="#61308C" stroke-width="4"/><text x="{side_x + 34}" y="{legend_y + 117}" fill="#20262D" font-size="14">Preferred center</text>',
-        f'<rect x="{side_x + 3}" y="{legend_y + 132}" width="14" height="14" fill="#E4513B"/><text x="{side_x + 34}" y="{legend_y + 144}" fill="#20262D" font-size="14">Weakest sample</text>',
-        f'<path d="M{side_x} {legend_y + 171}H{side_x + 22}" stroke="#61308C" stroke-width="2.5" stroke-dasharray="7 5"/><text x="{side_x + 34}" y="{legend_y + 176}" fill="#20262D" font-size="14">90% relative boundary</text>',
+        f'<polygon points="{side_x + 10},{legend_y + 103} {side_x + 19},{legend_y + 112} {side_x + 10},{legend_y + 121} {side_x + 1},{legend_y + 112}" fill="#FFC447" stroke="#8A5A00" stroke-width="1.5"/><text x="{side_x + 34}" y="{legend_y + 117}" fill="#20262D" font-size="14">Best measured cell</text>',
+        f'<path d="M{side_x + 1} {legend_y + 139}H{side_x + 19}M{side_x + 10} {legend_y + 130}V{legend_y + 148}" stroke="#61308C" stroke-width="4"/><text x="{side_x + 34}" y="{legend_y + 144}" fill="#20262D" font-size="14">Preferred center</text>',
+        f'<rect x="{side_x + 3}" y="{legend_y + 159}" width="14" height="14" fill="#E4513B"/><text x="{side_x + 34}" y="{legend_y + 171}" fill="#20262D" font-size="14">Weakest sample</text>',
+        f'<path d="M{side_x} {legend_y + 198}H{side_x + 22}" stroke="#61308C" stroke-width="2.5" stroke-dasharray="7 5"/><text x="{side_x + 34}" y="{legend_y + 203}" fill="#20262D" font-size="14">90% relative boundary</text>',
     ]
     parts.append('</svg>')
     return "".join(parts)
@@ -3848,7 +3889,7 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
         slope_left = slope_label_x - slope_width if slope_anchor == "end" else slope_label_x
         parts += [f'<path d="M{marker_x:.1f} {top} V{baseline_y}" stroke="#FF385C" stroke-width="2" stroke-dasharray="5 5"/>',
                   f'<rect x="{slope_left - 5:.1f}" y="{top + 64}" width="{slope_width + 10:.1f}" height="27" rx="6" fill="#FFF1EF" stroke="#F0C1B9"/>',
-                  f'<text x="{slope_label_x:.1f}" y="{top+83}" text-anchor="{slope_anchor}" fill="#C13515" font-size="14" font-weight="700">{slope_text}</text>']
+                  f'<text x="{slope_left + slope_width / 2:.1f}" y="{top+83}" text-anchor="middle" fill="#C13515" font-size="14" font-weight="700">{slope_text}</text>']
     closure = curve.get("eye_closure")
     if closure:
         x, closure_y = xy(float(closure["estimated_vdd_v"]), 0)
@@ -3861,7 +3902,7 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
         closure_left = closure_label_x - closure_width if closure_anchor == "end" else closure_label_x
         parts += [f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#FF9500" stroke-width="3" stroke-dasharray="{dash}"/>',
                   f'<rect x="{closure_left - 6:.1f}" y="{top + 8}" width="{closure_width + 12:.1f}" height="28" rx="6" fill="#FFF4DE" stroke="#F1D399"/>',
-                  f'<text x="{closure_label_x:.1f}" y="{top+28}" text-anchor="{closure_anchor}" fill="#C56A00" font-size="16" font-weight="700">{closure_text}</text>']
+                  f'<text x="{closure_left + closure_width / 2:.1f}" y="{top+28}" text-anchor="middle" fill="#C56A00" font-size="16" font-weight="700">{closure_text}</text>']
         if closure.get("extrapolated"):
             first_x, first_y = points[0]
             slope_note = f'Two-lowest-VDD slope: {closure["slope_mv_per_v"]:.2f} mV/V'
@@ -3871,7 +3912,7 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
             parts += [
                 f'<path data-extrapolated-to-zero="true" d="M{x:.1f} {closure_y:.1f}L{first_x:.1f} {first_y:.1f}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="8 6" stroke-linecap="round"/>',
                 f'<rect x="{slope_note_left - 6:.1f}" y="{top + 40}" width="{slope_note_width + 12:.1f}" height="25" rx="6" fill="#FFF4DE" stroke="#F1D399"/>',
-                f'<text x="{closure_label_x:.1f}" y="{top+58}" text-anchor="{closure_anchor}" fill="#C56A00" font-size="14">{slope_note}</text>',
+                f'<text x="{slope_note_left + slope_note_width / 2:.1f}" y="{top+58}" text-anchor="middle" fill="#C56A00" font-size="14">{slope_note}</text>',
             ]
     else:
         parts.append(f'<text x="{left+plot_w-8}" y="{top+28}" text-anchor="end" fill="#C56A00" font-size="16" font-weight="700">Eye-closure VDD not bracketed by imported points</text>')
@@ -3930,7 +3971,8 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
             svg_name = f"{index:02d}_vdd_{shmoo['vdd_v']:.3f}_cr_pr_shmoo.svg"
             png_name = svg_name.replace(".svg", ".png")
             svg_path = image_dir / svg_name
-            svg_path.write_text(estimate_vmin_ratio_shmoo_svg(shmoo), encoding="utf-8")
+            shmoo_svg_text = estimate_vmin_ratio_shmoo_svg(shmoo)
+            svg_path.write_text(shmoo_svg_text, encoding="utf-8")
             shmoo_drawing = svg2rlg(str(svg_path))
             if shmoo_drawing is None:
                 raise RuntimeError("Could not render Estimate Vmin CR/PR shmoo")
@@ -3938,10 +3980,15 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                                 dpi=180, backend="rlPyCairo")
             shmoo_sections.append(
                 f'<section><h2>Model VDD {shmoo["vdd_v"]:.3f} V — Drive-Balance Shmoo</h2>'
-                f'<p class="note">Preferred center: CR={shmoo["target"]["cell_ratio_beta"]:.3f}; '
-                f'PU/PG={shmoo["target"]["write_contention"]:.3f}. Upper-left is the preferred direction. '
-                'This is relative screening, not silicon Pass/Fail.</p>'
-                f'<img src="images/{png_name}" alt="Drive balance shmoo at Model VDD {shmoo["vdd_v"]:.3f} V"></section>')
+                f'<p class="note">Preferred-region center: CR={shmoo["target"]["cell_ratio_beta"]:.3f}; '
+                f'βPU/βPG={shmoo["target"]["write_contention"]:.3f}. '
+                f'Best measured cell: {html.escape(str(shmoo["best"]["chip_id"]))} '
+                f'(Score={float(shmoo["best"]["balanced_score"]):.3f}). '
+                'Move the pointer over a measured cell to inspect its WAT and margin values. '
+                'Color regions are relative screening within this VDD, not silicon Pass/Fail.</p>'
+                f'<div class="interactive-shmoo">{shmoo_svg_text}</div>'
+                f'<p class="note">Downloads: <a href="images/{svg_name}">interactive SVG</a> · '
+                f'<a href="images/{png_name}">PNG</a></p></section>')
             for sample in shmoo["samples"]:
                 record = {key: sample.get(key, "") for key in shmoo_fields}
                 record["vdd_v"] = shmoo["vdd_v"]
@@ -3955,7 +4002,47 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         source_path = Path(source); shutil.copy2(source_path, backup_dir / f"{index:02d}_{source_path.name}")
     sections = '<section><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows) + "".join(shmoo_sections)
     report = out / "estimate_vmin_report.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Estimate Vmin Curve</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1500px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}.note{{color:#6e6e73}}</style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1><p class="note">{html.escape(analysis["definition"])}</p><p class="note">Drive-Balance scoring uses the minimum of normalized RSNM (read stability) and BL Write Trip Margin (write ability) at each Model VDD. Residual WSNM remains a separate write-eye diagnostic and is not scored as larger-is-better. X=PU/PG=1/PR (left improves write); Y=PD/PG=CR (up improves read). Purple-ring points are within 90% of the best relative score.</p>{sections}<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. Per-cell target deltas: <code>estimate_vmin_cr_pr_shmoo.csv</code>.</p></main></body></html>''', encoding="utf-8")
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Estimate Vmin Curve</title>
+<style>
+body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}
+main{{max-width:1500px;margin:auto}}
+section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}
+img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}
+.interactive-shmoo circle.measured-cell{{cursor:help}}
+.note{{color:#6e6e73}}
+#cell-tooltip{{position:fixed;z-index:9999;display:none;max-width:340px;padding:12px 14px;border-radius:10px;background:#1d1d1f;color:#fff;box-shadow:0 8px 30px rgba(0,0,0,.24);font-size:14px;line-height:1.45;white-space:pre-line;pointer-events:none}}
+</style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1>
+<p class="note">{html.escape(analysis["definition"])}</p>
+<p class="note">Drive-Balance scoring uses the minimum of normalized RSNM (read stability) and BL Write Trip Margin (write ability) at each Model VDD. Residual WSNM remains a separate write-eye diagnostic and is not scored as larger-is-better. X=βPU/βPG=1/PR (left improves write); Y=βPD/βPG=CR (up improves read). Green, yellow and red show relative performance bands within the imported cells.</p>
+{sections}
+<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. Per-cell target deltas: <code>estimate_vmin_cr_pr_shmoo.csv</code>.</p>
+</main><div id="cell-tooltip" role="tooltip"></div>
+<script>
+const cellTooltip=document.getElementById('cell-tooltip');
+const moveCellTooltip=(event)=>{{
+  const gap=16;
+  const box=cellTooltip.getBoundingClientRect();
+  const left=Math.min(event.clientX+gap,window.innerWidth-box.width-gap);
+  const top=Math.min(event.clientY+gap,window.innerHeight-box.height-gap);
+  cellTooltip.style.left=Math.max(gap,left)+'px';
+  cellTooltip.style.top=Math.max(gap,top)+'px';
+}};
+document.querySelectorAll('[data-cell-tooltip]').forEach((mark)=>{{
+  const show=(event)=>{{
+    cellTooltip.textContent=mark.dataset.cellTooltip.replaceAll(' | ','\n');
+    cellTooltip.style.display='block';
+    moveCellTooltip(event);
+  }};
+  mark.addEventListener('mouseenter',show);
+  mark.addEventListener('mousemove',moveCellTooltip);
+  mark.addEventListener('mouseleave',()=>{{cellTooltip.style.display='none';}});
+  mark.addEventListener('focus',()=>{{
+    const box=mark.getBoundingClientRect();
+    show({{clientX:box.left+box.width/2,clientY:box.top+box.height/2}});
+  }});
+  mark.addEventListener('blur',()=>{{cellTooltip.style.display='none';}});
+}});
+</script></body></html>''', encoding="utf-8")
     return report
 
 
