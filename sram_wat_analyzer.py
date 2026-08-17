@@ -3488,7 +3488,7 @@ def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]]) -> dict:
             "definition": "Each VDD point is the minimum per-cell margin in the imported Multi-Cell summary data."}
 
 
-def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height: int = 1040) -> str:
+def _legacy_estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height: int = 1040) -> str:
     """Render upper-left-good drive balance plus PU/PG/PD tuning views."""
     samples = shmoo["samples"]
     panels = [("write_contention", "cell_ratio_beta", "Read / Write Drive-Balance Shmoo",
@@ -3575,6 +3575,160 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height: int = 
     if len(panels) == 1:
         parts.append('<text x="765" y="210" fill="#C56A00" font-size="18" font-weight="700">PU/PG/PD Vt and Idsat are unavailable in this legacy summary.</text>')
     parts += [f'<text x="{width/2}" y="{height-20}" text-anchor="middle" fill="#6E6E73" font-size="14">Arrow shows the weakest observed cell toward the median preferred center; empirical same-VDD guidance, not foundry sign-off.</text>', '</svg>']
+    return "".join(parts)
+
+
+def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
+                                  height: int = 900) -> str:
+    """Render one focused drive-balance shmoo with a separate reading guide."""
+    samples = shmoo["samples"]
+    x_key, y_key = "write_contention", "cell_ratio_beta"
+    xs = [float(item[x_key]) for item in samples]
+    ys = [float(item[y_key]) for item in samples]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    x_pad = max((x_max - x_min) * .12, max(abs(x_min), abs(x_max), 1.0) * .01)
+    y_pad = max((y_max - y_min) * .12, max(abs(y_min), abs(y_max), 1.0) * .01)
+    x_min -= x_pad; x_max += x_pad
+    y_min -= y_pad; y_max += y_pad
+    left, top, plot_w, plot_h = 105, 112, 1110, 690
+    side_x = 1270
+
+    def xy(x: float, y: float) -> tuple[float, float]:
+        return (left + (x - x_min) / (x_max - x_min) * plot_w,
+                top + (1 - (y - y_min) / (y_max - y_min)) * plot_h)
+
+    best_score = max(float(item["balanced_score"]) for item in samples)
+    cutoff = float(shmoo["best_cutoff"])
+
+    def background_color(score: float) -> str:
+        relative = score / best_score if best_score > 0 else 0.0
+        if relative >= .90:
+            return "#DDF3E2"
+        if relative >= .72:
+            return "#FFF0C2"
+        return "#F7C9C2"
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        f'<text x="{left}" y="48" fill="#111111" font-size="34" font-weight="700">Model VDD {shmoo["vdd_v"]:.3f} V - Read / Write Drive-Balance Shmoo</text>',
+        f'<text x="{left}" y="76" fill="#626B73" font-size="15">Relative ranking within this VDD only | {len(samples)} measured cells | not silicon Pass/Fail</text>',
+        '<defs><marker id="shmoo-arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1677D2"/></marker></defs>',
+        f'<rect x="{left}" y="{top}" width="{plot_w}" height="{plot_h}" fill="#FAFAFA" stroke="#AEB7C0"/>',
+    ]
+
+    grid_cols, grid_rows = 24, 16
+    preferred_grid: list[list[bool]] = []
+    for gy_index in range(grid_rows):
+        preferred_row = []
+        for gx_index in range(grid_cols):
+            gx_value = x_min + (gx_index + .5) / grid_cols * (x_max - x_min)
+            gy_value = y_max - (gy_index + .5) / grid_rows * (y_max - y_min)
+            nearest = min(samples, key=lambda item: (
+                ((gx_value - float(item[x_key])) / (x_max - x_min)) ** 2 +
+                ((gy_value - float(item[y_key])) / (y_max - y_min)) ** 2))
+            score = float(nearest["balanced_score"])
+            preferred_row.append(score >= cutoff)
+            parts.append(
+                f'<rect x="{left + gx_index * plot_w / grid_cols:.1f}" '
+                f'y="{top + gy_index * plot_h / grid_rows:.1f}" '
+                f'width="{plot_w / grid_cols + .5:.1f}" height="{plot_h / grid_rows + .5:.1f}" '
+                f'fill="{background_color(score)}"/>')
+        preferred_grid.append(preferred_row)
+
+    # Outline transitions into/out of the >=90% nearest-cell region.  This
+    # preserves the current empirical classification without implying a
+    # physically simulated continuous contour.
+    boundary_paths = []
+    for gy_index in range(grid_rows):
+        for gx_index in range(grid_cols):
+            state = preferred_grid[gy_index][gx_index]
+            x0 = left + gx_index * plot_w / grid_cols
+            x1 = left + (gx_index + 1) * plot_w / grid_cols
+            y0 = top + gy_index * plot_h / grid_rows
+            y1 = top + (gy_index + 1) * plot_h / grid_rows
+            if gx_index + 1 < grid_cols and state != preferred_grid[gy_index][gx_index + 1]:
+                boundary_paths.append(f'M{x1:.1f} {y0:.1f}V{y1:.1f}')
+            if gy_index + 1 < grid_rows and state != preferred_grid[gy_index + 1][gx_index]:
+                boundary_paths.append(f'M{x0:.1f} {y1:.1f}H{x1:.1f}')
+    if boundary_paths:
+        parts.append(f'<path d="{" ".join(boundary_paths)}" fill="none" stroke="#61308C" stroke-width="2.2" stroke-dasharray="7 5"/>')
+
+    for step in range(6):
+        gx = left + plot_w * step / 5
+        gy = top + plot_h * step / 5
+        xv = x_min + (x_max - x_min) * step / 5
+        yv = y_max - (y_max - y_min) * step / 5
+        parts += [
+            f'<path d="M{gx:.1f} {top}V{top + plot_h}" stroke="#D8DEE4" stroke-width="1"/>',
+            f'<path d="M{left} {gy:.1f}H{left + plot_w}" stroke="#D8DEE4" stroke-width="1"/>',
+            f'<text x="{gx:.1f}" y="{top + plot_h + 25}" text-anchor="middle" fill="#4F5962" font-size="13">{xv:.3f}</text>',
+            f'<text x="{left - 12}" y="{gy + 5:.1f}" text-anchor="end" fill="#4F5962" font-size="13">{yv:.3f}</text>',
+        ]
+
+    for item in samples:
+        x, y = xy(float(item[x_key]), float(item[y_key]))
+        score = float(item["balanced_score"])
+        parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5.5" fill="#26323D" stroke="#FFFFFF" stroke-width="1.2"><title>{html.escape(str(item["lot_wafer"]))} / {html.escape(str(item["chip_id"]))}; score={score:.3f}; CR={float(item["cell_ratio_beta"]):.3f}; 1/PR={float(item["write_contention"]):.3f}</title></circle>')
+        if item["best_region"]:
+            parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="10" fill="none" stroke="#61308C" stroke-width="2.5"/>')
+
+    target = shmoo["target"]
+    tx, ty = xy(float(target[x_key]), float(target[y_key]))
+    parts += [
+        f'<path d="M{tx - 11:.1f} {ty}H{tx + 11:.1f}M{tx} {ty - 11:.1f}V{ty + 11:.1f}" stroke="#61308C" stroke-width="4"/>',
+        f'<text x="{tx + 14:.1f}" y="{ty - 14:.1f}" fill="#61308C" font-size="14" font-weight="700">Preferred center</text>',
+    ]
+    weak = shmoo["weakest"]
+    wx, wy = xy(float(weak[x_key]), float(weak[y_key]))
+    weak_on_right = wx > left + plot_w * .62
+    weak_label_x = wx - 16 if weak_on_right else wx + 16
+    weak_anchor = "end" if weak_on_right else "start"
+    parts += [
+        f'<rect x="{wx - 7:.1f}" y="{wy - 7:.1f}" width="14" height="14" fill="#E4513B" stroke="#FFFFFF" stroke-width="2"/>',
+        f'<path d="M{wx:.1f} {wy:.1f}L{weak_label_x:.1f} {wy + 28:.1f}" stroke="#B2382B" stroke-width="1.5"/>',
+        f'<text x="{weak_label_x:.1f}" y="{wy + 45:.1f}" text-anchor="{weak_anchor}" fill="#B2382B" font-size="14" font-weight="700">Weakest: {html.escape(str(weak["chip_id"]))}</text>',
+    ]
+
+    arrow_start_x, arrow_start_y = left + 285, top + 148
+    arrow_end_x, arrow_end_y = left + 115, top + 47
+    parts += [
+        f'<path d="M{arrow_start_x} {arrow_start_y}L{arrow_end_x} {arrow_end_y}" stroke="#1677D2" stroke-width="4" marker-end="url(#shmoo-arrow)"/>',
+        f'<text x="{arrow_start_x + 10}" y="{arrow_start_y + 5}" fill="#1677D2" font-size="16" font-weight="700">Preferred drive direction</text>',
+        f'<text x="{left + plot_w / 2}" y="{height - 28}" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Write contention  beta_PU / beta_PG = 1/PR  (left = easier write)</text>',
+        f'<text x="34" y="{top + plot_h / 2}" transform="rotate(-90 34 {top + plot_h / 2})" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Read cell ratio  beta_PD / beta_PG = CR  (up = stronger read)</text>',
+    ]
+
+    # Reading guide on the right keeps formulas and status semantics outside
+    # the data region so labels cannot collide with measured samples.
+    parts += [
+        f'<text x="{side_x}" y="132" fill="#20262D" font-size="24" font-weight="700">HOW TO READ</text>',
+        f'<rect x="{side_x}" y="154" width="280" height="210" rx="16" fill="#F5F7F9" stroke="#DCE1E6"/>',
+        f'<text x="{side_x + 22}" y="198" fill="#20262D" font-size="17" font-weight="700">Balanced score</text>',
+        f'<text x="{side_x + 22}" y="244" fill="#303941" font-size="16">R_i = RSNM_i / RSNM_max</text>',
+        f'<text x="{side_x + 22}" y="276" fill="#303941" font-size="16">W_i = Vtrip_i / Vtrip_max</text>',
+        f'<text x="{side_x + 22}" y="322" fill="#303941" font-size="17" font-style="italic">Score_i = min(R_i, W_i)</text>',
+        f'<rect x="{side_x}" y="382" width="280" height="126" rx="16" fill="#F5EFFA" stroke="#D8C8E6"/>',
+        f'<text x="{side_x + 22}" y="424" fill="#61308C" font-size="17" font-weight="700">Preferred threshold</text>',
+        f'<text x="{side_x + 22}" y="466" fill="#61308C" font-size="16">Score &gt;= 90% of best = {cutoff:.3f}</text>',
+        f'<text x="{side_x}" y="550" fill="#20262D" font-size="17" font-weight="700">BACKGROUND RULE</text>',
+        f'<text x="{side_x}" y="583" fill="#535D66" font-size="15">Each region inherits the score</text>',
+        f'<text x="{side_x}" y="608" fill="#535D66" font-size="15">of the nearest measured cell.</text>',
+        f'<text x="{side_x}" y="633" fill="#535D66" font-size="15">Green means relative preferred,</text>',
+        f'<text x="{side_x}" y="658" fill="#535D66" font-size="15">not guaranteed silicon pass.</text>',
+    ]
+    legend_y = 704
+    parts += [
+        f'<circle cx="{side_x + 10}" cy="{legend_y}" r="6" fill="#26323D"/><text x="{side_x + 34}" y="{legend_y + 5}" fill="#20262D" font-size="14">Measured cell</text>',
+        f'<circle cx="{side_x + 10}" cy="{legend_y + 36}" r="9" fill="none" stroke="#61308C" stroke-width="2.5"/><text x="{side_x + 34}" y="{legend_y + 41}" fill="#20262D" font-size="14">Preferred sample</text>',
+        f'<path d="M{side_x + 1} {legend_y + 72}H{side_x + 19}M{side_x + 10} {legend_y + 63}V{legend_y + 81}" stroke="#61308C" stroke-width="4"/><text x="{side_x + 34}" y="{legend_y + 77}" fill="#20262D" font-size="14">Preferred center</text>',
+        f'<rect x="{side_x + 3}" y="{legend_y + 101}" width="14" height="14" fill="#E4513B"/><text x="{side_x + 34}" y="{legend_y + 113}" fill="#20262D" font-size="14">Weakest sample</text>',
+        f'<path d="M{side_x} {legend_y + 146}H{side_x + 22}" stroke="#61308C" stroke-width="2.5" stroke-dasharray="7 5"/><text x="{side_x + 34}" y="{legend_y + 151}" fill="#20262D" font-size="14">90% relative boundary</text>',
+    ]
+    if shmoo.get("has_family_wat"):
+        parts.append(f'<text x="{side_x}" y="{height - 18}" fill="#7A838B" font-size="12">PU / PG / PD tuning deltas remain available in the CSV export.</text>')
+    parts.append('</svg>')
     return "".join(parts)
 
 

@@ -683,9 +683,15 @@ class AnalyzerTests(unittest.TestCase):
         svg = estimate_vmin_ratio_shmoo_svg(shmoo)
         self.assertAlmostEqual(shmoo["samples"][1]["write_contention"], 1/1.7)
         self.assertIn("Read / Write Drive-Balance Shmoo", svg)
-        self.assertIn("PU tuning", svg)
-        self.assertIn("Upper-left = preferred direction", svg)
+        self.assertIn("HOW TO READ", svg)
+        self.assertIn("Balanced score", svg)
+        self.assertIn("Preferred threshold", svg)
+        self.assertIn("BACKGROUND RULE", svg)
+        self.assertIn("Preferred drive direction", svg)
         self.assertIn("Weakest: C01", svg)
+        self.assertIn("90% relative boundary", svg)
+        self.assertIn("PU / PG / PD tuning deltas remain available", svg)
+        self.assertIn("#DDF3E2", svg)
 
     def test_estimate_vmin_balance_does_not_reward_large_residual_wsnm(self):
         samples = [
