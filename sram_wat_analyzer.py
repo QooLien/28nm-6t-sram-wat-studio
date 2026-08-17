@@ -4010,7 +4010,17 @@ section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}
 img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}
 .interactive-shmoo circle.measured-cell{{cursor:help}}
 .note{{color:#6e6e73}}
-#cell-tooltip{{position:fixed;z-index:9999;display:none;max-width:340px;padding:12px 14px;border-radius:10px;background:#1d1d1f;color:#fff;box-shadow:0 8px 30px rgba(0,0,0,.24);font-size:14px;line-height:1.45;white-space:pre-line;pointer-events:none}}
+#cell-tooltip{{position:fixed;z-index:9999;display:none;width:390px;max-width:calc(100vw - 32px);padding:14px 16px;border-radius:12px;background:#1d1d1f;color:#fff;box-shadow:0 8px 30px rgba(0,0,0,.24);font-size:13px;line-height:1.35;pointer-events:none}}
+.tooltip-title{{font-size:16px;font-weight:700;margin-bottom:4px}}
+.tooltip-meta{{display:flex;flex-wrap:wrap;gap:4px 14px;color:#c8c8cc;margin-bottom:10px}}
+.tooltip-metrics{{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px}}
+.tooltip-metric{{padding:7px 8px;border-radius:7px;background:#303034}}
+.tooltip-metric-label{{display:block;color:#b8b8bd;font-size:11px;margin-bottom:2px}}
+.tooltip-metric-value{{display:block;color:#fff;font-weight:700}}
+.tooltip-section-label{{color:#c8c8cc;font-size:11px;font-weight:700;letter-spacing:.06em;margin:2px 0 6px}}
+.tooltip-device-grid{{display:grid;grid-template-columns:58px 1fr 1fr;gap:5px 8px;align-items:center;font-variant-numeric:tabular-nums}}
+.tooltip-device-grid .tooltip-head{{color:#aeb0b5;font-size:11px;border-bottom:1px solid #45454a;padding-bottom:4px}}
+.tooltip-device-name{{font-weight:700;color:#fff}}
 </style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1>
 <p class="note">{html.escape(analysis["definition"])}</p>
 <p class="note">Drive-Balance scoring uses the minimum of normalized RSNM (read stability) and BL Write Trip Margin (write ability) at each Model VDD. Residual WSNM remains a separate write-eye diagnostic and is not scored as larger-is-better. X=βPU/βPG=1/PR (left improves write); Y=βPD/βPG=CR (up improves read). Green, yellow and red show relative performance bands within the imported cells.</p>
@@ -4019,6 +4029,52 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 </main><div id="cell-tooltip" role="tooltip"></div>
 <script>
 const cellTooltip=document.getElementById('cell-tooltip');
+const makeTooltipNode=(className,text)=>{{
+  const node=document.createElement('div');
+  node.className=className;
+  node.textContent=text;
+  return node;
+}};
+const renderCellTooltip=(raw)=>{{
+  const rows=raw.split(' | ');
+  cellTooltip.replaceChildren();
+  cellTooltip.appendChild(makeTooltipNode('tooltip-title',rows[0]||'Cell information'));
+  const meta=document.createElement('div');
+  meta.className='tooltip-meta';
+  (rows.slice(1,3)).forEach((text)=>meta.appendChild(makeTooltipNode('',text)));
+  cellTooltip.appendChild(meta);
+  const metrics=document.createElement('div');
+  metrics.className='tooltip-metrics';
+  rows.slice(3,8).forEach((text)=>{{
+    const separator=text.lastIndexOf(':');
+    const metric=document.createElement('div');
+    metric.className='tooltip-metric';
+    metric.appendChild(makeTooltipNode('tooltip-metric-label',separator>=0?text.slice(0,separator):text));
+    metric.appendChild(makeTooltipNode('tooltip-metric-value',separator>=0?text.slice(separator+1).trim():'—'));
+    metrics.appendChild(metric);
+  }});
+  cellTooltip.appendChild(metrics);
+  const devices=rows.slice(8);
+  if(devices.length){{
+    cellTooltip.appendChild(makeTooltipNode('tooltip-section-label','PU / PG / PD WAT'));
+    const grid=document.createElement('div');
+    grid.className='tooltip-device-grid';
+    ['Device','Vt','Idsat'].forEach((text)=>grid.appendChild(makeTooltipNode('tooltip-head',text)));
+    devices.forEach((text)=>{{
+      const match=text.match(/^(PU|PG|PD): Vt ([^ ]+) V \\/ Idsat ([^ ]+) µA$/);
+      if(match){{
+        grid.appendChild(makeTooltipNode('tooltip-device-name',match[1]));
+        grid.appendChild(makeTooltipNode('',match[2]+' V'));
+        grid.appendChild(makeTooltipNode('',match[3]+' µA'));
+      }}else{{
+        grid.appendChild(makeTooltipNode('tooltip-device-name',text));
+        grid.appendChild(makeTooltipNode('','—'));
+        grid.appendChild(makeTooltipNode('','—'));
+      }}
+    }});
+    cellTooltip.appendChild(grid);
+  }}
+}};
 const moveCellTooltip=(event)=>{{
   const gap=16;
   const box=cellTooltip.getBoundingClientRect();
@@ -4029,7 +4085,7 @@ const moveCellTooltip=(event)=>{{
 }};
 document.querySelectorAll('[data-cell-tooltip]').forEach((mark)=>{{
   const show=(event)=>{{
-    cellTooltip.textContent=mark.dataset.cellTooltip.replaceAll(' | ','\n');
+    renderCellTooltip(mark.dataset.cellTooltip);
     cellTooltip.style.display='block';
     moveCellTooltip(event);
   }};
