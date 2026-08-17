@@ -3272,8 +3272,7 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
     shmoos: list[dict[str, object]] = []
     # Read stability and write ability are independent responses.  Use RSNM
     # and the BL Write Trip Margin once each; residual WSNM is retained as a
-    # diagnostic and WL margin is currently derived from the same compact
-    # write model, so neither is double-counted in the balance score.
+    # diagnostic, so it is not double-counted in the balance score.
     metric_keys = ("rsnm_mv", "write_margin_mv")
     family_fields = tuple(field for family in ("pu", "pg", "pd")
                           for field in (f"{family}_vt_v", f"{family}_idsat_ua"))
@@ -3293,7 +3292,6 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
             sample["read_score"] = normalized["rsnm_mv"]
             sample["write_score"] = normalized["write_margin_mv"]
             sample["balanced_score"] = min(sample["read_score"], sample["write_score"])
-            sample["write_contention"] = 1.0 / float(sample["pull_up_ratio_beta"])
         best_score = max(float(sample["balanced_score"]) for sample in samples)
         best_sample = max(
             samples,
@@ -3303,7 +3301,7 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
         for sample in samples:
             sample["best_region"] = float(sample["balanced_score"]) >= best_cutoff
         preferred = [sample for sample in samples if sample["best_region"]]
-        target_fields = ["cell_ratio_beta", "pull_up_ratio_beta", "write_contention"]
+        target_fields = ["cell_ratio_beta", "pull_up_ratio_beta"]
         if all(all(field in sample for field in family_fields) for sample in samples):
             target_fields.extend(family_fields)
         target = {field: statlib.median(float(sample[field]) for sample in preferred)
@@ -3314,9 +3312,9 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
         weakest = min(samples, key=lambda sample: float(sample["balanced_score"]))
         for sample in samples:
             sample["target_cr"] = target["cell_ratio_beta"]
-            sample["target_write_contention"] = target["write_contention"]
+            sample["target_pr"] = target["pull_up_ratio_beta"]
             sample["delta_cr"] = target["cell_ratio_beta"] - float(sample["cell_ratio_beta"])
-            sample["delta_write_contention"] = target["write_contention"] - float(sample["write_contention"])
+            sample["delta_pr"] = target["pull_up_ratio_beta"] - float(sample["pull_up_ratio_beta"])
             for field in family_fields:
                 if field in target and field in sample:
                     sample[f"delta_{field}"] = float(target[field]) - float(sample[field])
@@ -3329,7 +3327,7 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
                                        "BL Write Trip Margin within one Model VDD; residual WSNM "
                                        "is reported separately as a write-eye diagnostic. "
                                        "preferred region is at least 90% of the highest score. "
-                                       "X=β_PU/β_PG=1/PR (left is easier write); "
+                                       "X=β_PG/β_PU=PR (right is easier write); "
                                        "Y=β_PD/β_PG=CR (up is stronger read).")})
     return shmoos
 
@@ -3400,10 +3398,10 @@ def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]]) -> dict:
 
 
 def _legacy_estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height: int = 1040) -> str:
-    """Render upper-left-good drive balance plus PU/PG/PD tuning views."""
+    """Render upper-right-good drive balance plus PU/PG/PD tuning views."""
     samples = shmoo["samples"]
-    panels = [("write_contention", "cell_ratio_beta", "Read / Write Drive-Balance Shmoo",
-               "Write contention = beta_PU / beta_PG = 1/PR (lower is better)",
+    panels = [("pull_up_ratio_beta", "cell_ratio_beta", "Read / Write Drive-Balance Shmoo",
+               "Pull-up Ratio = beta_PG / beta_PU = PR (higher is better)",
                "Read cell ratio = beta_PD / beta_PG = CR (higher is better)")]
     if shmoo.get("has_family_wat"):
         panels.extend([
@@ -3423,7 +3421,7 @@ def _legacy_estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
              '<rect width="100%" height="100%" fill="#FFFFFF"/>',
              f'<text x="56" y="52" fill="#1D1D1F" font-size="34" font-weight="700">Model VDD {shmoo["vdd_v"]:.3f} V - Drive-Balance Shmoo</text>',
-             '<text x="56" y="82" fill="#6E6E73" font-size="15">Upper-left = preferred direction. Red = weak; green = strong; purple ring = relative preferred region (not silicon Pass/Fail).</text>',
+             '<text x="56" y="82" fill="#6E6E73" font-size="15">Upper-right = preferred direction. Red = weak; green = strong; purple ring = relative preferred region (not silicon Pass/Fail).</text>',
              '<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#007AFF"/></marker></defs>']
     for panel_index, ((x_key, y_key, title, x_label, y_label), (left, top)) in enumerate(zip(panels, origins)):
         xs = [float(item[x_key]) for item in samples]; ys = [float(item[y_key]) for item in samples]
@@ -3466,7 +3464,7 @@ def _legacy_estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height
             x, y = xy(float(item[x_key]), float(item[y_key])); score = float(item["balanced_score"])
             ring, ring_width = ("#460479", 4) if item["best_region"] else ("#FFFFFF", 1.5)
             parts += [f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="{score_color(item)}" stroke="{ring}" stroke-width="{ring_width}"/>',
-                      f'<title>{html.escape(str(item["lot_wafer"]))} / {html.escape(str(item["chip_id"]))}; score={score:.3f}; CR={float(item["cell_ratio_beta"]):.3f}; 1/PR={float(item["write_contention"]):.3f}</title>']
+                      f'<title>{html.escape(str(item["lot_wafer"]))} / {html.escape(str(item["chip_id"]))}; score={score:.3f}; CR={float(item["cell_ratio_beta"]):.3f}; PR={float(item["pull_up_ratio_beta"]):.3f}</title>']
         target = shmoo["target"]
         if x_key in target and y_key in target:
             tx, ty = xy(float(target[x_key]), float(target[y_key]))
@@ -3479,7 +3477,7 @@ def _legacy_estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height
             parts += [f'<path d="M{wx:.1f} {wy:.1f} L{tx:.1f} {ty:.1f}" stroke="#007AFF" stroke-width="3" stroke-dasharray="7 5" marker-end="url(#arrow)"/>',
                       f'<rect x="{wx-7:.1f}" y="{wy-7:.1f}" width="14" height="14" fill="#FF3B30" stroke="#FFFFFF" stroke-width="2"/>',
                       f'<text x="{wx+12:.1f}" y="{wy+20:.1f}" fill="#C13515" font-size="12" font-weight="700">Weakest: {html.escape(str(weak["chip_id"]))}</text>',
-                      f'<text x="{left+12}" y="{top+22}" fill="#248A3D" font-size="14" font-weight="700">Preferred drive direction ↖</text>',
+                      f'<text x="{left+panel_w-12}" y="{top+22}" text-anchor="end" fill="#248A3D" font-size="14" font-weight="700">Preferred drive direction ↗</text>',
                       f'<text x="{left+panel_w-12}" y="{top+panel_h-12}" text-anchor="end" fill="#C13515" font-size="14" font-weight="700">WEAK</text>']
         parts += [f'<text x="{left+panel_w/2}" y="{top+panel_h+50}" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{x_label}</text>',
                   f'<text x="{left-62}" y="{top+panel_h/2}" transform="rotate(-90 {left-62} {top+panel_h/2})" text-anchor="middle" fill="#1D1D1F" font-size="15" font-weight="700">{y_label}</text>']
@@ -3493,7 +3491,7 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
                                   height: int = 930) -> str:
     """Render one focused drive-balance shmoo with a separate reading guide."""
     samples = shmoo["samples"]
-    x_key, y_key = "write_contention", "cell_ratio_beta"
+    x_key, y_key = "pull_up_ratio_beta", "cell_ratio_beta"
     xs = [float(item[x_key]) for item in samples]
     ys = [float(item[y_key]) for item in samples]
     x_min, x_max = min(xs), max(xs)
@@ -3588,7 +3586,7 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
             f'BL Write Vtrip: {float(item.get("write_margin_mv", 0.0)):.1f} mV',
             f'Balanced score: {score:.3f}',
             f'CR = β_PD/β_PG: {float(item["cell_ratio_beta"]):.3f}',
-            f'1/PR = β_PU/β_PG: {float(item["write_contention"]):.3f}',
+            f'PR = β_PG/β_PU: {float(item["pull_up_ratio_beta"]):.3f}',
         ]
         for family, family_name in (("pu", "PU"), ("pg", "PG"), ("pd", "PD")):
             vt_key, idsat_key = f"{family}_vt_v", f"{family}_idsat_ua"
@@ -3649,7 +3647,7 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
     ]
 
     parts += [
-        f'<text x="{left + plot_w / 2}" y="{height - 28}" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Write contention  β_PU / β_PG = 1/PR  (left = easier write)</text>',
+        f'<text x="{left + plot_w / 2}" y="{height - 28}" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Pull-up Ratio  β_PG / β_PU = PR  (right = easier write)</text>',
         f'<text x="34" y="{top + plot_h / 2}" transform="rotate(-90 34 {top + plot_h / 2})" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Read cell ratio  β_PD / β_PG = CR  (up = stronger read)</text>',
     ]
 
@@ -3811,8 +3809,8 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
     shmoo_sections = []
     shmoo_fields = ["vdd_v", "lot_wafer", "chip_id", "read_score", "write_score",
                     "balanced_score", "best_region",
-                    "cell_ratio_beta", "pull_up_ratio_beta", "write_contention",
-                    "target_cr", "target_write_contention", "delta_cr", "delta_write_contention",
+                    "cell_ratio_beta", "pull_up_ratio_beta",
+                    "target_cr", "target_pr", "delta_cr", "delta_pr",
                     "pu_vt_v", "pu_idsat_ua", "delta_pu_vt_v", "delta_pu_idsat_ua",
                     "pg_vt_v", "pg_idsat_ua", "pd_vt_v", "pd_idsat_ua",
                     "delta_pg_vt_v", "delta_pg_idsat_ua", "delta_pd_vt_v", "delta_pd_idsat_ua",
@@ -3833,7 +3831,7 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
             shmoo_sections.append(
                 f'<section><h2>Model VDD {shmoo["vdd_v"]:.3f} V — Drive-Balance Shmoo</h2>'
                 f'<p class="note">Preferred-region center: CR={shmoo["target"]["cell_ratio_beta"]:.3f}; '
-                f'βPU/βPG={shmoo["target"]["write_contention"]:.3f}. '
+                f'PR=βPG/βPU={shmoo["target"]["pull_up_ratio_beta"]:.3f}. '
                 f'Best measured cell: {html.escape(str(shmoo["best"]["chip_id"]))} '
                 f'(Score={float(shmoo["best"]["balanced_score"]):.3f}). '
                 'Move the pointer over a measured cell to inspect its WAT and margin values. '
@@ -3880,7 +3878,7 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 .tooltip-device-label{{color:#aeb0b5}}
 </style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1>
 <p class="note">{html.escape(analysis["definition"])}</p>
-<p class="note">Drive-Balance scoring uses the minimum of normalized RSNM (read stability) and BL Write Trip Margin (write ability) at each Model VDD. Residual WSNM remains a separate write-eye diagnostic and is not scored as larger-is-better. X=βPU/βPG=1/PR (left improves write); Y=βPD/βPG=CR (up improves read). Green, yellow and red show relative performance bands within the imported cells.</p>
+<p class="note">Drive-Balance scoring uses the minimum of normalized RSNM (read stability) and BL Write Trip Margin (write ability) at each Model VDD. Residual WSNM remains a separate write-eye diagnostic and is not scored as larger-is-better. X=βPG/βPU=PR (right improves write); Y=βPD/βPG=CR (up improves read). Green, yellow and red show relative performance bands within the imported cells.</p>
 {sections}
 <p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. Per-cell target deltas: <code>estimate_vmin_cr_pr_shmoo.csv</code>.</p>
 </main><div id="cell-tooltip" role="tooltip"></div>
