@@ -640,6 +640,8 @@ class AnalyzerTests(unittest.TestCase):
         svg = estimate_vmin_curve_svg(result["curves"]["rsnm_mv"])
         self.assertIn("Extrapolated eye-closure VDD 0.4000 V", svg)
         self.assertIn("Two-lowest-VDD slope: 200.00 mV/V", svg)
+        self.assertIn('data-extrapolated-to-zero="true"', svg)
+        self.assertIn('stroke-dasharray="8 6"', svg)
 
     def test_estimate_vmin_rejects_nonpositive_low_vdd_slope(self):
         rows = []
@@ -686,12 +688,14 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("HOW TO READ", svg)
         self.assertIn("Balanced score", svg)
         self.assertIn("Preferred threshold", svg)
-        self.assertIn("BACKGROUND RULE", svg)
-        self.assertIn("Preferred drive direction", svg)
+        self.assertIn("COLOR SCALE", svg)
+        self.assertNotIn("Preferred drive direction", svg)
         self.assertIn("Weakest: C01", svg)
         self.assertIn("90% relative boundary", svg)
-        self.assertIn("PU / PG / PD tuning deltas remain available", svg)
+        self.assertIn("β_PU / β_PG", svg)
         self.assertIn("#DDF3E2", svg)
+        self.assertIn("#FFF0C2", svg)
+        self.assertIn("#F7C9C2", svg)
 
     def test_estimate_vmin_balance_does_not_reward_large_residual_wsnm(self):
         samples = [

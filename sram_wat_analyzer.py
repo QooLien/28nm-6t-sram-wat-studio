@@ -168,6 +168,59 @@ def _stagger_label_rows(labels: list[tuple[float, str]],
     return assigned
 
 
+def _place_chart_labels(
+        labels: list[tuple[float, float, str]],
+        point_obstacles: list[tuple[float, float]],
+        bounds: tuple[float, float, float, float],
+        font_size: float = 14.0) -> list[tuple[float, float, str]]:
+    """Place SVG labels near marks while avoiding points, labels and plot edges."""
+    left, top, right, bottom = bounds
+    candidates = ((0, -25, "middle"), (0, 34, "middle"),
+                  (20, -18, "start"), (-20, -18, "end"),
+                  (22, 26, "start"), (-22, 26, "end"),
+                  (34, 5, "start"), (-34, 5, "end"))
+    occupied: list[tuple[float, float, float, float]] = []
+    placed: list[tuple[float, float, str]] = []
+
+    def intersects(first: tuple[float, float, float, float],
+                   second: tuple[float, float, float, float], gap: float = 4.0) -> bool:
+        return not (first[2] + gap < second[0] or second[2] + gap < first[0]
+                    or first[3] + gap < second[1] or second[3] + gap < first[1])
+
+    for point_x, point_y, text in labels:
+        width = max(42.0, len(text) * font_size * .56)
+        height = font_size * 1.35
+        choice = None
+        choice_penalty = math.inf
+        for dx, dy, anchor in candidates:
+            label_x, label_y = point_x + dx, point_y + dy
+            if anchor == "middle":
+                box_left = label_x - width / 2
+            elif anchor == "end":
+                box_left = label_x - width
+            else:
+                box_left = label_x
+            box = (box_left, label_y - height, box_left + width, label_y + 3)
+            penalty = 0.0
+            if box[0] < left or box[2] > right or box[1] < top or box[3] > bottom:
+                penalty += 10000.0
+            penalty += 3000.0 * sum(intersects(box, other) for other in occupied)
+            for obstacle_x, obstacle_y in point_obstacles:
+                point_box = (obstacle_x - 8, obstacle_y - 8,
+                             obstacle_x + 8, obstacle_y + 8)
+                if intersects(box, point_box, gap=3.0):
+                    penalty += 600.0
+            penalty += abs(dx) + abs(dy)
+            if penalty < choice_penalty:
+                choice_penalty = penalty
+                choice = (label_x, label_y, anchor, box)
+        assert choice is not None
+        label_x, label_y, anchor, box = choice
+        occupied.append(box)
+        placed.append((label_x, label_y, anchor))
+    return placed
+
+
 @dataclass(frozen=True)
 class SixTWatCell:
     """Object-oriented WAT description of all six physical bitcell devices."""
@@ -3161,11 +3214,8 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 780) -> 
         parts += [f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA" stroke-width="1"/>',
                   f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="14">{value:.0f}</text>']
 
-    curve_points = []
     closure = analysis.get("eye_closure")
-    if closure:
-        curve_points.append(xy(closure["estimated_vcc_v"], 0.0))
-    curve_points.extend(xy(row["vcc_v"], row["rsnm_mv"]) for row in valid_rows)
+    curve_points = [xy(row["vcc_v"], row["rsnm_mv"]) for row in valid_rows]
     for row, voltage_y in zip(valid_rows, axis_label_y):
         x, y = xy(row["vcc_v"], row["rsnm_mv"])
         parts += [
@@ -3177,25 +3227,25 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 780) -> 
     if curve_points:
         points_text = " ".join(f"{x:.1f},{y:.1f}" for x, y in curve_points)
         parts.append(f'<polyline points="{points_text}" fill="none" stroke="#007AFF" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>')
-    for index, row in enumerate(valid_rows):
-        x, y = xy(row["vcc_v"], row["rsnm_mv"])
-        vcc = row["vcc_v"]
-        if vcc <= .375:
-            label_dx, label_dy, label_anchor = (-18, -36, "end")
-        elif vcc <= .385:
-            label_dx, label_dy, label_anchor = (20, -52, "start")
-        elif vcc <= .42:
-            label_dx, label_dy, label_anchor = (22, 26, "start")
-        elif vcc <= .47:
-            label_dx, label_dy, label_anchor = (0, 42, "middle")
-        elif vcc <= .53:
-            label_dx, label_dy, label_anchor = (0, 38, "middle")
-        elif vcc <= .65:
-            label_dx, label_dy, label_anchor = (0, -40, "middle")
-        else:
-            label_dx, label_dy, label_anchor = (0, -30 if index % 2 == 0 else 28, "middle")
+    if closure and valid_rows:
+        boundary_point = xy(float(closure["estimated_vcc_v"]), 0.0)
+        first_point = curve_points[0]
+        if boundary_point[0] < first_point[0]:
+            parts.append(
+                f'<path data-extrapolated-to-zero="true" d="M{boundary_point[0]:.1f} {boundary_point[1]:.1f} '
+                f'L{first_point[0]:.1f} {first_point[1]:.1f}" fill="none" '
+                'stroke="#007AFF" stroke-width="4" stroke-dasharray="8 6" '
+                'stroke-linecap="round"/>')
+    point_labels = [(x, y, f'{row["rsnm_mv"]:.1f} mV')
+                    for row, (x, y) in zip(valid_rows, curve_points)]
+    label_positions = _place_chart_labels(
+        point_labels, curve_points,
+        (left + 4, top + 8, left + plot_w - 4, baseline_y - 6), 16.0)
+    for row, (x, y), (label_x, label_y, label_anchor) in zip(
+            valid_rows, curve_points, label_positions):
         parts += [f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#FFFFFF" stroke="#007AFF" stroke-width="3"/>',
-                  f'<text x="{x+label_dx:.1f}" y="{y+label_dy:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" '
+                  f'<path d="M{x:.1f} {y:.1f}L{label_x:.1f} {label_y - 7:.1f}" stroke="#AAB4BE" stroke-width="1"/>',
+                  f'<text x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" '
                   f'font-size="16" font-weight="700" style="paint-order:stroke;stroke:#FFFFFF;stroke-width:6;stroke-linejoin:round">{row["rsnm_mv"]:.1f} mV</text>']
     for row in rows:
         if row["valid_eye"]:
@@ -3204,9 +3254,16 @@ def rsnm_vcc_curve_svg(analysis: dict, width: int = 1280, height: int = 780) -> 
         parts.append(f'<path d="M{x-5:.1f} {y-5:.1f} L{x+5:.1f} {y+5:.1f} M{x+5:.1f} {y-5:.1f} L{x-5:.1f} {y+5:.1f}" stroke="#8E8E93" stroke-width="2"/>')
     if closure:
         boundary_x, boundary_y = xy(closure["estimated_vcc_v"], 0.0)
+        closure_text = f'Estimated eye-closure VDD {closure["estimated_vcc_v"]:.4f} V'
+        closure_width = len(closure_text) * 8.7 + 16
+        closure_anchor = "end" if boundary_x > left + plot_w * .70 else "start"
+        closure_label_x = boundary_x - 12 if closure_anchor == "end" else boundary_x + 12
+        closure_left = (closure_label_x - closure_width
+                        if closure_anchor == "end" else closure_label_x)
         parts += [f'<path d="M{boundary_x:.1f} {top} V{top+plot_h}" stroke="#FF9500" stroke-width="3" stroke-dasharray="8 6"/>',
                   f'<circle cx="{boundary_x:.1f}" cy="{boundary_y:.1f}" r="7" fill="#FFFFFF" stroke="#FF9500" stroke-width="3"/>',
-                  f'<text x="{boundary_x+12:.1f}" y="{top+28}" fill="#C56A00" font-size="16" font-weight="700">Estimated eye-closure VDD {closure["estimated_vcc_v"]:.4f} V</text>']
+                  f'<rect x="{closure_left - 6:.1f}" y="{top + 8}" width="{closure_width + 12:.1f}" height="28" rx="6" fill="#FFF4DE" stroke="#F1D399"/>',
+                  f'<text x="{closure_label_x:.1f}" y="{top+28}" text-anchor="{closure_anchor}" fill="#C56A00" font-size="16" font-weight="700">{closure_text}</text>']
     else:
         parts.append(f'<text x="{left+plot_w-8}" y="{top+28}" text-anchor="end" fill="#C56A00" font-size="16" font-weight="700">Eye-closure VDD not bracketed by the entered rows</text>')
     parts += [
@@ -3418,8 +3475,8 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
                                        "BL Write Trip Margin within one Model VDD; residual WSNM "
                                        "is reported separately as a write-eye diagnostic. "
                                        "preferred region is at least 90% of the highest score. "
-                                       "X=beta_PU/beta_PG=1/PR (left is easier write); "
-                                       "Y=beta_PD/beta_PG=CR (up is stronger read).")})
+                                       "X=β_PU/β_PG=1/PR (left is easier write); "
+                                       "Y=β_PD/β_PG=CR (up is stronger read).")})
     return shmoos
 
 
@@ -3614,7 +3671,6 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
         f'<text x="{left}" y="48" fill="#111111" font-size="34" font-weight="700">Model VDD {shmoo["vdd_v"]:.3f} V - Read / Write Drive-Balance Shmoo</text>',
         f'<text x="{left}" y="76" fill="#626B73" font-size="15">Relative ranking within this VDD only | {len(samples)} measured cells | not silicon Pass/Fail</text>',
-        '<defs><marker id="shmoo-arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1677D2"/></marker></defs>',
         f'<rect x="{left}" y="{top}" width="{plot_w}" height="{plot_h}" fill="#FAFAFA" stroke="#AEB7C0"/>',
     ]
 
@@ -3667,37 +3723,42 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
             f'<text x="{left - 12}" y="{gy + 5:.1f}" text-anchor="end" fill="#4F5962" font-size="13">{yv:.3f}</text>',
         ]
 
-    for item in samples:
-        x, y = xy(float(item[x_key]), float(item[y_key]))
+    sample_positions = [xy(float(item[x_key]), float(item[y_key])) for item in samples]
+    for item, (x, y) in zip(samples, sample_positions):
         score = float(item["balanced_score"])
         parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5.5" fill="#26323D" stroke="#FFFFFF" stroke-width="1.2"><title>{html.escape(str(item["lot_wafer"]))} / {html.escape(str(item["chip_id"]))}; score={score:.3f}; CR={float(item["cell_ratio_beta"]):.3f}; 1/PR={float(item["write_contention"]):.3f}</title></circle>')
-        if item["best_region"]:
-            parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="10" fill="none" stroke="#61308C" stroke-width="2.5"/>')
 
     target = shmoo["target"]
     tx, ty = xy(float(target[x_key]), float(target[y_key]))
-    parts += [
-        f'<path d="M{tx - 11:.1f} {ty}H{tx + 11:.1f}M{tx} {ty - 11:.1f}V{ty + 11:.1f}" stroke="#61308C" stroke-width="4"/>',
-        f'<text x="{tx + 14:.1f}" y="{ty - 14:.1f}" fill="#61308C" font-size="14" font-weight="700">Preferred center</text>',
-    ]
     weak = shmoo["weakest"]
     wx, wy = xy(float(weak[x_key]), float(weak[y_key]))
-    weak_on_right = wx > left + plot_w * .62
-    weak_label_x = wx - 16 if weak_on_right else wx + 16
-    weak_anchor = "end" if weak_on_right else "start"
+    preferred_text = "Preferred center"
+    weak_text = f'Weakest: {html.escape(str(weak["chip_id"]))}'
+    label_positions = _place_chart_labels(
+        [(tx, ty, preferred_text), (wx, wy, weak_text)], sample_positions,
+        (left + 8, top + 8, left + plot_w - 8, top + plot_h - 8), 14.0)
+    (preferred_x, preferred_y, preferred_anchor), (weak_x, weak_y, weak_anchor) = label_positions
+
+    def label_left(x: float, anchor: str, text: str) -> float:
+        label_width = max(42.0, len(text) * 14.0 * .56)
+        return x - label_width / 2 if anchor == "middle" else (x - label_width if anchor == "end" else x)
+
+    preferred_left = label_left(preferred_x, preferred_anchor, preferred_text)
+    preferred_width = max(42.0, len(preferred_text) * 14.0 * .56)
+    weak_left = label_left(weak_x, weak_anchor, weak_text)
+    weak_width = max(42.0, len(weak_text) * 14.0 * .56)
     parts += [
+        f'<path d="M{tx - 11:.1f} {ty}H{tx + 11:.1f}M{tx} {ty - 11:.1f}V{ty + 11:.1f}" stroke="#61308C" stroke-width="4"/>',
+        f'<rect x="{preferred_left - 6:.1f}" y="{preferred_y - 18:.1f}" width="{preferred_width + 12:.1f}" height="24" rx="6" fill="#F5EFFA" stroke="#D8C8E6"/>',
+        f'<text x="{preferred_x:.1f}" y="{preferred_y:.1f}" text-anchor="{preferred_anchor}" fill="#61308C" font-size="14" font-weight="700">{preferred_text}</text>',
         f'<rect x="{wx - 7:.1f}" y="{wy - 7:.1f}" width="14" height="14" fill="#E4513B" stroke="#FFFFFF" stroke-width="2"/>',
-        f'<path d="M{wx:.1f} {wy:.1f}L{weak_label_x:.1f} {wy + 28:.1f}" stroke="#B2382B" stroke-width="1.5"/>',
-        f'<text x="{weak_label_x:.1f}" y="{wy + 45:.1f}" text-anchor="{weak_anchor}" fill="#B2382B" font-size="14" font-weight="700">Weakest: {html.escape(str(weak["chip_id"]))}</text>',
+        f'<rect x="{weak_left - 6:.1f}" y="{weak_y - 18:.1f}" width="{weak_width + 12:.1f}" height="24" rx="6" fill="#FFF1EF" stroke="#F0C1B9"/>',
+        f'<text x="{weak_x:.1f}" y="{weak_y:.1f}" text-anchor="{weak_anchor}" fill="#B2382B" font-size="14" font-weight="700">{weak_text}</text>',
     ]
 
-    arrow_start_x, arrow_start_y = left + 285, top + 148
-    arrow_end_x, arrow_end_y = left + 115, top + 47
     parts += [
-        f'<path d="M{arrow_start_x} {arrow_start_y}L{arrow_end_x} {arrow_end_y}" stroke="#1677D2" stroke-width="4" marker-end="url(#shmoo-arrow)"/>',
-        f'<text x="{arrow_start_x + 10}" y="{arrow_start_y + 5}" fill="#1677D2" font-size="16" font-weight="700">Preferred drive direction</text>',
-        f'<text x="{left + plot_w / 2}" y="{height - 28}" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Write contention  beta_PU / beta_PG = 1/PR  (left = easier write)</text>',
-        f'<text x="34" y="{top + plot_h / 2}" transform="rotate(-90 34 {top + plot_h / 2})" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Read cell ratio  beta_PD / beta_PG = CR  (up = stronger read)</text>',
+        f'<text x="{left + plot_w / 2}" y="{height - 28}" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Write contention  β_PU / β_PG = 1/PR  (left = easier write)</text>',
+        f'<text x="34" y="{top + plot_h / 2}" transform="rotate(-90 34 {top + plot_h / 2})" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Read cell ratio  β_PD / β_PG = CR  (up = stronger read)</text>',
     ]
 
     # Reading guide on the right keeps formulas and status semantics outside
@@ -3712,22 +3773,22 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
         f'<rect x="{side_x}" y="382" width="280" height="126" rx="16" fill="#F5EFFA" stroke="#D8C8E6"/>',
         f'<text x="{side_x + 22}" y="424" fill="#61308C" font-size="17" font-weight="700">Preferred threshold</text>',
         f'<text x="{side_x + 22}" y="466" fill="#61308C" font-size="16">Score &gt;= 90% of best = {cutoff:.3f}</text>',
-        f'<text x="{side_x}" y="550" fill="#20262D" font-size="17" font-weight="700">BACKGROUND RULE</text>',
+        f'<text x="{side_x}" y="550" fill="#20262D" font-size="17" font-weight="700">COLOR SCALE</text>',
         f'<text x="{side_x}" y="583" fill="#535D66" font-size="15">Each region inherits the score</text>',
         f'<text x="{side_x}" y="608" fill="#535D66" font-size="15">of the nearest measured cell.</text>',
-        f'<text x="{side_x}" y="633" fill="#535D66" font-size="15">Green means relative preferred,</text>',
+        f'<text x="{side_x}" y="633" fill="#535D66" font-size="15">Ranking is relative within this VDD,</text>',
         f'<text x="{side_x}" y="658" fill="#535D66" font-size="15">not guaranteed silicon pass.</text>',
     ]
-    legend_y = 704
+    legend_y = 690
     parts += [
-        f'<circle cx="{side_x + 10}" cy="{legend_y}" r="6" fill="#26323D"/><text x="{side_x + 34}" y="{legend_y + 5}" fill="#20262D" font-size="14">Measured cell</text>',
-        f'<circle cx="{side_x + 10}" cy="{legend_y + 36}" r="9" fill="none" stroke="#61308C" stroke-width="2.5"/><text x="{side_x + 34}" y="{legend_y + 41}" fill="#20262D" font-size="14">Preferred sample</text>',
-        f'<path d="M{side_x + 1} {legend_y + 72}H{side_x + 19}M{side_x + 10} {legend_y + 63}V{legend_y + 81}" stroke="#61308C" stroke-width="4"/><text x="{side_x + 34}" y="{legend_y + 77}" fill="#20262D" font-size="14">Preferred center</text>',
-        f'<rect x="{side_x + 3}" y="{legend_y + 101}" width="14" height="14" fill="#E4513B"/><text x="{side_x + 34}" y="{legend_y + 113}" fill="#20262D" font-size="14">Weakest sample</text>',
-        f'<path d="M{side_x} {legend_y + 146}H{side_x + 22}" stroke="#61308C" stroke-width="2.5" stroke-dasharray="7 5"/><text x="{side_x + 34}" y="{legend_y + 151}" fill="#20262D" font-size="14">90% relative boundary</text>',
+        f'<rect x="{side_x + 2}" y="{legend_y - 10}" width="17" height="17" fill="#DDF3E2"/><text x="{side_x + 34}" y="{legend_y + 4}" fill="#20262D" font-size="14">Best region (≥90%)</text>',
+        f'<rect x="{side_x + 2}" y="{legend_y + 17}" width="17" height="17" fill="#FFF0C2"/><text x="{side_x + 34}" y="{legend_y + 31}" fill="#20262D" font-size="14">Next region (72–90%)</text>',
+        f'<rect x="{side_x + 2}" y="{legend_y + 44}" width="17" height="17" fill="#F7C9C2"/><text x="{side_x + 34}" y="{legend_y + 58}" fill="#20262D" font-size="14">Lowest region (&lt;72%)</text>',
+        f'<circle cx="{side_x + 10}" cy="{legend_y + 85}" r="6" fill="#26323D"/><text x="{side_x + 34}" y="{legend_y + 90}" fill="#20262D" font-size="14">Measured cell</text>',
+        f'<path d="M{side_x + 1} {legend_y + 112}H{side_x + 19}M{side_x + 10} {legend_y + 103}V{legend_y + 121}" stroke="#61308C" stroke-width="4"/><text x="{side_x + 34}" y="{legend_y + 117}" fill="#20262D" font-size="14">Preferred center</text>',
+        f'<rect x="{side_x + 3}" y="{legend_y + 132}" width="14" height="14" fill="#E4513B"/><text x="{side_x + 34}" y="{legend_y + 144}" fill="#20262D" font-size="14">Weakest sample</text>',
+        f'<path d="M{side_x} {legend_y + 171}H{side_x + 22}" stroke="#61308C" stroke-width="2.5" stroke-dasharray="7 5"/><text x="{side_x + 34}" y="{legend_y + 176}" fill="#20262D" font-size="14">90% relative boundary</text>',
     ]
-    if shmoo.get("has_family_wat"):
-        parts.append(f'<text x="{side_x}" y="{height - 18}" fill="#7A838B" font-size="12">PU / PG / PD tuning deltas remain available in the CSV export.</text>')
     parts.append('</svg>')
     return "".join(parts)
 
@@ -3757,12 +3818,21 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
                   f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="14">{value:.0f}</text>']
     points = [xy(row["vdd_v"], row["margin_mv"]) for row in rows]
     parts.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x,y in points)}" fill="none" stroke="{color}" stroke-width="4" stroke-linejoin="round"/>')
-    for index, (row, (x, y)) in enumerate(zip(rows, points)):
-        anchor = "middle"; dy = -18 if index % 2 == 0 else 30
+    positive_label_items = [(x, y, f'{row["margin_mv"]:.1f} mV')
+                            for row, (x, y) in zip(rows, points)
+                            if row["margin_mv"] > 0]
+    positive_label_positions = iter(_place_chart_labels(
+        positive_label_items, points,
+        (left + 4, top + 8, left + plot_w - 4, baseline_y - 6), 16.0))
+    for row, (x, y) in zip(rows, points):
         parts += [f'<path d="M{x:.1f} {y+6:.1f} V{baseline_y+35:.1f}" stroke="#B9D7FF" stroke-dasharray="4 5"/>',
                   f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="#FFFFFF" stroke="{color}" stroke-width="3"/>']
         if row["margin_mv"] > 0:
-            parts.append(f'<text x="{x:.1f}" y="{y+dy:.1f}" text-anchor="{anchor}" fill="#1D1D1F" font-size="16" font-weight="700" style="paint-order:stroke;stroke:#FFFFFF;stroke-width:6">{row["margin_mv"]:.1f} mV</text>')
+            label_x, label_y, label_anchor = next(positive_label_positions)
+            parts += [
+                f'<path d="M{x:.1f} {y:.1f}L{label_x:.1f} {label_y - 7:.1f}" stroke="#AAB4BE" stroke-width="1"/>',
+                f'<text x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{label_anchor}" fill="#1D1D1F" font-size="16" font-weight="700" style="paint-order:stroke;stroke:#FFFFFF;stroke-width:6">{row["margin_mv"]:.1f} mV</text>',
+            ]
         parts.append(f'<text x="{x:.1f}" y="{baseline_y+55:.1f}" text-anchor="middle" fill="#0062CC" font-size="14" font-weight="700">{row["vdd_v"]:.2f} V</text>')
     if curve["key"] == "rsnm_mv" and len(rows) >= 2:
         left_row, right_row = max(
@@ -3771,18 +3841,38 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
                                  (pair[1]["vdd_v"] - pair[0]["vdd_v"])) )
         marker_row = right_row
         marker_x, marker_y = xy(marker_row["vdd_v"], marker_row["margin_mv"])
+        slope_text = f'Largest RSNM slope  {marker_row["vdd_v"]:.2f} V'
+        slope_width = len(slope_text) * 7.8 + 16
+        slope_anchor = "end" if marker_x > left + plot_w * .72 else "start"
+        slope_label_x = marker_x - 8 if slope_anchor == "end" else marker_x + 8
+        slope_left = slope_label_x - slope_width if slope_anchor == "end" else slope_label_x
         parts += [f'<path d="M{marker_x:.1f} {top} V{baseline_y}" stroke="#FF385C" stroke-width="2" stroke-dasharray="5 5"/>',
-                  f'<text x="{marker_x+8:.1f}" y="{top+76}" fill="#C13515" font-size="14" font-weight="700">Largest RSNM slope</text>',
-                  f'<text x="{marker_x+8:.1f}" y="{top+96}" fill="#C13515" font-size="14">{marker_row["vdd_v"]:.2f} V</text>']
+                  f'<rect x="{slope_left - 5:.1f}" y="{top + 64}" width="{slope_width + 10:.1f}" height="27" rx="6" fill="#FFF1EF" stroke="#F0C1B9"/>',
+                  f'<text x="{slope_label_x:.1f}" y="{top+83}" text-anchor="{slope_anchor}" fill="#C13515" font-size="14" font-weight="700">{slope_text}</text>']
     closure = curve.get("eye_closure")
     if closure:
-        x, _ = xy(float(closure["estimated_vdd_v"]), 0)
+        x, closure_y = xy(float(closure["estimated_vdd_v"]), 0)
         estimate_kind = "Extrapolated" if closure.get("extrapolated") else "Estimated"
         dash = "4 5" if closure.get("extrapolated") else "8 6"
+        closure_text = f'{estimate_kind} eye-closure VDD {closure["estimated_vdd_v"]:.4f} V'
+        closure_width = len(closure_text) * 8.7 + 16
+        closure_anchor = "end" if x > left + plot_w * .70 else "start"
+        closure_label_x = x - 12 if closure_anchor == "end" else x + 12
+        closure_left = closure_label_x - closure_width if closure_anchor == "end" else closure_label_x
         parts += [f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#FF9500" stroke-width="3" stroke-dasharray="{dash}"/>',
-                  f'<text x="{x+12:.1f}" y="{top+28}" fill="#C56A00" font-size="16" font-weight="700">{estimate_kind} eye-closure VDD {closure["estimated_vdd_v"]:.4f} V</text>']
+                  f'<rect x="{closure_left - 6:.1f}" y="{top + 8}" width="{closure_width + 12:.1f}" height="28" rx="6" fill="#FFF4DE" stroke="#F1D399"/>',
+                  f'<text x="{closure_label_x:.1f}" y="{top+28}" text-anchor="{closure_anchor}" fill="#C56A00" font-size="16" font-weight="700">{closure_text}</text>']
         if closure.get("extrapolated"):
-            parts.append(f'<text x="{x+12:.1f}" y="{top+52}" fill="#C56A00" font-size="14">Two-lowest-VDD slope: {closure["slope_mv_per_v"]:.2f} mV/V</text>')
+            first_x, first_y = points[0]
+            slope_note = f'Two-lowest-VDD slope: {closure["slope_mv_per_v"]:.2f} mV/V'
+            slope_note_width = len(slope_note) * 7.6 + 16
+            slope_note_left = (closure_label_x - slope_note_width
+                               if closure_anchor == "end" else closure_label_x)
+            parts += [
+                f'<path data-extrapolated-to-zero="true" d="M{x:.1f} {closure_y:.1f}L{first_x:.1f} {first_y:.1f}" fill="none" stroke="{color}" stroke-width="4" stroke-dasharray="8 6" stroke-linecap="round"/>',
+                f'<rect x="{slope_note_left - 6:.1f}" y="{top + 40}" width="{slope_note_width + 12:.1f}" height="25" rx="6" fill="#FFF4DE" stroke="#F1D399"/>',
+                f'<text x="{closure_label_x:.1f}" y="{top+58}" text-anchor="{closure_anchor}" fill="#C56A00" font-size="14">{slope_note}</text>',
+            ]
     else:
         parts.append(f'<text x="{left+plot_w-8}" y="{top+28}" text-anchor="end" fill="#C56A00" font-size="16" font-weight="700">Eye-closure VDD not bracketed by imported points</text>')
     parts += [f'<text x="{left+plot_w/2}" y="{baseline_y+112}" text-anchor="middle" fill="#1D1D1F" font-size="21" font-weight="700">Model VDD (V)</text>',
@@ -4094,6 +4184,15 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
             point_string = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
             dash = ' stroke-dasharray="10 7"' if curve["key"] == "wl_write_margin_mv" else ""
             parts.append(f'<polyline points="{point_string}" fill="none" stroke="{curve["color"]}" stroke-width="3.5"{dash}/>')
+            closure = curve.get("eye_closure")
+            if closure and closure.get("extrapolated") and points:
+                closure_x, closure_y = xy(float(closure["estimated_vdd_v"]), 0.0)
+                first_x, first_y = points[0]
+                curve_dash = "10 7" if curve["key"] == "wl_write_margin_mv" else "8 6"
+                parts.append(
+                    f'<path data-extrapolated-to-zero="true" d="M{closure_x:.1f} {closure_y:.1f}L{first_x:.1f} {first_y:.1f}" '
+                    f'fill="none" stroke="{curve["color"]}" stroke-width="3.5" '
+                    f'stroke-dasharray="{curve_dash}" stroke-linecap="round"/>')
             for _row, (x, y) in zip(curve["rows"], points):
                 if curve["key"] == "wl_write_margin_mv":
                     parts.append(f'<polygon points="{x:.1f},{y-5:.1f} {x+5:.1f},{y:.1f} {x:.1f},{y+5:.1f} {x-5:.1f},{y:.1f}" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
