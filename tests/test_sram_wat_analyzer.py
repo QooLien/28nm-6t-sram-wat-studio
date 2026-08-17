@@ -10,7 +10,7 @@ from sram_wat_analyzer import (
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg,
-    analyze_bl_wl_write_assist_sensitivity, analyze_write_trip_margin_curve,
+    analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     educational_sram_metrics,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
@@ -18,7 +18,6 @@ from sram_wat_analyzer import (
     save_gui_state,
     validate_config, wat_electrical_snm_rows, write_mismatch_boundary_outputs,
     write_iv_curve_excel_template, write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
-    write_assist_sensitivity_svg, write_bl_wl_write_assist_outputs,
     write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
 
@@ -572,7 +571,7 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn(">-44.00</text>",
                           (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
 
-    def test_multi_cell_summary_builds_four_estimate_vmin_curves(self):
+    def test_multi_cell_summary_builds_three_estimate_vmin_curves(self):
         with tempfile.TemporaryDirectory() as td:
             fields = ["lot_wafer", "chip_id", "model_vdd_v", "rsnm_mv", "wsnm_mv", "write_margin_mv"]
             paths = []
@@ -586,10 +585,9 @@ class AnalyzerTests(unittest.TestCase):
                                      "rsnm_mv": rsnm, "wsnm_mv": wsnm, "write_margin_mv": write_margin})
                 paths.append(path)
             result = analyze_estimate_vmin_curves(read_multi_chip_snm_summary(paths))
-            self.assertEqual(set(result["curves"]), {"rsnm_mv", "wsnm_mv", "write_margin_mv", "wl_write_margin_mv"})
+            self.assertEqual(set(result["curves"]), {"rsnm_mv", "wsnm_mv", "write_margin_mv"})
             self.assertEqual(result["curves"]["rsnm_mv"]["rows"][0]["chip_id"], "C02")
             self.assertAlmostEqual(result["curves"]["write_margin_mv"]["eye_closure"]["estimated_vdd_v"], .40)
-            self.assertAlmostEqual(result["curves"]["wl_write_margin_mv"]["eye_closure"]["estimated_vdd_v"], .40)
 
     def test_estimate_vmin_summary_rejects_excel_with_clear_message(self):
         with tempfile.TemporaryDirectory() as td:
@@ -613,12 +611,10 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("0.50 V", svg)
         stacked = estimate_vmin_stacked_svg(result)
         self.assertIn("Estimate Vmin Curves - Comparison View", stacked)
-        self.assertIn("BL Write Margin / WL Write Margin", stacked)
+        self.assertIn("BL Write Margin", stacked)
+        self.assertNotIn("WL Write Margin", stacked)
         self.assertIn("SNM (mV)", stacked)
         self.assertIn("Vtrip (mV)", stacked)
-        self.assertIn('stroke-dasharray="10 7"', stacked)
-        self.assertIn("overlap 3/3 VDD point(s)", stacked)
-        self.assertIn("Delta +0.0 mV overlap", stacked)
         transparent = estimate_vmin_stacked_svg(result, transparent_background=True)
         self.assertNotIn('<rect width="100%" height="100%" fill="#FFFFFF"/>', transparent)
 
@@ -663,14 +659,14 @@ class AnalyzerTests(unittest.TestCase):
                 samples.append({
                     "lot_wafer": "W01", "chip_id": f"C{index:02d}",
                     "rsnm_mv": 80*scale, "wsnm_mv": 65*scale,
-                    "write_margin_mv": 55*scale, "wl_write_margin_mv": 50*scale,
+                    "write_margin_mv": 55*scale,
                     "cell_ratio_beta": 1.2+index*.1, "pull_up_ratio_beta": 1.5+index*.1,
                     "pu_vt_v": .38, "pu_idsat_ua": 44*scale,
                     "pg_vt_v": .36, "pg_idsat_ua": 82*scale,
                     "pd_vt_v": .35, "pd_idsat_ua": 124*scale,
                 })
             row = {"vdd_v": vdd, "sample_count": 2, "samples": samples}
-            for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv", "wl_write_margin_mv"):
+            for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
                 row[key] = min(item[key] for item in samples)
                 row[f"{key}_chip_id"] = "C01"; row[f"{key}_lot_wafer"] = "W01"
             rows.append(row)
@@ -702,6 +698,7 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("#F7C9C2", svg)
         self.assertIn('class="measured-cell"', svg)
         self.assertIn('data-cell-tooltip=', svg)
+        self.assertIn('class="special-cell-highlights" pointer-events="none"', svg)
         self.assertIn("Cell: C01 (1/2)", svg)
         self.assertIn("RSNM: 60.0 mV", svg)
         self.assertIn("BL Write Vtrip: 41.2 mV", svg)
@@ -719,7 +716,7 @@ class AnalyzerTests(unittest.TestCase):
              "cell_ratio_beta": 1.4, "pull_up_ratio_beta": 1.6},
         ]
         row = {"vdd_v": .8, "sample_count": 2, "samples": samples}
-        for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv", "wl_write_margin_mv"):
+        for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
             row[key] = min(float(item.get(key, item["write_margin_mv"])) for item in samples)
             row[f"{key}_chip_id"] = "GOOD"
             row[f"{key}_lot_wafer"] = "W01"
@@ -807,26 +804,6 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((report.parent / "write_trip_margin_curve.csv").exists())
             self.assertTrue((report.parent / "images" /
                              "01_write_trip_margin_vs_model_vdd.png").exists())
-
-    def test_bl_wl_write_assist_sensitivity_uses_same_six_mos_cell(self):
-        mos = {
-            "pu1": MosWat(.385, 44.0), "pu2": MosWat(.385, 44.0),
-            "pg1": MosWat(.365, 82.0), "pg2": MosWat(.365, 82.0),
-            "pd1": MosWat(.355, 124.0), "pd2": MosWat(.355, 124.0),
-        }
-        analysis = analyze_bl_wl_write_assist_sensitivity(
-            SixTWatCell("ASSIST", **mos), self.cfg, .90, fit_points=201)
-        self.assertEqual(analysis["bl"]["wordline_v"], .90)
-        self.assertEqual(analysis["wl"]["low_bitline_v"], 0.0)
-        self.assertIsNotNone(analysis["bl_write_tolerance"])
-        self.assertIsNotNone(analysis["wl_drive_tolerance"])
-        self.assertIn("PGL", analysis["caveat"])
-        self.assertIn("BL / WL Write Assist Sensitivity", write_assist_sensitivity_svg(analysis))
-        with tempfile.TemporaryDirectory() as td:
-            report = write_bl_wl_write_assist_outputs(analysis, Path(td) / "assist")
-            self.assertTrue(report.exists())
-            self.assertTrue((report.parent / "bl_wl_write_assist_sensitivity.csv").exists())
-
 
 if __name__ == "__main__":
     unittest.main()

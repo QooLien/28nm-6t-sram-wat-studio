@@ -1228,131 +1228,6 @@ def write_snm_vs_bitline(vdd: float,
     }
 
 
-def write_snm_vs_wordline(vdd: float,
-                          butterfly_at_wl: Callable[[float, int], dict],
-                          sweep_points: int = 37,
-                          fit_points: int = 401) -> dict:
-    """Find the minimum low-side WL drive that still closes the write eye.
-
-    This is deliberately a split-WL *sensitivity* experiment: BL=0 V and
-    BLB=VDD are fixed while only PGL's gate is swept.  It is not a normal
-    single-wordline 6T operating mode.  A lower WL trip means more tolerance
-    to reduced access drive.
-    """
-    if not math.isfinite(vdd) or vdd <= 0:
-        raise ValueError("VDD must be a positive finite value")
-    sweep_points = max(9, int(sweep_points))
-    fit_points = max(101, int(fit_points))
-    cache: dict[float, dict] = {}
-
-    def solve(wordline_v: float) -> dict:
-        key = round(min(vdd, max(0.0, wordline_v)), 12)
-        if key not in cache:
-            cache[key] = butterfly_at_wl(key, fit_points)
-        return cache[key]
-
-    def write_enabled(result: dict) -> bool:
-        # A closed write eye means that the original stored state has lost its
-        # static stability and the low BL can force the intended write state.
-        return not bool(result.get("snm_v", 0.0) > max(1e-9, vdd / fit_points / 2.0))
-
-    rows = []
-    for index in range(sweep_points):
-        wl = vdd * index / (sweep_points - 1)
-        fitted = solve(wl)
-        rows.append({
-            "wordline_v": wl,
-            "cell_write_snm_mv": fitted.get("snm_mv", 0.0),
-            "upper_left_snm_mv": fitted.get("snm_upper_left_mv", 0.0),
-            "lower_right_snm_mv": fitted.get("snm_lower_right_mv", 0.0),
-            "write_enabled": write_enabled(fitted),
-        })
-
-    disabled_at_zero = not write_enabled(solve(0.0))
-    enabled_at_vdd = write_enabled(solve(vdd))
-    if disabled_at_zero and enabled_at_vdd:
-        low_wl, high_wl = 0.0, vdd
-        for _ in range(26):
-            mid = (low_wl + high_wl) / 2.0
-            if write_enabled(solve(mid)):
-                high_wl = mid
-            else:
-                low_wl = mid
-        trip = (low_wl + high_wl) / 2.0
-        status = "VALID"
-        reason = "Minimum split-WL drive bracketed between write-disabled and write-enabled states"
-    elif enabled_at_vdd:
-        trip = 0.0
-        status = "ALWAYS ENABLED"
-        reason = "Write eye is already closed at WL=0 V in this compact model"
-    else:
-        trip = None
-        status = "NO WRITE"
-        reason = "Write eye remains open even at WL=VDD"
-
-    return {
-        "method": "Split-WL sensitivity: sweep PGL gate from 0 V to VDD at BL=0 V and BLB=VDD",
-        "vdd_v": vdd,
-        "low_bitline_v": 0.0,
-        "high_bitline_v": vdd,
-        "status": status,
-        "reason": reason,
-        "write_trip_wl_v": trip,
-        "wl_drive_tolerance_v": (vdd - trip if trip is not None else None),
-        "points": rows,
-    }
-
-
-def analyze_bl_wl_write_assist_sensitivity(cell: SixTWatCell, cfg: Config,
-                                            vdd: float,
-                                            fit_points: int = 401) -> dict:
-    """Compare BL write tolerance with an assumed low-side split-WL assist.
-
-    Both measurements use the same six independent WAT devices.  BL sweep is
-    the conventional write-trip experiment (common WL=VDD). WL sweep drives
-    only PGL while PGR stays at VDD, therefore it reports a hypothetical
-    access-drive sensitivity rather than a production 6T write specification.
-    """
-    if not math.isfinite(vdd) or not 0 < vdd <= SNM_PLOT_AXIS_MAX_V:
-        raise ValueError(f"Model VDD must be > 0 and <= {SNM_PLOT_AXIS_MAX_V:.2f} V")
-    point_cfg = replace(cfg, nominal_vdd=vdd, wat_vdd=vdd, grid_points=max(201, int(fit_points)))
-    model = AsymmetricSram6T(cell, point_cfg)
-    bl = write_snm_vs_bitline(
-        vdd,
-        lambda bitline, points: model.write_butterfly(
-            vdd, bitline, vdd, points, wordline_low=vdd, wordline_high=vdd),
-        fit_points=fit_points)
-    wl = write_snm_vs_wordline(
-        vdd,
-        lambda wordline, points: model.write_butterfly(
-            vdd, 0.0, vdd, points, wordline_low=wordline, wordline_high=vdd),
-        fit_points=fit_points)
-    bl_trip = bl["write_trip_bl_v"]
-    wl_trip = wl["write_trip_wl_v"]
-    bl_tolerance = None if bl_trip is None else bl_trip / vdd
-    wl_tolerance = None if wl_trip is None else 1.0 - wl_trip / vdd
-    if bl_tolerance is None or wl_tolerance is None:
-        limiting = "Not comparable: one or both compact-model boundaries were not bracketed"
-    elif abs(bl_tolerance - wl_tolerance) < .02:
-        limiting = "Comparable normalized BL and WL tolerance"
-    elif bl_tolerance < wl_tolerance:
-        limiting = "BL is more limiting at this VDD (smaller normalized tolerance)"
-    else:
-        limiting = "PGL split-WL drive is more limiting at this VDD (smaller normalized tolerance)"
-    return {
-        "model": "BL conventional write-trip plus PGL-only split-WL sensitivity",
-        "lot_wafer": cell.corner,
-        "vdd_v": vdd,
-        "bl": bl,
-        "wl": wl,
-        "bl_write_tolerance": bl_tolerance,
-        "wl_drive_tolerance": wl_tolerance,
-        "limiting_control": limiting,
-        "caveat": ("BL result is conventional write-trip sensitivity. WL result assumes PGL has an independent "
-                   "wordline while PGR remains at VDD; use it only as a write-assist/mismatch sensitivity study."),
-    }
-
-
 def _vtc_diagonal_intersection(curve: list[tuple[float, float]]) -> tuple[float, float] | None:
     """Return the interpolated crossing of a monotonic VTC and Vout=Vin."""
     if len(curve) < 2:
@@ -2577,11 +2452,6 @@ def _multi_cell_metrics(cell: SixTWatCell, cfg: Config, vdd: float,
         "write": write,
         "wsnm_mv": write.get("snm_mv"),
         "write_margin_mv": write_margin_mv,
-        # In the current WAT compact model, BL trip and split-WL trip are
-        # complementary controls of the same PG overdrive.  The normalized WL
-        # tolerance is therefore the same numeric margin until independent
-        # driver/boost/parasitic data is supplied.
-        "wl_write_margin_mv": write_margin_mv,
         "cell_ratio_beta": min(item["cell_ratio_beta"] for item in side_ratios),
         "pull_up_ratio_beta": min(item["pull_up_ratio_beta"] for item in side_ratios),
     }
@@ -3324,27 +3194,7 @@ _ESTIMATE_VMIN_METRICS = (
     ("rsnm_mv", "RSNM", "Read SNM", "#007AFF"),
     ("wsnm_mv", "WSNM", "Write SNM", "#AF52DE"),
     ("write_margin_mv", "Write Margin", "BL Write Margin", "#34C759"),
-    ("wl_write_margin_mv", "WL Write Margin", "WL Write Margin", "#FF385C"),
 )
-
-_VTRIP_OVERLAP_TOLERANCE_MV = 0.1
-
-
-def _paired_vtrip_deltas(analysis: dict) -> list[dict[str, float | bool]]:
-    """Pair BL/WL write-trip results by VDD and calculate WL minus BL."""
-    bl_rows = {float(row["vdd_v"]): row
-               for row in analysis["curves"]["write_margin_mv"]["rows"]}
-    wl_rows = {float(row["vdd_v"]): row
-               for row in analysis["curves"]["wl_write_margin_mv"]["rows"]}
-    paired = []
-    for vdd in sorted(bl_rows.keys() & wl_rows.keys()):
-        bl_value = float(bl_rows[vdd]["margin_mv"])
-        wl_value = float(wl_rows[vdd]["margin_mv"])
-        delta = wl_value - bl_value
-        paired.append({"vdd_v": vdd, "bl_mv": bl_value, "wl_mv": wl_value,
-                       "delta_mv": delta,
-                       "overlap": abs(delta) <= _VTRIP_OVERLAP_TOLERANCE_MV})
-    return paired
 
 
 def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list[dict[str, object]]:
@@ -3785,6 +3635,7 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
     weak_left = label_left(weak_x, weak_anchor, weak_text)
     weak_width = max(42.0, len(weak_text) * 14.0 * .56)
     parts += [
+        '<g class="special-cell-highlights" pointer-events="none">',
         f'<path d="M{tx - 11:.1f} {ty}H{tx + 11:.1f}M{tx} {ty - 11:.1f}V{ty + 11:.1f}" stroke="#61308C" stroke-width="4"/>',
         f'<rect x="{preferred_left - 6:.1f}" y="{preferred_y - 18:.1f}" width="{preferred_width + 12:.1f}" height="24" rx="6" fill="#F5EFFA" stroke="#D8C8E6"/>',
         f'<text x="{preferred_left + preferred_width / 2:.1f}" y="{preferred_y:.1f}" text-anchor="middle" fill="#61308C" font-size="14" font-weight="700">{preferred_text}</text>',
@@ -3794,6 +3645,7 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
         f'<rect x="{wx - 7:.1f}" y="{wy - 7:.1f}" width="14" height="14" fill="#E4513B" stroke="#FFFFFF" stroke-width="2"/>',
         f'<rect x="{weak_left - 6:.1f}" y="{weak_y - 18:.1f}" width="{weak_width + 12:.1f}" height="24" rx="6" fill="#FFF1EF" stroke="#F0C1B9"/>',
         f'<text x="{weak_left + weak_width / 2:.1f}" y="{weak_y:.1f}" text-anchor="middle" fill="#B2382B" font-size="14" font-weight="700">{weak_text}</text>',
+        '</g>',
     ]
 
     parts += [
@@ -3964,7 +3816,7 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                     "pu_vt_v", "pu_idsat_ua", "delta_pu_vt_v", "delta_pu_idsat_ua",
                     "pg_vt_v", "pg_idsat_ua", "pd_vt_v", "pd_idsat_ua",
                     "delta_pg_vt_v", "delta_pg_idsat_ua", "delta_pd_vt_v", "delta_pd_idsat_ua",
-                    "rsnm_mv", "wsnm_mv", "write_margin_mv", "wl_write_margin_mv"]
+                    "rsnm_mv", "wsnm_mv", "write_margin_mv"]
     with (out / "estimate_vmin_cr_pr_shmoo.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=shmoo_fields); writer.writeheader()
         for index, shmoo in enumerate(analysis.get("ratio_shmoos", []), 1):
@@ -4010,17 +3862,22 @@ section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}
 img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}
 .interactive-shmoo circle.measured-cell{{cursor:help}}
 .note{{color:#6e6e73}}
-#cell-tooltip{{position:fixed;z-index:9999;display:none;width:390px;max-width:calc(100vw - 32px);padding:14px 16px;border-radius:12px;background:#1d1d1f;color:#fff;box-shadow:0 8px 30px rgba(0,0,0,.24);font-size:13px;line-height:1.35;pointer-events:none}}
-.tooltip-title{{font-size:16px;font-weight:700;margin-bottom:4px}}
-.tooltip-meta{{display:flex;flex-wrap:wrap;gap:4px 14px;color:#c8c8cc;margin-bottom:10px}}
-.tooltip-metrics{{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px}}
-.tooltip-metric{{padding:7px 8px;border-radius:7px;background:#303034}}
-.tooltip-metric-label{{display:block;color:#b8b8bd;font-size:11px;margin-bottom:2px}}
-.tooltip-metric-value{{display:block;color:#fff;font-weight:700}}
-.tooltip-section-label{{color:#c8c8cc;font-size:11px;font-weight:700;letter-spacing:.06em;margin:2px 0 6px}}
-.tooltip-device-grid{{display:grid;grid-template-columns:58px 1fr 1fr;gap:5px 8px;align-items:center;font-variant-numeric:tabular-nums}}
-.tooltip-device-grid .tooltip-head{{color:#aeb0b5;font-size:11px;border-bottom:1px solid #45454a;padding-bottom:4px}}
-.tooltip-device-name{{font-weight:700;color:#fff}}
+#cell-tooltip{{position:fixed;z-index:9999;display:none;width:390px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:hidden;padding:18px 20px;border-radius:14px;background:#1d1d1f;color:#fff;box-shadow:0 10px 34px rgba(0,0,0,.26);font-size:13px;line-height:1.45;pointer-events:none}}
+.tooltip-title{{font-size:17px;font-weight:700;margin-bottom:6px}}
+.tooltip-meta{{display:grid;grid-template-columns:1fr;gap:3px;color:#c8c8cc;margin-bottom:16px}}
+.tooltip-section-label{{color:#aeb0b5;font-size:11px;font-weight:700;letter-spacing:.07em;margin:0 0 7px;text-transform:uppercase}}
+.tooltip-metrics{{display:grid;grid-template-columns:1fr;gap:1px;margin-bottom:16px;border-radius:9px;overflow:hidden;background:#46464b}}
+.tooltip-metric{{display:flex;align-items:baseline;justify-content:space-between;gap:18px;padding:9px 11px;background:#303034}}
+.tooltip-metric-label{{color:#b8b8bd;font-size:12px}}
+.tooltip-metric-value{{color:#fff;font-weight:700;text-align:right;font-variant-numeric:tabular-nums}}
+.tooltip-device-list{{display:grid;grid-template-columns:1fr;gap:9px}}
+.tooltip-device-card{{display:grid;grid-template-columns:1fr;gap:5px;padding:10px 12px;border-left:3px solid #8e8e93;border-radius:9px;background:#303034;font-variant-numeric:tabular-nums}}
+.tooltip-device-card[data-family="PU"]{{border-left-color:#ff453a}}
+.tooltip-device-card[data-family="PG"]{{border-left-color:#30d158}}
+.tooltip-device-card[data-family="PD"]{{border-left-color:#0a84ff}}
+.tooltip-device-name{{font-size:14px;font-weight:700;color:#fff;padding-bottom:5px;margin-bottom:1px;border-bottom:1px solid #47474c}}
+.tooltip-device-value{{display:flex;justify-content:space-between;gap:16px;color:#fff}}
+.tooltip-device-label{{color:#aeb0b5}}
 </style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1>
 <p class="note">{html.escape(analysis["definition"])}</p>
 <p class="note">Drive-Balance scoring uses the minimum of normalized RSNM (read stability) and BL Write Trip Margin (write ability) at each Model VDD. Residual WSNM remains a separate write-eye diagnostic and is not scored as larger-is-better. X=βPU/βPG=1/PR (left improves write); Y=βPD/βPG=CR (up improves read). Green, yellow and red show relative performance bands within the imported cells.</p>
@@ -4043,36 +3900,50 @@ const renderCellTooltip=(raw)=>{{
   meta.className='tooltip-meta';
   (rows.slice(1,3)).forEach((text)=>meta.appendChild(makeTooltipNode('',text)));
   cellTooltip.appendChild(meta);
-  const metrics=document.createElement('div');
-  metrics.className='tooltip-metrics';
-  rows.slice(3,8).forEach((text)=>{{
-    const separator=text.lastIndexOf(':');
-    const metric=document.createElement('div');
-    metric.className='tooltip-metric';
-    metric.appendChild(makeTooltipNode('tooltip-metric-label',separator>=0?text.slice(0,separator):text));
-    metric.appendChild(makeTooltipNode('tooltip-metric-value',separator>=0?text.slice(separator+1).trim():'—'));
-    metrics.appendChild(metric);
-  }});
-  cellTooltip.appendChild(metrics);
+  const appendMetricSection=(title,values)=>{{
+    cellTooltip.appendChild(makeTooltipNode('tooltip-section-label',title));
+    const metrics=document.createElement('div');
+    metrics.className='tooltip-metrics';
+    values.forEach((text)=>{{
+      const separator=text.lastIndexOf(':');
+      const metric=document.createElement('div');
+      metric.className='tooltip-metric';
+      metric.appendChild(makeTooltipNode('tooltip-metric-label',separator>=0?text.slice(0,separator):text));
+      metric.appendChild(makeTooltipNode('tooltip-metric-value',separator>=0?text.slice(separator+1).trim():'—'));
+      metrics.appendChild(metric);
+    }});
+    cellTooltip.appendChild(metrics);
+  }};
+  appendMetricSection('Performance',rows.slice(3,6));
+  appendMetricSection('Drive ratios',rows.slice(6,8));
   const devices=rows.slice(8);
   if(devices.length){{
-    cellTooltip.appendChild(makeTooltipNode('tooltip-section-label','PU / PG / PD WAT'));
-    const grid=document.createElement('div');
-    grid.className='tooltip-device-grid';
-    ['Device','Vt','Idsat'].forEach((text)=>grid.appendChild(makeTooltipNode('tooltip-head',text)));
+    cellTooltip.appendChild(makeTooltipNode('tooltip-section-label','Device WAT · PU → PG → PD'));
+    const list=document.createElement('div');
+    list.className='tooltip-device-list';
     devices.forEach((text)=>{{
       const match=text.match(/^(PU|PG|PD): Vt ([^ ]+) V \\/ Idsat ([^ ]+) µA$/);
       if(match){{
-        grid.appendChild(makeTooltipNode('tooltip-device-name',match[1]));
-        grid.appendChild(makeTooltipNode('',match[2]+' V'));
-        grid.appendChild(makeTooltipNode('',match[3]+' µA'));
+        const card=document.createElement('div');
+        card.className='tooltip-device-card';
+        card.dataset.family=match[1];
+        card.appendChild(makeTooltipNode('tooltip-device-name',match[1]));
+        const vt=document.createElement('div');
+        vt.className='tooltip-device-value';
+        vt.appendChild(makeTooltipNode('tooltip-device-label','Vt'));
+        vt.appendChild(makeTooltipNode('',match[2]+' V'));
+        card.appendChild(vt);
+        const idsat=document.createElement('div');
+        idsat.className='tooltip-device-value';
+        idsat.appendChild(makeTooltipNode('tooltip-device-label','Idsat'));
+        idsat.appendChild(makeTooltipNode('',match[3]+' µA'));
+        card.appendChild(idsat);
+        list.appendChild(card);
       }}else{{
-        grid.appendChild(makeTooltipNode('tooltip-device-name',text));
-        grid.appendChild(makeTooltipNode('','—'));
-        grid.appendChild(makeTooltipNode('','—'));
+        list.appendChild(makeTooltipNode('tooltip-device-card',text));
       }}
     }});
-    cellTooltip.appendChild(grid);
+    cellTooltip.appendChild(list);
   }}
 }};
 const moveCellTooltip=(event)=>{{
@@ -4182,58 +4053,8 @@ def write_write_trip_margin_outputs(analysis: dict,
     return report
 
 
-def write_assist_sensitivity_svg(analysis: dict, width: int = 1280,
-                                 height: int = 610) -> str:
-    """Render BL and split-WL sensitivity on a shared normalized control axis."""
-    vdd = float(analysis["vdd_v"])
-    left, top, plot_w, plot_h = 105, 105, 1060, 350
-    baseline = top + plot_h
-    blue, purple, grid = "#FF385C", "#460479", "#DDDDDD"
-
-    def xy(x: float, y_mv: float) -> tuple[float, float]:
-        return left + x / vdd * plot_w, baseline - y_mv / max(vdd * 1000.0, 1.0) * plot_h
-
-    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" role="img" aria-label="BL and WL write assist sensitivity" style="font-family:Calibri,Arial,sans-serif">',
-             '<rect width="100%" height="100%" fill="white"/>',
-             '<text x="60" y="48" fill="#222222" font-size="28" font-weight="700">BL / WL Write Assist Sensitivity</text>',
-             f'<text x="60" y="76" fill="#6A6A6A" font-size="16">Model VDD = {vdd:.3f} V · WSNM closes when PG can force the intended write state</text>']
-    for index in range(6):
-        value = vdd * index / 5.0
-        x, y = xy(value, 0)
-        parts += [f'<path d="M{x:.1f} {top} V{baseline}" stroke="{grid}"/>',
-                  f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="{grid}"/>',
-                  f'<text x="{x:.1f}" y="{baseline+25}" text-anchor="middle" fill="#6A6A6A" font-size="14">{value:.2f}</text>',
-                  f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6A6A6A" font-size="14">{value*1000:.0f}</text>']
-    series = ((analysis["bl"]["points"], "write_bl_v", "BL sweep / common WL=VDD", blue),
-              (analysis["wl"]["points"], "wordline_v", "PGL-only split-WL sweep / BL=0", purple))
-    for rows, x_key, label, color in series:
-        points = " ".join(f'{xy(float(row[x_key]), float(row.get("cell_write_snm_mv") or 0.0))[0]:.1f},{xy(float(row[x_key]), float(row.get("cell_write_snm_mv") or 0.0))[1]:.1f}' for row in rows)
-        parts += [f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="4"/>']
-        lx = 90 if x_key == "write_bl_v" else 510
-        parts += [f'<path d="M{lx} 92 h34" stroke="{color}" stroke-width="4"/>',
-                  f'<text x="{lx+44}" y="98" fill="#3F3F3F" font-size="15">{label}</text>']
-    for boundary, key, color, prefix in ((analysis["bl"], "write_trip_bl_v", blue, "BL trip"),
-                                         (analysis["wl"], "write_trip_wl_v", purple, "PGL WL trip")):
-        trip = boundary.get(key)
-        if trip is not None:
-            x, _ = xy(float(trip), 0)
-            parts += [f'<path d="M{x:.1f} {top} V{baseline}" stroke="{color}" stroke-width="3" stroke-dasharray="7 6"/>',
-                      f'<text x="{x+8:.1f}" y="{top+22}" fill="{color}" font-size="15" font-weight="700">{prefix} {float(trip):.3f} V</text>']
-    bl_pct = analysis.get("bl_write_tolerance")
-    wl_pct = analysis.get("wl_drive_tolerance")
-    summary = (f'BL tolerance = {bl_pct*100:.1f}% VDD' if bl_pct is not None else 'BL tolerance: not bracketed')
-    summary += '   ·   '
-    summary += (f'PGL WL tolerance = {wl_pct*100:.1f}% VDD' if wl_pct is not None else 'PGL WL tolerance: not bracketed')
-    parts += [f'<text x="{width/2}" y="{height-72}" text-anchor="middle" fill="#222222" font-size="19" font-weight="700">{html.escape(summary)}</text>',
-              f'<text x="{width/2}" y="{height-42}" text-anchor="middle" fill="#6A6A6A" font-size="15">{html.escape(str(analysis["limiting_control"]))}</text>',
-              f'<text x="{width/2}" y="{height-17}" text-anchor="middle" fill="#6A6A6A" font-size="13">Split-WL is a sensitivity assumption, not standard single-WL 6T operation.</text>',
-              f'<text x="{left+plot_w/2}" y="{baseline+56}" text-anchor="middle" fill="#222222" font-size="18">Swept control voltage (V)</text>',
-              f'<text x="32" y="{top+plot_h/2}" transform="rotate(-90 32 {top+plot_h/2})" text-anchor="middle" fill="#222222" font-size="18">Write SNM / closing-eye proxy (mV)</text>', '</svg>']
-    return "".join(parts)
-
-
 def _legacy_estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 1120) -> str:
-    """Four aligned VDD trend panels, each retaining its own mV scale."""
+    """Aligned VDD trend panels, each retaining its own mV scale."""
     left, right, top, bottom = 125, 65, 92, 58
     panel_gap = 22
     panel_h = (height - top - bottom - panel_gap * (len(_ESTIMATE_VMIN_METRICS) - 1)) / len(_ESTIMATE_VMIN_METRICS)
@@ -4270,11 +4091,10 @@ def _legacy_estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height:
 
 def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 920,
                               transparent_background: bool = False) -> str:
-    """Render paired comparison panels for SNM and the two write margins."""
+    """Render paired comparison panels for SNM and BL write margin."""
     groups = (
         ("Read / Write SNM", ("rsnm_mv", "wsnm_mv"), "SNM (mV)"),
-        ("BL Write Margin / WL Write Margin",
-         ("write_margin_mv", "wl_write_margin_mv"), "Vtrip (mV)"),
+        ("BL Write Margin", ("write_margin_mv",), "Vtrip (mV)"),
     )
     # Reserve independent bands for the report header, each panel header,
     # axis tick labels and the next panel.  This prevents the lower title and
@@ -4289,7 +4109,7 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
         parts.append('<rect width="100%" height="100%" fill="#FFFFFF"/>')
     parts += [
         '<text x="56" y="52" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
-        '<text x="56" y="78" fill="#6E6E73" font-size="16">Top: Read / Write SNM. Bottom: BL and WL write-trip margins. X-axis is Model VDD (V).</text>',
+        '<text x="56" y="78" fill="#6E6E73" font-size="16">Top: Read / Write SNM. Bottom: BL write-trip margin. X-axis is Model VDD (V).</text>',
     ]
     for index, (group_label, keys, y_axis_label) in enumerate(groups):
         panel_top = top + index * (panel_h + gap)
@@ -4306,14 +4126,9 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
         parts.append(f'<text x="{left}" y="{header_y:.1f}" fill="#1D1D1F" font-size="21" font-weight="700">{group_label}</text>')
         legend_x = left + 360
         for curve in curves:
-            legend_dash = ' stroke-dasharray="8 5"' if curve["key"] == "wl_write_margin_mv" else ""
-            parts += [f'<path d="M{legend_x} {header_y-6:.1f} h26" stroke="{curve["color"]}" stroke-width="4"{legend_dash}/>',
+            parts += [f'<path d="M{legend_x} {header_y-6:.1f} h26" stroke="{curve["color"]}" stroke-width="4"/>',
                       f'<text x="{legend_x+34}" y="{header_y:.1f}" fill="#3A3A3C" font-size="15">{curve["label"]}</text>']
             legend_x += 220
-        if "write_margin_mv" in keys:
-            delta_rows = _paired_vtrip_deltas(analysis)
-            overlap_count = sum(bool(row["overlap"]) for row in delta_rows)
-            parts.append(f'<text x="{left+plot_w}" y="{header_y+24:.1f}" text-anchor="end" fill="#6E6E73" font-size="13">Delta Vtrip = WL - BL; overlap {overlap_count}/{len(delta_rows)} VDD point(s)</text>')
         for step in range(5):
             margin = y_max * step / 4
             _x, y = xy(0, margin)
@@ -4325,33 +4140,17 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
         for curve in curves:
             points = [xy(row["vdd_v"], row["margin_mv"]) for row in curve["rows"]]
             point_string = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
-            dash = ' stroke-dasharray="10 7"' if curve["key"] == "wl_write_margin_mv" else ""
-            parts.append(f'<polyline points="{point_string}" fill="none" stroke="{curve["color"]}" stroke-width="3.5"{dash}/>')
+            parts.append(f'<polyline points="{point_string}" fill="none" stroke="{curve["color"]}" stroke-width="3.5"/>')
             closure = curve.get("eye_closure")
             if closure and closure.get("extrapolated") and points:
                 closure_x, closure_y = xy(float(closure["estimated_vdd_v"]), 0.0)
                 first_x, first_y = points[0]
-                curve_dash = "10 7" if curve["key"] == "wl_write_margin_mv" else "8 6"
                 parts.append(
                     f'<path data-extrapolated-to-zero="true" d="M{closure_x:.1f} {closure_y:.1f}L{first_x:.1f} {first_y:.1f}" '
                     f'fill="none" stroke="{curve["color"]}" stroke-width="3.5" '
-                    f'stroke-dasharray="{curve_dash}" stroke-linecap="round"/>')
+                    f'stroke-dasharray="8 6" stroke-linecap="round"/>')
             for _row, (x, y) in zip(curve["rows"], points):
-                if curve["key"] == "wl_write_margin_mv":
-                    parts.append(f'<polygon points="{x:.1f},{y-5:.1f} {x+5:.1f},{y:.1f} {x:.1f},{y+5:.1f} {x-5:.1f},{y:.1f}" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
-                else:
-                    parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
-        if "write_margin_mv" in keys:
-            for delta_index, delta_row in enumerate(_paired_vtrip_deltas(analysis)):
-                x, bl_y = xy(float(delta_row["vdd_v"]), float(delta_row["bl_mv"]))
-                _x, wl_y = xy(float(delta_row["vdd_v"]), float(delta_row["wl_mv"]))
-                if delta_row["overlap"]:
-                    center_y = (bl_y + wl_y) / 2
-                    parts.append(f'<circle cx="{x:.1f}" cy="{center_y:.1f}" r="8" fill="none" stroke="#FF9500" stroke-width="2"/>')
-                label_y = max(panel_top + 16, min(bl_y, wl_y) - 13 - (delta_index % 2) * 16)
-                delta_color = "#C56A00" if delta_row["overlap"] else "#3A3A3C"
-                overlap_text = " overlap" if delta_row["overlap"] else ""
-                parts.append(f'<text x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle" fill="{delta_color}" font-size="12" font-weight="700" style="paint-order:stroke;stroke:#FFFFFF;stroke-width:5">Delta {float(delta_row["delta_mv"]):+.1f} mV{overlap_text}</text>')
+                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
         if "rsnm_mv" in keys:
             rows = analysis["curves"]["rsnm_mv"]["rows"]
             if len(rows) >= 2:
@@ -4370,30 +4169,6 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
         parts.append(f'<text x="36" y="{center_y:.1f}" transform="rotate(-90 36 {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_axis_label}</text>')
     parts += [f'<text x="{left+plot_w/2}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
     return "".join(parts)
-
-
-def write_bl_wl_write_assist_outputs(analysis: dict, out_dir: str | os.PathLike[str]) -> Path:
-    """Write a self-contained HTML/CSV sensitivity record for one fixed VDD."""
-    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
-    svg = write_assist_sensitivity_svg(analysis)
-    (out / "bl_wl_write_assist_sensitivity.svg").write_text(svg, encoding="utf-8")
-    rows = []
-    for item in analysis["bl"]["points"]:
-        rows.append({"sweep": "BL common-WL", "control_v": item["write_bl_v"],
-                     "write_snm_mv": item["cell_write_snm_mv"], "write_enabled": not item["eye_open"]})
-    for item in analysis["wl"]["points"]:
-        rows.append({"sweep": "PGL split-WL", "control_v": item["wordline_v"],
-                     "write_snm_mv": item["cell_write_snm_mv"], "write_enabled": item["write_enabled"]})
-    with open(out / "bl_wl_write_assist_sensitivity.csv", "w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
-    (out / "bl_wl_write_assist_sensitivity.json").write_text(json.dumps(analysis, indent=2), encoding="utf-8")
-    report = out / "bl_wl_write_assist_sensitivity.html"
-    lot_label = html.escape(str(analysis["lot_wafer"]))
-    vdd_label = float(analysis["vdd_v"])
-    limiting = html.escape(str(analysis["limiting_control"]))
-    caveat = html.escape(str(analysis["caveat"]))
-    report.write_text(f'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><title>HV28 SRAM BL/WL Write Assist Sensitivity</title><style>body{{margin:0;padding:32px;background:#fff;color:#222;font:16px/1.5 Calibri,"Microsoft JhengHei",Arial,sans-serif}}main{{max-width:1280px;margin:auto}}section{{border:1px solid #ebebeb;border-radius:20px;padding:24px;margin:18px 0}}object{{width:100%;height:auto}}.note{{color:#6a6a6a}}</style></head><body><main><h1>BL / WL Write Assist Sensitivity</h1><p>Lot/Wafer: {lot_label} · Model VDD={vdd_label:.3f} V</p><section><object type="image/svg+xml" data="bl_wl_write_assist_sensitivity.svg"></object></section><section><h2>Interpretation</h2><p>{limiting}</p><p class="note">{caveat}</p></section></main></body></html>''', encoding="utf-8")
-    return report
 
 
 def butterfly_svg(items: list[dict], vdd: float, width: int = 900, height: int = 590) -> str:
@@ -5767,7 +5542,6 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                     "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
                     "upper_rsnm_mv": row["upper_rsnm_mv"], "lower_rsnm_mv": row["lower_rsnm_mv"],
                     "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
-                    "wl_write_margin_mv": row["wl_write_margin_mv"],
                     "cell_ratio_beta": row["cell_ratio_beta"],
                     "pull_up_ratio_beta": row["pull_up_ratio_beta"],
                     "pu_vt_v": family_average(row, "pu", "vt"),
@@ -6455,7 +6229,6 @@ def launch_gui() -> None:
     bitcell_tab = ttk.Frame(notebook, style="Root.TFrame")
     curve_tab = ttk.Frame(notebook, style="Root.TFrame")
     write_margin_tab = ttk.Frame(notebook, style="Root.TFrame")
-    write_assist_tab = ttk.Frame(notebook, style="Root.TFrame")
     mismatch_boundary_tab = ttk.Frame(notebook, style="Root.TFrame")
     training_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
@@ -7032,12 +6805,7 @@ def launch_gui() -> None:
         draw_curve_chart()
         if curve_result:
             if curve_kind.get() == "stacked":
-                delta_rows = _paired_vtrip_deltas(curve_result)
-                overlap_count = sum(bool(row["overlap"]) for row in delta_rows)
-                maximum_delta = max((abs(float(row["delta_mv"])) for row in delta_rows), default=0.0)
-                curve_summary.set(
-                    f"Comparison view: BL/WL overlap {overlap_count}/{len(delta_rows)} VDD point(s); "
-                    f"maximum |Delta Vtrip| = {maximum_delta:.1f} mV.")
+                curve_summary.set("Comparison view: Read/Write SNM and BL Write Margin versus Model VDD.")
                 return
             curve = curve_result["curves"][curve_kind.get()]
             closure = curve.get("eye_closure")
@@ -7075,8 +6843,7 @@ def launch_gui() -> None:
             curve_title.set("Estimate Vmin Curves - Comparison View")
             groups = (
                 ("Read / Write SNM", ("rsnm_mv", "wsnm_mv"), "SNM (mV)"),
-                ("BL Write Margin / WL Write Margin",
-                 ("write_margin_mv", "wl_write_margin_mv"), "Vtrip (mV)"),
+                ("BL Write Margin", ("write_margin_mv",), "Vtrip (mV)"),
             )
             panel_gap = 74
             panel_height = max(112, (height - 64 - panel_gap) / 2)
@@ -7099,8 +6866,7 @@ def launch_gui() -> None:
                 legend_x = left_margin + 190
                 for curve in curves:
                     curve_canvas.create_line(legend_x, panel_top - 21, legend_x + 16, panel_top - 21,
-                                             fill=curve["color"], width=3,
-                                             dash=(7, 4) if curve["key"] == "wl_write_margin_mv" else None)
+                                             fill=curve["color"], width=3)
                     curve_canvas.create_text(legend_x + 21, panel_top - 21, text=curve["label"], anchor="w",
                                              fill=SECONDARY, font=("Calibri", 9, "bold"))
                     legend_x += 140
@@ -7120,32 +6886,10 @@ def launch_gui() -> None:
                     if len(points) >= 2:
                         curve_canvas.create_line(
                             *[coordinate for point in points for coordinate in point],
-                            fill=curve["color"], width=2,
-                            dash=(8, 5) if curve["key"] == "wl_write_margin_mv" else None)
+                            fill=curve["color"], width=2)
                     for _row, (x, y) in zip(curve["rows"], points):
-                        if curve["key"] == "wl_write_margin_mv":
-                            curve_canvas.create_polygon(x, y-4, x+4, y, x, y+4, x-4, y,
-                                                        fill=CARD, outline=curve["color"], width=2)
-                        else:
-                            curve_canvas.create_oval(x-3, y-3, x+3, y+3,
-                                                     fill=CARD, outline=curve["color"], width=2)
-                if "write_margin_mv" in keys:
-                    delta_rows = _paired_vtrip_deltas(curve_result)
-                    for delta_index, delta_row in enumerate(delta_rows):
-                        x, bl_y = stacked_xy(float(delta_row["vdd_v"]), float(delta_row["bl_mv"]))
-                        _x, wl_y = stacked_xy(float(delta_row["vdd_v"]), float(delta_row["wl_mv"]))
-                        if delta_row["overlap"]:
-                            center_y = (bl_y + wl_y) / 2
-                            curve_canvas.create_oval(x-7, center_y-7, x+7, center_y+7,
-                                                     outline="#FF9500", width=2)
-                        if len(delta_rows) <= 8:
-                            label_y = max(panel_top + 12,
-                                          min(bl_y, wl_y) - 10 - (delta_index % 2) * 13)
-                            curve_canvas.create_text(
-                                x, label_y,
-                                text=f'Delta {float(delta_row["delta_mv"]):+.1f}',
-                                fill="#C56A00" if delta_row["overlap"] else SECONDARY,
-                                font=("Calibri", 8, "bold"))
+                        curve_canvas.create_oval(x-3, y-3, x+3, y+3,
+                                                 fill=CARD, outline=curve["color"], width=2)
                 if "rsnm_mv" in keys:
                     rows = curve_result["curves"]["rsnm_mv"]["rows"]
                     if len(rows) >= 2:
@@ -7357,11 +7101,7 @@ def launch_gui() -> None:
             curve_result = analysis
             curve_report_path = Path(payload)
             if curve_kind.get() == "stacked":
-                delta_rows = _paired_vtrip_deltas(analysis)
-                overlap_count = sum(bool(row["overlap"]) for row in delta_rows)
-                maximum_delta = max((abs(float(row["delta_mv"])) for row in delta_rows), default=0.0)
-                summary = (f"Comparison view: BL/WL overlap {overlap_count}/{len(delta_rows)} VDD point(s); "
-                           f"maximum |Delta Vtrip| = {maximum_delta:.1f} mV.")
+                summary = "Comparison view: Read/Write SNM and BL Write Margin versus Model VDD."
                 curve_summary_label.configure(fg=SECONDARY)
             else:
                 curve = analysis["curves"][curve_kind.get()]
@@ -7585,157 +7325,6 @@ def launch_gui() -> None:
         command=open_wtm_report)
     wtm_open_button.pack(fill="x", pady=(7, 0))
     wtm_open_button.state(["disabled"])
-
-    # Fixed-VDD BL / WL write-assist sensitivity.  BL uses the normal shared
-    # wordline condition; WL uses an explicitly labelled PGL-only split-WL
-    # assumption so it cannot be mistaken for normal 6T operation.
-    write_assist_tab.columnconfigure(0, weight=4)
-    write_assist_tab.columnconfigure(1, weight=8)
-    write_assist_tab.rowconfigure(0, weight=1)
-    assist_input_card = ttk.Frame(write_assist_tab, style="Card.TFrame", padding=22)
-    assist_chart_card = ttk.Frame(write_assist_tab, style="Card.TFrame", padding=22)
-    assist_input_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-    assist_chart_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-    assist_chart_card.columnconfigure(0, weight=1)
-    assist_chart_card.rowconfigure(3, weight=1)
-    ttk.Label(assist_input_card, text="BL / WL Write Assist Sensitivity", style="Section.TLabel").pack(anchor="w")
-    ttk.Label(
-        assist_input_card,
-        text=("Fixed Model VDD. Compare the conventional BL write-trip with a PGL-only split-WL "
-              "sensitivity sweep using the current independent 6T WAT data."),
-        style="Meta.TLabel", wraplength=390).pack(anchor="w", pady=(4, 14))
-    assist_note = tk.Frame(assist_input_card, bg="#FFF1F3", padx=14, pady=12)
-    assist_note.pack(fill="x", pady=(0, 14))
-    tk.Label(assist_note, text="Sensitivity assumption", bg="#FFF1F3", fg=TEXT,
-             font=("Calibri", 11, "bold"), anchor="w").pack(fill="x")
-    tk.Label(
-        assist_note,
-        text=("BL: common WL=VDD, BL sweeps 0→VDD.\n"
-              "WL: BL=0, BLB=VDD; only PGL WL sweeps 0→VDD while PGR remains VDD.\n"
-              "WL result is not a standard single-WL 6T specification."),
-        bg="#FFF1F3", fg=SECONDARY, font=("Calibri", 9), justify="left",
-        wraplength=365, anchor="w").pack(fill="x", pady=(5, 0))
-    ttk.Label(assist_input_card, text="Uses current 6T Bitcell inputs and Model VDD", style="Body.TLabel").pack(anchor="w")
-    ttk.Button(assist_input_card, text="Edit 6T WAT inputs", style="Quiet.TButton",
-               command=lambda: notebook.select(bitcell_tab)).pack(fill="x", pady=(6, 0))
-    assist_status = tk.StringVar(value="Ready to compare BL and PGL WL sensitivity")
-    assist_status_label = tk.Label(assist_input_card, textvariable=assist_status, bg=CARD, fg=SECONDARY,
-                                   font=("Calibri", 9), justify="left", anchor="w", wraplength=390)
-    assist_status_label.pack(fill="x", pady=(16, 6))
-    assist_progress = ttk.Progressbar(assist_input_card, mode="indeterminate",
-                                      style="Apple.Horizontal.TProgressbar")
-    assist_progress.pack(fill="x")
-
-    ttk.Label(assist_chart_card, text="Write-control tolerance at fixed Model VDD",
-              style="ChartTitle.TLabel").grid(row=0, column=0, sticky="w")
-    ttk.Label(assist_chart_card,
-              text="Higher normalized tolerance means the selected control can deviate farther while write remains enabled.",
-              style="Meta.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 8))
-    assist_summary = tk.StringVar(value="Run analysis to compare BL and PGL split-WL tolerance.")
-    assist_summary_label = tk.Label(assist_chart_card, textvariable=assist_summary, bg=CARD, fg=SECONDARY,
-                                    font=("Calibri", 10, "bold"), justify="left", anchor="w", wraplength=740)
-    assist_summary_label.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-    assist_canvas = tk.Canvas(assist_chart_card, bg=CARD, highlightthickness=0, bd=0, width=720, height=450)
-    assist_canvas.grid(row=3, column=0, sticky="nsew")
-    assist_canvas.create_text(360, 220, text="BL / WL tolerance comparison will appear here",
-                              fill=SECONDARY, font=("Calibri", 13))
-    assist_result_queue: queue.Queue = queue.Queue()
-    assist_report_path: Path | None = None
-
-    def draw_assist_chart(analysis: dict) -> None:
-        canvas = assist_canvas
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 720); height = max(canvas.winfo_height(), 450)
-        left, right, top, bottom = 95, 55, 72, 82
-        plot_w, plot_h = width - left - right, height - top - bottom
-        canvas.create_text(left, 30, text=f'Model VDD = {analysis["vdd_v"]:.3f} V', anchor="w",
-                           fill=TEXT, font=("Calibri", 13, "bold"))
-        for index in range(6):
-            y = top + plot_h - plot_h * index / 5
-            canvas.create_line(left, y, left + plot_w, y, fill="#EBEBEB")
-            canvas.create_text(left - 12, y, text=f"{index * 20}%", anchor="e", fill=SECONDARY,
-                               font=("Calibri", 10))
-        canvas.create_line(left, top, left, top + plot_h, fill="#C1C1C1")
-        canvas.create_line(left, top + plot_h, left + plot_w, top + plot_h, fill="#C1C1C1")
-        entries = (("BL tolerance", analysis.get("bl_write_tolerance"), "#FF385C",
-                    analysis["bl"].get("write_trip_bl_v"), "BL trip"),
-                   ("PGL WL tolerance", analysis.get("wl_drive_tolerance"), "#460479",
-                    analysis["wl"].get("write_trip_wl_v"), "Minimum PGL WL"))
-        x_positions = (left + plot_w * .28, left + plot_w * .70)
-        for x, (label, tolerance, color, trip, trip_label) in zip(x_positions, entries):
-            value = 0.0 if tolerance is None else max(0.0, min(1.0, float(tolerance)))
-            bar_h = plot_h * value
-            canvas.create_rectangle(x - 58, top + plot_h - bar_h, x + 58, top + plot_h,
-                                    fill=color, outline="")
-            canvas.create_text(x, top + plot_h - bar_h - 16,
-                               text="Not bracketed" if tolerance is None else f"{value * 100:.1f}% VDD",
-                               fill=color, font=("Calibri", 13, "bold"))
-            canvas.create_text(x, top + plot_h + 24, text=label, fill=TEXT,
-                               font=("Calibri", 11, "bold"))
-            trip_text = "not bracketed" if trip is None else f"{trip_label}: {float(trip):.3f} V"
-            canvas.create_text(x, top + plot_h + 46, text=trip_text, fill=SECONDARY,
-                               font=("Calibri", 10))
-        canvas.create_text(left + plot_w / 2, height - 15,
-                           text="Compare normalized headroom; BL and WL trip voltages are not directly interchangeable.",
-                           fill=SECONDARY, font=("Calibri", 10))
-
-    def assist_worker(cell: SixTWatCell, cfg: Config, vdd: float, out_path: Path) -> None:
-        try:
-            analysis = analyze_bl_wl_write_assist_sensitivity(cell, cfg, vdd)
-            run_dir = create_run_output_dir(out_path, cell.corner, "bl_wl_write_assist_sensitivity")
-            report = write_bl_wl_write_assist_outputs(analysis, run_dir)
-            assist_result_queue.put((True, analysis, report))
-        except Exception as exc:
-            assist_result_queue.put((False, None, exc))
-
-    def poll_assist_result() -> None:
-        nonlocal assist_report_path
-        try:
-            ok, analysis, payload = assist_result_queue.get_nowait()
-        except queue.Empty:
-            root.after(80, poll_assist_result); return
-        assist_progress.stop(); assist_analyze_button.state(["!disabled"])
-        if ok:
-            assist_report_path = Path(payload)
-            assist_summary.set(str(analysis["limiting_control"]))
-            assist_summary_label.configure(fg=BLUE)
-            assist_status.set(f"Complete - sensitivity record saved to {assist_report_path.parent}")
-            assist_status_label.configure(fg=GREEN)
-            draw_assist_chart(analysis)
-            assist_open_button.state(["!disabled"])
-        else:
-            assist_status.set("BL / WL sensitivity analysis could not be completed")
-            assist_status_label.configure(fg=RED)
-            messagebox.showerror("BL / WL Write Assist Sensitivity", str(payload))
-
-    def execute_assist_analysis() -> None:
-        try:
-            cell, cfg, _targets = collect_inputs()
-            vdd = float(numeric["nominal_vdd"].get())
-        except Exception as exc:
-            assist_status.set("Check 6T WAT inputs and Model VDD")
-            assist_status_label.configure(fg=RED)
-            messagebox.showerror("Invalid write-assist input", str(exc)); return
-        assist_status.set("Sweeping BL and PGL split-WL at the selected Model VDD...")
-        assist_status_label.configure(fg=BLUE)
-        assist_analyze_button.state(["disabled"]); assist_open_button.state(["disabled"])
-        assist_progress.start(10)
-        threading.Thread(target=assist_worker, args=(cell, cfg, vdd, Path(values["out"].get())), daemon=True).start()
-        root.after(80, poll_assist_result)
-
-    def open_assist_report() -> None:
-        if assist_report_path and assist_report_path.exists():
-            webbrowser.open(assist_report_path.resolve().as_uri())
-
-    assist_actions = ttk.Frame(assist_input_card, style="Card.TFrame")
-    assist_actions.pack(side="bottom", fill="x", pady=(18, 0))
-    assist_analyze_button = ttk.Button(assist_actions, text="Analyze BL / WL Sensitivity",
-                                       style="Accent.TButton", command=execute_assist_analysis)
-    assist_analyze_button.pack(fill="x")
-    assist_open_button = ttk.Button(assist_actions, text="Open HTML Result", style="Quiet.TButton",
-                                    command=open_assist_report)
-    assist_open_button.pack(fill="x", pady=(7, 0))
-    assist_open_button.state(["disabled"])
 
     # One-factor-at-a-time Vt/Idsat boundary search for the two Read-SNM eyes.
     mismatch_boundary_tab.columnconfigure(0, weight=1)
