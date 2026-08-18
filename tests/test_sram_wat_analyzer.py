@@ -9,7 +9,7 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg,
+    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg, estimate_vmin_multi_lot_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_output_folders,
     analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     educational_sram_metrics,
@@ -615,8 +615,47 @@ class AnalyzerTests(unittest.TestCase):
         self.assertNotIn("WL Write Margin", stacked)
         self.assertIn("SNM (mV)", stacked)
         self.assertIn("Vtrip (mV)", stacked)
+        self.assertIn('class="curve-data-label"', stacked)
+        self.assertIn('>90.0 mV</text>', stacked)
+        self.assertIn('class="vertical-vdd-label"', stacked)
+        self.assertIn('>0.50 V</text>', stacked)
         transparent = estimate_vmin_stacked_svg(result, transparent_background=True)
         self.assertNotIn('<rect width="100%" height="100%" fill="#FFFFFF"/>', transparent)
+
+    def test_multi_lot_curve_comparison_reads_two_output_folders(self):
+        with tempfile.TemporaryDirectory() as td:
+            folders = []
+            fields = ["vdd_v", "lot_wafer", "chip_id", "rsnm_mv", "wsnm_mv",
+                      "write_margin_mv"]
+            for folder_index, lot in enumerate(("LOT_A_W01", "LOT_B_W02")):
+                folder = Path(td) / f"output_{folder_index+1}"
+                folder.mkdir()
+                with (folder / "estimate_vmin_cr_pr_shmoo.csv").open(
+                        "w", newline="", encoding="utf-8-sig") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=fields)
+                    writer.writeheader()
+                    for vdd, base in ((.5, 50.0), (.7, 90.0)):
+                        writer.writerow({"vdd_v": vdd, "lot_wafer": lot,
+                                         "chip_id": "C01",
+                                         "rsnm_mv": base + folder_index * 10,
+                                         "wsnm_mv": base + 20 + folder_index * 10,
+                                         "write_margin_mv": base / 2 + folder_index * 5})
+                folders.append(folder)
+            datasets = read_estimate_vmin_output_folders(folders)
+            self.assertEqual([item["lot_wafer"] for item in datasets],
+                             ["LOT_A_W01", "LOT_B_W02"])
+            self.assertEqual(len(datasets[0]["rows"]), 2)
+            svg = estimate_vmin_multi_lot_svg(datasets)
+            self.assertIn("Multi Lot/Wafer Estimate Vmin Curve Comparison", svg)
+            self.assertIn("LOT_A_W01", svg)
+            self.assertIn("LOT_B_W02", svg)
+            self.assertIn("Read SNM", svg)
+            self.assertIn("Write SNM", svg)
+            self.assertIn("BL Write Margin", svg)
+            self.assertIn('class="multi-lot-data-label"', svg)
+            self.assertIn('text-anchor="middle" fill="#1D1D1F" font-size="34"', svg)
+            self.assertIn('text-anchor="middle" fill="#1D1D1F" font-size="20"', svg)
+            self.assertIn('opacity=".42"', svg)
 
     def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):
         rows = []
@@ -700,6 +739,8 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("#F7C9C2", svg)
         self.assertIn('class="measured-cell"', svg)
         self.assertIn('data-cell-tooltip=', svg)
+        self.assertIn('aria-label="Cell: C01', svg)
+        self.assertNotIn("<title>", svg)
         self.assertIn('class="special-cell-highlights" pointer-events="none"', svg)
         self.assertIn("Cell: C01 (1/2)", svg)
         self.assertIn("RSNM: 60.0 mV", svg)
