@@ -9,14 +9,14 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_mismatch_rsnm_boundaries, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg, estimate_vmin_multi_lot_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_output_folders,
+    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg, estimate_vmin_multi_lot_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_output_folders,
     analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
-    educational_sram_metrics,
+    drive_monitor_metrics, drive_monitor_shmoo_reference,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
     read_iv_curve_excel, read_multi_chip_6t_excel, read_multi_chip_snm_summary, read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
     save_gui_state,
-    validate_config, wat_electrical_snm_rows, write_mismatch_boundary_outputs,
+    validate_config, wat_electrical_snm_rows,
     write_iv_curve_excel_template, write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
     write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
@@ -38,10 +38,10 @@ class AnalyzerTests(unittest.TestCase):
         self.assertLess(at_threshold, above)
         self.assertAlmostEqual(device.current(.90, .90), 44.0, places=7)
 
-    def test_training_metrics_use_wat_calibrated_beta_ratios(self):
-        baseline = educational_sram_metrics(
+    def test_drive_monitor_metrics_use_wat_calibrated_beta_ratios(self):
+        baseline = drive_monitor_metrics(
             WatPoint("TRAIN", .385, 44.0, .365, 82.0, .355, 124.0), .90)
-        stronger_pg = educational_sram_metrics(
+        stronger_pg = drive_monitor_metrics(
             WatPoint("TRAIN", .385, 44.0, .365, 110.0, .355, 124.0), .90)
         self.assertGreater(baseline["read_snm_mv"], 0.0)
         self.assertGreaterEqual(baseline["write_margin_mv"], 0.0)
@@ -49,6 +49,16 @@ class AnalyzerTests(unittest.TestCase):
         self.assertGreater(baseline["pull_up_ratio"], 0.0)
         self.assertGreater(stronger_pg["beta_pg"], baseline["beta_pg"])
         self.assertGreater(stronger_pg["pull_up_ratio"], baseline["pull_up_ratio"])
+
+    def test_drive_monitor_shmoo_reference_uses_stable_quartile_targets(self):
+        low_vdd = drive_monitor_shmoo_reference(.68)
+        high_vdd = drive_monitor_shmoo_reference(.90)
+        self.assertEqual(low_vdd["sample_count"], 729)
+        for axis in ("cr", "pr"):
+            self.assertLess(low_vdd[axis]["q1"], low_vdd[axis]["median"])
+            self.assertLess(low_vdd[axis]["median"], low_vdd[axis]["q3"])
+        self.assertNotAlmostEqual(low_vdd["cr"]["median"],
+                                  high_vdd["cr"]["median"])
 
     def test_run_output_directory_uses_date_time_wafer_and_never_overwrites(self):
         stamp = datetime(2026, 8, 1, 14, 30, 25)
@@ -191,29 +201,6 @@ class AnalyzerTests(unittest.TestCase):
                                swapped["snm_upper_left_mv"], delta=1.0)
         self.assertAlmostEqual(original["snm_mv"], swapped["snm_mv"], delta=1.0)
         self.assertAlmostEqual(original["delta_snm_mv"], -swapped["delta_snm_mv"], delta=1.0)
-
-    def test_mismatch_boundary_search_exports_complete_six_mos_values(self):
-        cell = SixTWatCell(
-            "BOUNDARY_W01", MosWat(.385, 44), MosWat(.385, 44),
-            MosWat(.365, 82), MosWat(.365, 82),
-            MosWat(.355, 124), MosWat(.355, 124))
-        analysis = analyze_mismatch_rsnm_boundaries(
-            cell, self.cfg, fit_points=101, scan_steps=4, bisection_steps=6)
-        self.assertEqual(len(analysis["rows"]), 24)
-        found = [row for row in analysis["rows"] if row["status"] == "BOUNDARY FOUND"]
-        self.assertTrue(found)
-        self.assertTrue(any(row["upper_rsnm_mv"] == 0 for row in found))
-        self.assertTrue(any(row["lower_rsnm_mv"] == 0 for row in found))
-        for key in ("pul_vt_v", "pul_idsat_ua", "pgr_vt_v", "pgr_idsat_ua",
-                    "pdr_vt_v", "pdr_idsat_ua"):
-            self.assertIn(key, found[0])
-        with tempfile.TemporaryDirectory() as td:
-            report = write_mismatch_boundary_outputs(analysis, td)
-            self.assertTrue(report.exists())
-            self.assertTrue((Path(td) / "rsnm_mismatch_boundaries.csv").exists())
-            html_text = report.read_text(encoding="utf-8")
-            self.assertIn("Complete 6T Boundary Values", html_text)
-            self.assertIn("PUL Vt (V)", html_text)
 
     def test_html_png_and_csv_include_read_and_w0_w1_wsnm(self):
         result = analyze_three_mos(self.cell, self.cfg, self.targets)
@@ -463,23 +450,6 @@ class AnalyzerTests(unittest.TestCase):
         self.assertAlmostEqual(stats.vt_mean, 0.3065)
         self.assertAlmostEqual(sample.cell.pu1.ids, 46.5)
 
-    def test_distributed_excel_template_uses_compatible_filtered_ranges(self):
-        from openpyxl import load_workbook
-
-        template = (Path(__file__).resolve().parents[1] / "input" / "templates" /
-                    "HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx")
-        workbook = load_workbook(template, read_only=False, data_only=False)
-        self.assertEqual(workbook.sheetnames, ["PU", "PG", "PD", "Instructions"])
-        for sheet_name in ("PU", "PG", "PD"):
-            sheet = workbook[sheet_name]
-            self.assertEqual(len(sheet.tables), 0)
-            self.assertEqual(sheet.auto_filter.ref, "A1:I145")
-            self.assertEqual(
-                [cell.value for cell in sheet[1]],
-                ["Lot/Wafer", "Site", "Model VDD", "MOS", "Vt", "Vt Unit",
-                 "Idsat", "Idsat Unit", "Notes"],
-            )
-
     def test_manual_rsnm_vcc_curve_brackets_eye_closure_and_exports(self):
         base_vt = {"pu": .385, "pg": .365, "pd": .355}
         base_ids = {"pu": 44.0, "pg": 82.0, "pd": 124.0}
@@ -561,10 +531,19 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual(analysis["median_cell"]["chip_id"], "MEDIAN_CELL")
             self.assertEqual(len(analysis["median_target_read_shmoo"]["rows"]), 66)
             self.assertEqual(len(analysis["median_target_write_shmoo"]["rows"]), 66)
+            self.assertIn("relative_shmoo", analysis)
+            self.assertEqual(analysis["relative_shmoo"]["samples"][0]["wafer_grade"],
+                             "preferred")
             report = write_multi_chip_outputs(analysis, Path(td) / "batch", template)
             self.assertTrue(report.exists())
             self.assertTrue((report.parent / "images" / "01_multi_chip_read_vtc.png").exists())
             self.assertTrue((report.parent / "median_target_read_shmoo.csv").exists())
+            self.assertTrue((report.parent / "images" /
+                             "03_multi_cell_wafer_relative_shmoo.png").exists())
+            self.assertTrue((report.parent /
+                             "multi_cell_wafer_relative_grades.csv").exists())
+            self.assertTrue((report.parent /
+                             "multi_cell_wafer_distribution_statistics.csv").exists())
             self.assertTrue((report.parent / "imported_6t_vt_idsat_data.xlsx").exists())
             self.assertIn("Minimum RSNM source 6T WAT values",
                           (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
@@ -718,19 +697,28 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(shmoo["best"]["chip_id"], "C02")
         self.assertAlmostEqual(shmoo["samples"][0]["read_score"], .75)
         self.assertAlmostEqual(shmoo["samples"][0]["write_score"], .75)
+        self.assertAlmostEqual(shmoo["samples"][0]["delta_vs_median_pu_idsat_ua_pct"],
+                               -14.285714, places=5)
+        self.assertAlmostEqual(shmoo["samples"][1]["write_balance_vs_median_pct"],
+                               100 * (1.7 - 1.65) / 1.65, places=5)
+        self.assertEqual(shmoo["samples"][0]["wafer_grade"], "monitor")
+        self.assertEqual(shmoo["samples"][1]["wafer_grade"], "preferred")
+        self.assertAlmostEqual(shmoo["samples"][0]["wafer_grade_score"], .25)
+        self.assertAlmostEqual(shmoo["samples"][1]["wafer_grade_score"], .75)
+        self.assertAlmostEqual(shmoo["distributions"]["rsnm_mv"]["median"], 70.0)
         svg = estimate_vmin_ratio_shmoo_svg(shmoo)
         self.assertAlmostEqual(shmoo["samples"][1]["pull_up_ratio_beta"], 1.7)
         self.assertIn("Read / Write Drive-Balance Shmoo", svg)
         self.assertIn("HOW TO READ", svg)
-        self.assertIn("Balanced score", svg)
-        self.assertIn("Preferred threshold", svg)
+        self.assertIn("Wafer-relative grade", svg)
+        self.assertIn("Dynamic wafer thresholds", svg)
         self.assertIn("COLOR SCALE", svg)
         self.assertNotIn("Preferred drive direction", svg)
         self.assertIn("Weakest: C01", svg)
         self.assertIn("Best measured: C02", svg)
         self.assertIn("Best measured cell", svg)
         self.assertIn("#FFC447", svg)
-        self.assertIn("90% relative boundary", svg)
+        self.assertIn("P50/P50 relative boundary", svg)
         self.assertIn("β_PG / β_PU", svg)
         self.assertIn("right = easier write", svg)
         self.assertNotIn("1/PR", svg)
@@ -745,6 +733,9 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("Cell: C01 (1/2)", svg)
         self.assertIn("RSNM: 60.0 mV", svg)
         self.assertIn("BL Write Vtrip: 41.2 mV", svg)
+        self.assertIn("Read balance vs median:", svg)
+        self.assertIn("Write balance vs median:", svg)
+        self.assertIn("Δmed -14.3%", svg)
         self.assertIn("PU: Vt", svg)
         self.assertIn("PG: Vt", svg)
         self.assertIn("PD: Vt", svg)
@@ -769,6 +760,31 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(by_chip["GOOD"]["best_region"])
         self.assertFalse(by_chip["RESIDUAL_EYE"]["best_region"])
         self.assertAlmostEqual(by_chip["RESIDUAL_EYE"]["balanced_score"], .25)
+
+    def test_wafer_relative_grade_follows_both_cr_and_pr_quartiles(self):
+        samples = []
+        for index, (ratio, margin) in enumerate(
+                ((1.0, 100.0), (1.2, 80.0), (1.4, 60.0), (1.6, 40.0)), 1):
+            samples.append({
+                "lot_wafer": "W01", "chip_id": f"C{index:02d}",
+                "rsnm_mv": margin, "wsnm_mv": margin,
+                "write_margin_mv": margin,
+                "cell_ratio_beta": ratio, "pull_up_ratio_beta": ratio,
+            })
+        base = {"vdd_v": .68, "sample_count": len(samples), "samples": samples}
+        for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
+            base[key] = min(sample[key] for sample in samples)
+            base[f"{key}_chip_id"] = "C04"
+            base[f"{key}_lot_wafer"] = "W01"
+        second = {**base, "vdd_v": .70, "samples": [dict(item) for item in samples]}
+        shmoo = analyze_estimate_vmin_curves([base, second])["ratio_shmoos"][0]
+        by_chip = {sample["chip_id"]: sample for sample in shmoo["samples"]}
+        self.assertEqual(by_chip["C01"]["wafer_grade"], "low")
+        self.assertEqual(by_chip["C04"]["wafer_grade"], "preferred")
+        self.assertGreater(by_chip["C01"]["performance_grade_score"],
+                           by_chip["C01"]["wafer_grade_score"])
+        self.assertAlmostEqual(shmoo["target"]["cell_ratio_beta"], 1.3)
+        self.assertAlmostEqual(shmoo["target"]["pull_up_ratio_beta"], 1.3)
 
     def test_single_and_multi_chip_use_identical_snm_calculation(self):
         """One multi-chip row must numerically match the 6T single-cell result."""

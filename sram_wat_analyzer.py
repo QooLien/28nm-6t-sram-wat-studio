@@ -1014,15 +1014,15 @@ class Sram6T:
         return None
 
 
-def educational_sram_metrics(wat: WatPoint, vdd: float) -> dict[str, float | list[tuple[float, float]]]:
-    """Return compact-model values for the interactive SRAM training tab.
+def drive_monitor_metrics(wat: WatPoint, vdd: float) -> dict[str, float | list[tuple[float, float]]]:
+    """Return compact-model values for the interactive 6T Drive Monitor.
 
     This intentionally uses the same WAT-calibrated 6T model as the main
     application.  It is a learning aid: the metrics show directional device
     trade-offs, not a replacement for PDK/array sign-off.
     """
     if not math.isfinite(vdd) or vdd <= 0:
-        raise ValueError("Training VDD must be a positive finite value")
+        raise ValueError("Drive Monitor VDD must be a positive finite value")
     cfg = Config(wat_vdd=vdd, nominal_vdd=vdd, grid_points=401)
     model = Sram6T(wat, cfg)
     read_fit = model.butterfly_squares(vdd, "read", points=401)
@@ -1036,6 +1036,47 @@ def educational_sram_metrics(wat: WatPoint, vdd: float) -> dict[str, float | lis
         "read_snm_mv": float(read_fit.get("snm_mv") or 0.0),
         "write_margin_mv": 1000.0 * model.write_snm(vdd),
         "read_vtc": model.vtc(vdd, "read", points=81),
+    }
+
+
+def drive_monitor_shmoo_reference(vdd: float,
+                                   drive_sigma: float = .08) -> dict[str, object]:
+    """Build a deterministic statistical CR/PR reference for the monitor.
+
+    The target population is anchored to the nominal 28 nm WAT reference and
+    uses independent log-normal PU/PG/PD effective-drive variation. Its median
+    moves with Model VDD, but it does not chase the live device sliders.
+    """
+    if not math.isfinite(vdd) or vdd <= 0:
+        raise ValueError("Drive Monitor VDD must be a positive finite value")
+    sigma = float(drive_sigma)
+    if not math.isfinite(sigma) or sigma <= 0:
+        raise ValueError("Drive variation sigma must be positive")
+    nominal = WatPoint("DriveReference", .385, 44.0, .365, 82.0, .355, 124.0)
+    model = Sram6T(nominal, Config(wat_vdd=vdd, nominal_vdd=vdd, grid_points=101))
+    # Mid-quantile normal scores avoid random seeds while approximating a
+    # reproducible log-normal process-strength population (9^3 = 729 cells).
+    normal = statlib.NormalDist()
+    factors = [math.exp(sigma * normal.inv_cdf((index + .5) / 9.0))
+               for index in range(9)]
+    cr_values: list[float] = []
+    pr_values: list[float] = []
+    for pu_factor in factors:
+        for pg_factor in factors:
+            for pd_factor in factors:
+                beta_pu = model.pu.beta * pu_factor
+                beta_pg = model.pg.beta * pg_factor
+                beta_pd = model.pd.beta * pd_factor
+                cr_values.append(beta_pd / beta_pg)
+                pr_values.append(beta_pg / beta_pu)
+    return {
+        "vdd_v": vdd,
+        "sample_count": len(cr_values),
+        "drive_sigma": sigma,
+        "cr": _robust_distribution(cr_values),
+        "pr": _robust_distribution(pr_values),
+        "definition": ("Nominal-reference log-normal PU/PG/PD drive population; "
+                       "green requires CR and PR >= median, yellow requires both >= Q1."),
     }
 
 
@@ -2599,6 +2640,27 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
     median_cell = _median_multi_cell(chips)
     median = {"chip_id": "MEDIAN_CELL", **_multi_cell_metrics(
         median_cell, point_cfg, vdd, point_cfg.grid_points)}
+    shmoo_samples = []
+    for row in rows:
+        source_cell = row["cell"]
+        sample = {
+            "lot_wafer": chips[0].lot_wafer,
+            "chip_id": row["chip_id"],
+            "rsnm_mv": row["rsnm_mv"],
+            "wsnm_mv": row["wsnm_mv"],
+            "write_margin_mv": row["write_margin_mv"],
+            "cell_ratio_beta": row["cell_ratio_beta"],
+            "pull_up_ratio_beta": row["pull_up_ratio_beta"],
+        }
+        for family in ("pu", "pg", "pd"):
+            left_mos = getattr(source_cell, f"{family}1")
+            right_mos = getattr(source_cell, f"{family}2")
+            sample[f"{family}_vt_v"] = (float(left_mos.vt) + float(right_mos.vt)) / 2.0
+            sample[f"{family}_idsat_ua"] = (float(left_mos.ids) + float(right_mos.ids)) / 2.0
+        shmoo_samples.append(sample)
+    relative_shmoo = _build_estimate_vmin_ratio_shmoos([
+        {"vdd_v": vdd, "samples": shmoo_samples}
+    ])[0]
     return {"lot_wafer": chips[0].lot_wafer, "vdd_v": vdd, "rows": rows,
             "worst_rsnm": worst_read, "worst_rsnm_upper": worst_upper,
             "worst_rsnm_lower": worst_lower, "worst_wsnm": worst_write,
@@ -2611,6 +2673,7 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
                 worst_read, median, point_cfg, vdd, "rsnm_mv"),
             "median_target_write_shmoo": _median_target_shmoo(
                 worst_write_margin, median, point_cfg, vdd, "write_margin_mv"),
+            "relative_shmoo": relative_shmoo,
             "fit_points": point_cfg.grid_points}
 
 
@@ -2775,194 +2838,6 @@ def analyze_rsnm_vcc_curve(points: list[RsnmVccPoint], cfg: Config,
         "fit_points": fit_points,
         "definition": "Estimated eye-closure VDD is a compact-model boundary, not measured WT Vmin",
     }
-
-
-def analyze_mismatch_rsnm_boundaries(cell: SixTWatCell, cfg: Config,
-                                     fit_points: int = 301,
-                                     scan_steps: int = 16,
-                                     bisection_steps: int = 14) -> dict:
-    """Find one-factor-at-a-time 6T Vt/Idsat values where either Read-SNM eye closes."""
-    validate_config(cfg)
-    fit_points = max(101, int(fit_points))
-    scan_steps = max(4, int(scan_steps))
-    bisection_steps = max(6, int(bisection_steps))
-    device_names = ("pu1", "pu2", "pg1", "pg2", "pd1", "pd2")
-
-    def evaluate(candidate: SixTWatCell) -> dict:
-        # Evaluate the same physical state in both cell orientations.  Mapping
-        # the swapped-cell upper eye back to the original lower eye prevents a
-        # sequential lobe-fit failure from masking the opposite stored state.
-        primary = AsymmetricSram6T(candidate, cfg).read_butterfly(
-            cfg.nominal_vdd, fit_points)["read_butterfly"]
-        swapped = SixTWatCell(
-            candidate.corner, candidate.pu2, candidate.pu1,
-            candidate.pg2, candidate.pg1, candidate.pd2, candidate.pd1)
-        reverse = AsymmetricSram6T(swapped, cfg).read_butterfly(
-            cfg.nominal_vdd, fit_points)["read_butterfly"]
-        upper = primary.get("snm_upper_left_mv")
-        lower = reverse.get("snm_upper_left_mv")
-        failed = []
-        if upper is None or upper <= 0:
-            failed.append("upper_left")
-        if lower is None or lower <= 0:
-            failed.append("lower_right")
-        valid = not failed
-        return {"valid": valid, "upper_mv": upper, "lower_mv": lower,
-                "failed_state_keys": failed,
-                "reason": (primary.get("reason", "") + " | swapped: " +
-                           reverse.get("reason", ""))}
-
-    baseline = evaluate(cell)
-    if not baseline["valid"]:
-        raise ValueError("Baseline 6T inputs must have two valid Read-SNM eyes before boundary search")
-
-    def candidate_cell(device: str, parameter: str, value: float) -> SixTWatCell:
-        return cell.replace_mos(device, **{parameter: value})
-
-    def value_at(baseline_value: float, endpoint: float, parameter: str, fraction: float) -> float:
-        if parameter == "ids":
-            return baseline_value * ((endpoint / baseline_value) ** fraction)
-        return baseline_value + (endpoint - baseline_value) * fraction
-
-    rows: list[dict] = []
-    for device in device_names:
-        baseline_mos = getattr(cell, device)
-        for parameter, unit in (("vt", "V"), ("ids", "uA")):
-            baseline_value = getattr(baseline_mos, parameter)
-            if parameter == "vt":
-                endpoints = {
-                    "DECREASE": max(0.005, baseline_value * 0.02),
-                    "INCREASE": max(cfg.wat_vdd, cfg.nominal_vdd) * 1.25,
-                }
-            else:
-                endpoints = {
-                    "DECREASE": max(0.001, baseline_value * 0.002),
-                    "INCREASE": baseline_value * 20.0,
-                }
-            for direction, endpoint in endpoints.items():
-                previous_fraction = 0.0
-                previous_result = baseline
-                bracket = None
-                for step in range(1, scan_steps + 1):
-                    fraction = step / scan_steps
-                    value = value_at(baseline_value, endpoint, parameter, fraction)
-                    result = evaluate(candidate_cell(device, parameter, value))
-                    if not result["valid"]:
-                        bracket = [previous_fraction, fraction, previous_result, result]
-                        break
-                    previous_fraction, previous_result = fraction, result
-
-                boundary_value = None
-                boundary_cell = None
-                boundary_result = None
-                last_valid = previous_result
-                status = "NOT BRACKETED"
-                if bracket:
-                    valid_fraction, invalid_fraction, last_valid, boundary_result = bracket
-                    for _ in range(bisection_steps):
-                        middle = (valid_fraction + invalid_fraction) / 2.0
-                        value = value_at(baseline_value, endpoint, parameter, middle)
-                        result = evaluate(candidate_cell(device, parameter, value))
-                        if result["valid"]:
-                            valid_fraction, last_valid = middle, result
-                        else:
-                            invalid_fraction, boundary_result = middle, result
-                    boundary_fraction = (valid_fraction + invalid_fraction) / 2.0
-                    boundary_value = value_at(
-                        baseline_value, endpoint, parameter, boundary_fraction)
-                    boundary_cell = candidate_cell(device, parameter, boundary_value)
-                    status = "BOUNDARY FOUND"
-
-                failed_keys = boundary_result["failed_state_keys"] if boundary_result else []
-                failed_label = (" / ".join(key.replace("_", " ").title() for key in failed_keys)
-                                if failed_keys else None)
-                row = {
-                    "device": DISPLAY_MOS_NAMES[device],
-                    "parameter": "Vt" if parameter == "vt" else "Isat",
-                    "direction": direction,
-                    "baseline_value": baseline_value,
-                    "boundary_value": boundary_value,
-                    "unit": unit,
-                    "failed_state": failed_label,
-                    "upper_rsnm_mv": (0.0 if "upper_left" in failed_keys else
-                                      last_valid.get("upper_mv") if boundary_result else None),
-                    "lower_rsnm_mv": (0.0 if "lower_right" in failed_keys else
-                                      last_valid.get("lower_mv") if boundary_result else None),
-                    "status": status,
-                    "search_endpoint": endpoint,
-                }
-                source_cell = boundary_cell or cell
-                for source_name in device_names:
-                    source_mos = getattr(source_cell, source_name)
-                    label = DISPLAY_MOS_NAMES[source_name].lower()
-                    row[f"{label}_vt_v"] = source_mos.vt
-                    row[f"{label}_idsat_ua"] = source_mos.ids
-                rows.append(row)
-
-    return {
-        "lot_wafer": cell.corner,
-        "vdd_v": cfg.nominal_vdd,
-        "wat_vdd_v": cfg.wat_vdd,
-        "baseline_upper_rsnm_mv": baseline["upper_mv"],
-        "baseline_lower_rsnm_mv": baseline["lower_mv"],
-        "rows": rows,
-        "definition": ("One-factor-at-a-time boundary: all other 6T Vt/Idsat values remain "
-                       "at the entered Lot/Wafer baseline; RSNM=0 is a compact-model eye-closure estimate."),
-        "search_limits": {
-            "vt_v": "2% of baseline (minimum 0.005 V) to 1.25*max(WAT VDD, SRAM VDD)",
-            "idsat_ua": "0.2% to 2000% of baseline",
-        },
-    }
-
-
-def write_mismatch_boundary_outputs(analysis: dict,
-                                    out_dir: str | os.PathLike[str]) -> Path:
-    """Write CSV, JSON and HTML for the 6T mismatch Read-SNM boundary search."""
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    rows = analysis["rows"]
-    csv_path = out / "rsnm_mismatch_boundaries.csv"
-    fieldnames = list(rows[0]) if rows else []
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as target:
-        writer = csv.DictWriter(target, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    (out / "rsnm_mismatch_boundaries.json").write_text(
-        json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    body_rows = []
-    full_boundary_rows = []
-    for row in rows:
-        boundary = _fmt(row["boundary_value"], 5)
-        body_rows.append(
-            f'<tr><td>{row["device"]}</td><td>{row["parameter"]}</td>'
-            f'<td>{row["direction"].title()}</td><td>{row["baseline_value"]:.5g}</td>'
-            f'<td>{boundary}</td><td>{row["unit"]}</td>'
-            f'<td>{html.escape(row["failed_state"] or "N/A")}</td>'
-            f'<td>{_fmt(row["upper_rsnm_mv"], 2)}</td>'
-            f'<td>{_fmt(row["lower_rsnm_mv"], 2)}</td><td>{row["status"]}</td></tr>')
-        if row["status"] == "BOUNDARY FOUND":
-            device_cells = "".join(
-                f'<td>{row[f"{label}_vt_v"]:.5g}</td><td>{row[f"{label}_idsat_ua"]:.5g}</td>'
-                for label in ("pul", "pur", "pgl", "pgr", "pdl", "pdr"))
-            full_boundary_rows.append(
-                f'<tr><td>{row["device"]} {row["parameter"]} {row["direction"].title()}</td>'
-                f'<td>{html.escape(row["failed_state"] or "N/A")}</td>{device_cells}</tr>')
-    device_headers = "".join(
-        f'<th>{label.upper()} Vt (V)</th><th>{label.upper()} Isat (uA)</th>'
-        for label in ("pul", "pur", "pgl", "pgr", "pdl", "pdr"))
-    report = out / "rsnm_mismatch_boundary_report.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Analysis - RSNM Mismatch Boundary</title>
-<style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1500px;margin:auto}}section{{background:#fff;border-radius:18px;padding:24px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:12px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3){{text-align:left}}th{{color:#6e6e73}}code{{background:#f2f2f7;padding:2px 6px;border-radius:5px}}</style></head><body><main>
-<h1>HV28 SRAM Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · SRAM VDD={analysis["vdd_v"]:.3f} V</p>
-<section><h2>RSNM Mismatch Boundary</h2><p>{html.escape(analysis["definition"])}</p>
-<p>Baseline Upper RSNM={analysis["baseline_upper_rsnm_mv"]:.2f} mV · Lower RSNM={analysis["baseline_lower_rsnm_mv"]:.2f} mV</p>
-<table><thead><tr><th>Device</th><th>Parameter</th><th>Direction</th><th>Baseline</th><th>Boundary</th><th>Unit</th><th>First zero state</th><th>Upper RSNM (mV)</th><th>Lower RSNM (mV)</th><th>Status</th></tr></thead><tbody>{''.join(body_rows)}</tbody></table></section>
-<section><h2>Complete 6T Boundary Values</h2><p>Values other than the swept parameter remain at the entered baseline.</p>
-<div style="overflow-x:auto"><table><thead><tr><th>Sweep</th><th>First zero state</th>{device_headers}</tr></thead><tbody>{''.join(full_boundary_rows)}</tbody></table></div>
-<p>Raw files: <code>rsnm_mismatch_boundaries.csv</code>, <code>rsnm_mismatch_boundaries.json</code>.</p></section>
-</main></body></html>''', encoding="utf-8")
-    return report
 
 
 def analyze_write_trip_margin_curve(points: list[RsnmVccPoint], cfg: Config,
@@ -3267,6 +3142,47 @@ def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list
     return rows
 
 
+def _linear_quantile(values: Iterable[float], probability: float) -> float:
+    """Return an inclusive, linearly interpolated population quantile."""
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise ValueError("A quantile requires at least one value")
+    q = min(max(float(probability), 0.0), 1.0)
+    position = (len(ordered) - 1) * q
+    low = int(math.floor(position))
+    high = int(math.ceil(position))
+    if low == high:
+        return ordered[low]
+    fraction = position - low
+    return ordered[low] * (1.0 - fraction) + ordered[high] * fraction
+
+
+def _midrank_percentile(values: Iterable[float], measured: float) -> float:
+    """Return a tie-aware 0..1 percentile rank within one wafer population."""
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    value = float(measured)
+    less = sum(item < value for item in ordered)
+    equal = sum(item == value for item in ordered)
+    return (less + 0.5 * equal) / len(ordered)
+
+
+def _robust_distribution(values: Iterable[float]) -> dict[str, float]:
+    """Summarize one wafer metric without relying on outlier-sensitive extrema."""
+    ordered = [float(value) for value in values]
+    median = _linear_quantile(ordered, .50)
+    deviations = [abs(value - median) for value in ordered]
+    return {
+        "p05": _linear_quantile(ordered, .05),
+        "q1": _linear_quantile(ordered, .25),
+        "median": median,
+        "q3": _linear_quantile(ordered, .75),
+        "p95": _linear_quantile(ordered, .95),
+        "mad": _linear_quantile(deviations, .50),
+    }
+
+
 def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     """Build same-VDD drive-balance shmoos and actionable target deltas."""
     shmoos: list[dict[str, object]] = []
@@ -3292,24 +3208,88 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
             sample["read_score"] = normalized["rsnm_mv"]
             sample["write_score"] = normalized["write_margin_mv"]
             sample["balanced_score"] = min(sample["read_score"], sample["write_score"])
+        distribution_fields = ("rsnm_mv", "write_margin_mv",
+                               "cell_ratio_beta", "pull_up_ratio_beta")
+        distributions = {
+            field: _robust_distribution(float(sample[field]) for sample in samples)
+            for field in distribution_fields
+        }
+        read_values = [float(sample["rsnm_mv"]) for sample in samples]
+        write_values = [float(sample["write_margin_mv"]) for sample in samples]
+        cr_values = [float(sample["cell_ratio_beta"]) for sample in samples]
+        pr_values = [float(sample["pull_up_ratio_beta"]) for sample in samples]
+        for sample in samples:
+            sample["read_percentile"] = _midrank_percentile(
+                read_values, float(sample["rsnm_mv"]))
+            sample["write_percentile"] = _midrank_percentile(
+                write_values, float(sample["write_margin_mv"]))
+            sample["cr_percentile"] = _midrank_percentile(
+                cr_values, float(sample["cell_ratio_beta"]))
+            sample["pr_percentile"] = _midrank_percentile(
+                pr_values, float(sample["pull_up_ratio_beta"]))
+            # The Shmoo grade follows the two plotted drive ratios, so a
+            # write-heavy lower-right or read-heavy upper-left cell cannot be
+            # colored green solely because one axis is strong.  Performance
+            # percentiles remain available to check whether this ratio proxy
+            # agrees with the modeled RSNM/Vtrip response.
+            sample["performance_grade_score"] = min(
+                sample["read_percentile"], sample["write_percentile"])
+            sample["wafer_grade_score"] = min(
+                sample["cr_percentile"], sample["pr_percentile"])
+            if sample["wafer_grade_score"] >= .50:
+                sample["wafer_grade"] = "preferred"
+            elif sample["wafer_grade_score"] >= .25:
+                sample["wafer_grade"] = "monitor"
+            else:
+                sample["wafer_grade"] = "low"
+            sample["robust_low_outlier"] = (
+                float(sample["rsnm_mv"]) < distributions["rsnm_mv"]["p05"] or
+                float(sample["write_margin_mv"]) < distributions["write_margin_mv"]["p05"])
+        population_medians = {
+            "cell_ratio_beta": statlib.median(float(sample["cell_ratio_beta"]) for sample in samples),
+            "pull_up_ratio_beta": statlib.median(float(sample["pull_up_ratio_beta"]) for sample in samples),
+        }
+        if all(all(field in sample for field in family_fields) for sample in samples):
+            population_medians.update({
+                field: statlib.median(float(sample[field]) for sample in samples)
+                for field in family_fields
+            })
+        for sample in samples:
+            for field, median_value in population_medians.items():
+                measured_value = float(sample[field])
+                sample[f"wafer_median_{field}"] = median_value
+                sample[f"delta_vs_median_{field}_pct"] = (
+                    100.0 * (measured_value - median_value) / abs(median_value)
+                    if abs(median_value) > 1e-15 else 0.0)
+            sample["read_balance_vs_median_pct"] = sample["delta_vs_median_cell_ratio_beta_pct"]
+            sample["write_balance_vs_median_pct"] = sample["delta_vs_median_pull_up_ratio_beta_pct"]
         best_score = max(float(sample["balanced_score"]) for sample in samples)
         best_sample = max(
             samples,
-            key=lambda sample: (float(sample["balanced_score"]),
-                                float(sample["read_score"]) + float(sample["write_score"])))
+            key=lambda sample: (float(sample["wafer_grade_score"]),
+                                float(sample["performance_grade_score"]),
+                                float(sample["balanced_score"])))
         best_cutoff = best_score * 0.90
         for sample in samples:
             sample["best_region"] = float(sample["balanced_score"]) >= best_cutoff
-        preferred = [sample for sample in samples if sample["best_region"]]
+        preferred = [sample for sample in samples
+                     if sample["wafer_grade"] == "preferred"]
+        if not preferred:
+            preferred = samples
         target_fields = ["cell_ratio_beta", "pull_up_ratio_beta"]
         if all(all(field in sample for field in family_fields) for sample in samples):
             target_fields.extend(family_fields)
-        target = {field: statlib.median(float(sample[field]) for sample in preferred)
+        # The center is the whole-wafer population median.  It is intentionally
+        # separate from the best measured cell and is not an absolute target.
+        target = {field: statlib.median(float(sample[field]) for sample in samples)
                   for field in target_fields}
-        target["chip_id"] = "PREFERRED_CENTER"
+        target["chip_id"] = "WAFER_MEDIAN_CENTER"
         target["balanced_score"] = statlib.median(
-            float(sample["balanced_score"]) for sample in preferred)
-        weakest = min(samples, key=lambda sample: float(sample["balanced_score"]))
+            float(sample["balanced_score"]) for sample in samples)
+        target["wafer_grade_score"] = statlib.median(
+            float(sample["wafer_grade_score"]) for sample in samples)
+        weakest = min(samples, key=lambda sample: (
+            float(sample["wafer_grade_score"]), float(sample["balanced_score"])))
         for sample in samples:
             sample["target_cr"] = target["cell_ratio_beta"]
             sample["target_pr"] = target["pull_up_ratio_beta"]
@@ -3321,14 +3301,20 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
         shmoos.append({"vdd_v": float(row["vdd_v"]), "samples": samples,
                         "best_score": best_score, "best_cutoff": best_cutoff,
                         "target": target, "best": best_sample, "weakest": weakest,
+                        "population_medians": population_medians,
+                        "distributions": distributions,
+                        "grade_thresholds": {"preferred": .50, "monitor": .25},
                         "has_family_wat": all(all(field in sample for field in family_fields)
                                               for sample in samples),
-                        "definition": ("Balanced score is the minimum of normalized RSNM and "
-                                       "BL Write Trip Margin within one Model VDD; residual WSNM "
-                                       "is reported separately as a write-eye diagnostic. "
-                                       "preferred region is at least 90% of the highest score. "
+                        "definition": ("Wafer grade is the smaller within-wafer percentile of "
+                                       "CR and PR at one Model VDD: "
+                                       "green >= P50, yellow P25-P50, red < P25. "
+                                       "RSNM and BL Write Trip Margin percentiles plus the balanced "
+                                       "max-normalized score are retained for correlation; "
+                                       "residual WSNM is reported separately. "
                                        "X=β_PG/β_PU=PR (right is easier write); "
-                                       "Y=β_PD/β_PG=CR (up is stronger read).")})
+                                       "Y=β_PD/β_PG=CR (up is stronger read). "
+                                       "This is relative screening, not absolute silicon Pass/Fail.")})
     return shmoos
 
 
@@ -3696,14 +3682,10 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
         return (left + (x - x_min) / (x_max - x_min) * plot_w,
                 top + (1 - (y - y_min) / (y_max - y_min)) * plot_h)
 
-    best_score = max(float(item["balanced_score"]) for item in samples)
-    cutoff = float(shmoo["best_cutoff"])
-
-    def background_color(score: float) -> str:
-        relative = score / best_score if best_score > 0 else 0.0
-        if relative >= .90:
+    def background_color(grade: str) -> str:
+        if grade == "preferred":
             return "#DDF3E2"
-        if relative >= .72:
+        if grade == "monitor":
             return "#FFF0C2"
         return "#F7C9C2"
 
@@ -3711,7 +3693,7 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
         f'<text x="{left}" y="48" fill="#111111" font-size="34" font-weight="700">Model VDD {shmoo["vdd_v"]:.3f} V - Read / Write Drive-Balance Shmoo</text>',
-        f'<text x="{left}" y="76" fill="#626B73" font-size="15">Relative ranking within this VDD only | {len(samples)} measured cells | not silicon Pass/Fail</text>',
+        f'<text x="{left}" y="76" fill="#626B73" font-size="15">CR/PR population P25 / median grading within this VDD | {len(samples)} measured cells | not silicon Pass/Fail</text>',
         f'<rect x="{left}" y="{top}" width="{plot_w}" height="{plot_h}" fill="#FAFAFA" stroke="#AEB7C0"/>',
     ]
 
@@ -3725,16 +3707,16 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
             nearest = min(samples, key=lambda item: (
                 ((gx_value - float(item[x_key])) / (x_max - x_min)) ** 2 +
                 ((gy_value - float(item[y_key])) / (y_max - y_min)) ** 2))
-            score = float(nearest["balanced_score"])
-            preferred_row.append(score >= cutoff)
+            grade = str(nearest["wafer_grade"])
+            preferred_row.append(grade == "preferred")
             parts.append(
                 f'<rect x="{left + gx_index * plot_w / grid_cols:.1f}" '
                 f'y="{top + gy_index * plot_h / grid_rows:.1f}" '
                 f'width="{plot_w / grid_cols + .5:.1f}" height="{plot_h / grid_rows + .5:.1f}" '
-                f'fill="{background_color(score)}"/>')
+                f'fill="{background_color(grade)}"/>')
         preferred_grid.append(preferred_row)
 
-    # Outline transitions into/out of the >=90% nearest-cell region.  This
+    # Outline transitions into/out of the P50/P50 nearest-cell region.  This
     # preserves the current empirical classification without implying a
     # physically simulated continuous contour.
     boundary_paths = []
@@ -3767,6 +3749,10 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
     sample_positions = [xy(float(item[x_key]), float(item[y_key])) for item in samples]
     for sample_index, (item, (x, y)) in enumerate(zip(samples, sample_positions), 1):
         score = float(item["balanced_score"])
+        read_delta = float(item.get("read_balance_vs_median_pct", 0.0))
+        write_delta = float(item.get("write_balance_vs_median_pct", 0.0))
+        read_direction = "stronger" if read_delta > .05 else ("weaker" if read_delta < -.05 else "near median")
+        write_direction = "stronger" if write_delta > .05 else ("weaker" if write_delta < -.05 else "near median")
         tooltip_rows = [
             f'Cell: {item["chip_id"]} ({sample_index}/{len(samples)})',
             f'Lot/Wafer: {item["lot_wafer"]}',
@@ -3774,15 +3760,24 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
             f'RSNM: {float(item.get("rsnm_mv", 0.0)):.1f} mV',
             f'BL Write Vtrip: {float(item.get("write_margin_mv", 0.0)):.1f} mV',
             f'Balanced score: {score:.3f}',
+            f'Wafer relative grade: {str(item.get("wafer_grade", "unknown")).upper()}',
+            f'CR drive percentile: P{100.0 * float(item.get("cr_percentile", 0.0)):.0f}',
+            f'PR drive percentile: P{100.0 * float(item.get("pr_percentile", 0.0)):.0f}',
+            f'RSNM performance percentile: P{100.0 * float(item.get("read_percentile", 0.0)):.0f}',
+            f'Vtrip performance percentile: P{100.0 * float(item.get("write_percentile", 0.0)):.0f}',
             f'CR = β_PD/β_PG: {float(item["cell_ratio_beta"]):.3f}',
             f'PR = β_PG/β_PU: {float(item["pull_up_ratio_beta"]):.3f}',
+            f'Read balance vs median: {read_delta:+.1f}% ({read_direction})',
+            f'Write balance vs median: {write_delta:+.1f}% ({write_direction})',
         ]
         for family, family_name in (("pu", "PU"), ("pg", "PG"), ("pd", "PD")):
             vt_key, idsat_key = f"{family}_vt_v", f"{family}_idsat_ua"
             if vt_key in item and idsat_key in item:
                 tooltip_rows.append(
-                    f'{family_name}: Vt {float(item[vt_key]):.4f} V / '
-                    f'Idsat {float(item[idsat_key]):.3f} µA')
+                    f'{family_name}: Vt {float(item[vt_key]):.4f} V '
+                    f'(Δmed {float(item.get(f"delta_vs_median_{vt_key}_pct", 0.0)):+.1f}%) / '
+                    f'Idsat {float(item[idsat_key]):.3f} µA '
+                    f'(Δmed {float(item.get(f"delta_vs_median_{idsat_key}_pct", 0.0)):+.1f}%)')
         tooltip_text = " | ".join(tooltip_rows)
         tooltip_attr = html.escape(tooltip_text, quote=True)
         parts.append(
@@ -3799,7 +3794,7 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
     bx, by = xy(float(best[x_key]), float(best[y_key]))
     weak = shmoo["weakest"]
     wx, wy = xy(float(weak[x_key]), float(weak[y_key]))
-    preferred_text = "Preferred center"
+    preferred_text = "Wafer median center"
     best_text = f'Best measured: {html.escape(str(best["chip_id"]))}'
     weak_text = f'Weakest: {html.escape(str(weak["chip_id"]))}'
     label_positions = _place_chart_labels(
@@ -3844,13 +3839,14 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
     parts += [
         f'<text x="{side_x}" y="132" fill="#20262D" font-size="24" font-weight="700">HOW TO READ</text>',
         f'<rect x="{side_x}" y="154" width="280" height="210" rx="16" fill="#F5F7F9" stroke="#DCE1E6"/>',
-        f'<text x="{side_x + 22}" y="198" fill="#20262D" font-size="17" font-weight="700">Balanced score</text>',
-        f'<text x="{side_x + 22}" y="244" fill="#303941" font-size="16">R_i = RSNM_i / RSNM_max</text>',
-        f'<text x="{side_x + 22}" y="276" fill="#303941" font-size="16">W_i = Vtrip_i / Vtrip_max</text>',
-        f'<text x="{side_x + 22}" y="322" fill="#303941" font-size="17" font-style="italic">Score_i = min(R_i, W_i)</text>',
+        f'<text x="{side_x + 22}" y="198" fill="#20262D" font-size="17" font-weight="700">Wafer-relative grade</text>',
+        f'<text x="{side_x + 22}" y="244" fill="#303941" font-size="16">R_pct = percentile(CR)</text>',
+        f'<text x="{side_x + 22}" y="276" fill="#303941" font-size="16">W_pct = percentile(PR)</text>',
+        f'<text x="{side_x + 22}" y="322" fill="#303941" font-size="17" font-style="italic">Grade = min(R_pct, W_pct)</text>',
         f'<rect x="{side_x}" y="382" width="280" height="126" rx="16" fill="#F5EFFA" stroke="#D8C8E6"/>',
-        f'<text x="{side_x + 22}" y="424" fill="#61308C" font-size="17" font-weight="700">Preferred threshold</text>',
-        f'<text x="{side_x + 22}" y="466" fill="#61308C" font-size="16">Score &gt;= 90% of best = {cutoff:.3f}</text>',
+        f'<text x="{side_x + 22}" y="424" fill="#61308C" font-size="17" font-weight="700">Dynamic wafer thresholds</text>',
+        f'<text x="{side_x + 22}" y="456" fill="#61308C" font-size="16">Preferred: both metrics &gt;= P50</text>',
+        f'<text x="{side_x + 22}" y="482" fill="#61308C" font-size="16">Monitor: weaker metric P25-P50</text>',
         f'<text x="{side_x}" y="550" fill="#20262D" font-size="17" font-weight="700">COLOR SCALE</text>',
         f'<text x="{side_x}" y="583" fill="#535D66" font-size="15">Each region inherits the score</text>',
         f'<text x="{side_x}" y="608" fill="#535D66" font-size="15">of the nearest measured cell.</text>',
@@ -3859,14 +3855,14 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
     ]
     legend_y = 690
     parts += [
-        f'<rect x="{side_x + 2}" y="{legend_y - 10}" width="17" height="17" fill="#DDF3E2"/><text x="{side_x + 34}" y="{legend_y + 4}" fill="#20262D" font-size="14">Best region (≥90%)</text>',
-        f'<rect x="{side_x + 2}" y="{legend_y + 17}" width="17" height="17" fill="#FFF0C2"/><text x="{side_x + 34}" y="{legend_y + 31}" fill="#20262D" font-size="14">Next region (72–90%)</text>',
-        f'<rect x="{side_x + 2}" y="{legend_y + 44}" width="17" height="17" fill="#F7C9C2"/><text x="{side_x + 34}" y="{legend_y + 58}" fill="#20262D" font-size="14">Lowest region (&lt;72%)</text>',
+        f'<rect x="{side_x + 2}" y="{legend_y - 10}" width="17" height="17" fill="#DDF3E2"/><text x="{side_x + 34}" y="{legend_y + 4}" fill="#20262D" font-size="14">Preferred (both ≥ P50)</text>',
+        f'<rect x="{side_x + 2}" y="{legend_y + 17}" width="17" height="17" fill="#FFF0C2"/><text x="{side_x + 34}" y="{legend_y + 31}" fill="#20262D" font-size="14">Monitor (weaker P25-P50)</text>',
+        f'<rect x="{side_x + 2}" y="{legend_y + 44}" width="17" height="17" fill="#F7C9C2"/><text x="{side_x + 34}" y="{legend_y + 58}" fill="#20262D" font-size="14">Low (weaker &lt; P25)</text>',
         f'<circle cx="{side_x + 10}" cy="{legend_y + 85}" r="6" fill="#26323D"/><text x="{side_x + 34}" y="{legend_y + 90}" fill="#20262D" font-size="14">Measured cell</text>',
         f'<polygon points="{side_x + 10},{legend_y + 103} {side_x + 19},{legend_y + 112} {side_x + 10},{legend_y + 121} {side_x + 1},{legend_y + 112}" fill="#FFC447" stroke="#8A5A00" stroke-width="1.5"/><text x="{side_x + 34}" y="{legend_y + 117}" fill="#20262D" font-size="14">Best measured cell</text>',
-        f'<path d="M{side_x + 1} {legend_y + 139}H{side_x + 19}M{side_x + 10} {legend_y + 130}V{legend_y + 148}" stroke="#61308C" stroke-width="4"/><text x="{side_x + 34}" y="{legend_y + 144}" fill="#20262D" font-size="14">Preferred center</text>',
+        f'<path d="M{side_x + 1} {legend_y + 139}H{side_x + 19}M{side_x + 10} {legend_y + 130}V{legend_y + 148}" stroke="#61308C" stroke-width="4"/><text x="{side_x + 34}" y="{legend_y + 144}" fill="#20262D" font-size="14">Wafer median center</text>',
         f'<rect x="{side_x + 3}" y="{legend_y + 159}" width="14" height="14" fill="#E4513B"/><text x="{side_x + 34}" y="{legend_y + 171}" fill="#20262D" font-size="14">Weakest sample</text>',
-        f'<path d="M{side_x} {legend_y + 198}H{side_x + 22}" stroke="#61308C" stroke-width="2.5" stroke-dasharray="7 5"/><text x="{side_x + 34}" y="{legend_y + 203}" fill="#20262D" font-size="14">90% relative boundary</text>',
+        f'<path d="M{side_x} {legend_y + 198}H{side_x + 22}" stroke="#61308C" stroke-width="2.5" stroke-dasharray="7 5"/><text x="{side_x + 34}" y="{legend_y + 203}" fill="#20262D" font-size="14">P50/P50 relative boundary</text>',
     ]
     parts.append('</svg>')
     return "".join(parts)
@@ -3996,13 +3992,26 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                         bg=None, backend="rlPyCairo", backendFmt="RGBA")
     shmoo_sections = []
     shmoo_fields = ["vdd_v", "lot_wafer", "chip_id", "read_score", "write_score",
-                    "balanced_score", "best_region",
+                    "balanced_score", "best_region", "read_percentile", "write_percentile",
+                    "cr_percentile", "pr_percentile", "performance_grade_score",
+                    "wafer_grade_score", "wafer_grade",
+                    "robust_low_outlier",
                     "cell_ratio_beta", "pull_up_ratio_beta",
                     "target_cr", "target_pr", "delta_cr", "delta_pr",
+                    "read_balance_vs_median_pct", "write_balance_vs_median_pct",
                     "pu_vt_v", "pu_idsat_ua", "delta_pu_vt_v", "delta_pu_idsat_ua",
                     "pg_vt_v", "pg_idsat_ua", "pd_vt_v", "pd_idsat_ua",
                     "delta_pg_vt_v", "delta_pg_idsat_ua", "delta_pd_vt_v", "delta_pd_idsat_ua",
+                    "delta_vs_median_pu_vt_v_pct", "delta_vs_median_pu_idsat_ua_pct",
+                    "delta_vs_median_pg_vt_v_pct", "delta_vs_median_pg_idsat_ua_pct",
+                    "delta_vs_median_pd_vt_v_pct", "delta_vs_median_pd_idsat_ua_pct",
                     "rsnm_mv", "wsnm_mv", "write_margin_mv"]
+    statistics_fields = ["vdd_v", "metric", "p05", "q1", "median",
+                         "q3", "p95", "mad"]
+    statistics_stream = (out / "estimate_vmin_wafer_distribution_statistics.csv").open(
+        "w", newline="", encoding="utf-8-sig")
+    statistics_writer = csv.DictWriter(statistics_stream, fieldnames=statistics_fields)
+    statistics_writer.writeheader()
     with (out / "estimate_vmin_cr_pr_shmoo.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=shmoo_fields); writer.writeheader()
         for index, shmoo in enumerate(analysis.get("ratio_shmoos", []), 1):
@@ -4018,12 +4027,12 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                                 dpi=180, backend="rlPyCairo")
             shmoo_sections.append(
                 f'<section><h2>Model VDD {shmoo["vdd_v"]:.3f} V — Drive-Balance Shmoo</h2>'
-                f'<p class="note">Preferred-region center: CR={shmoo["target"]["cell_ratio_beta"]:.3f}; '
+                f'<p class="note">Whole-wafer median center: CR={shmoo["target"]["cell_ratio_beta"]:.3f}; '
                 f'PR=βPG/βPU={shmoo["target"]["pull_up_ratio_beta"]:.3f}. '
                 f'Best measured cell: {html.escape(str(shmoo["best"]["chip_id"]))} '
                 f'(Score={float(shmoo["best"]["balanced_score"]):.3f}). '
                 'Move the pointer over a measured cell to inspect its WAT and margin values. '
-                'Color regions are relative screening within this VDD, not silicon Pass/Fail.</p>'
+                'Color regions use the weaker CR/PR population percentile: green ≥P50, yellow P25–P50, red &lt;P25. RSNM and BL-Vtrip percentiles remain available for correlation. These are relative screening within this VDD, not silicon Pass/Fail.</p>'
                 f'<div class="interactive-shmoo">{shmoo_svg_text}</div>'
                 f'<p class="note">Downloads: <a href="images/{svg_name}">interactive SVG</a> · '
                 f'<a href="images/{png_name}">PNG</a></p></section>')
@@ -4031,6 +4040,10 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                 record = {key: sample.get(key, "") for key in shmoo_fields}
                 record["vdd_v"] = shmoo["vdd_v"]
                 writer.writerow(record)
+            for metric, values in shmoo["distributions"].items():
+                statistics_writer.writerow({"vdd_v": shmoo["vdd_v"], "metric": metric,
+                                             **values})
+    statistics_stream.close()
     with (out / "multi_chip_snm_summary_combined.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         fields = ["vdd_v", "sample_count"] + [field for key, *_ in _ESTIMATE_VMIN_METRICS
                   for field in (key, f"{key}_lot_wafer", f"{key}_chip_id")]
@@ -4066,9 +4079,11 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 .tooltip-device-name{{font-size:14px;font-weight:700;color:#fff;padding-bottom:5px;margin-bottom:1px;border-bottom:1px solid #47474c}}
 .tooltip-device-value{{display:flex;justify-content:space-between;gap:16px;color:#fff}}
 .tooltip-device-label{{color:#aeb0b5}}
+.tooltip-device-reading{{display:flex;align-items:baseline;gap:8px;text-align:right}}
+.tooltip-device-delta{{color:#ffd60a;font-size:11px;font-weight:700}}
 </style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1>
 <p class="note">{html.escape(analysis["definition"])}</p>
-<p class="note">Drive-Balance scoring uses the minimum of normalized RSNM (read stability) and BL Write Trip Margin (write ability) at each Model VDD. Residual WSNM remains a separate write-eye diagnostic and is not scored as larger-is-better. X=βPG/βPU=PR (right improves write); Y=βPD/βPG=CR (up improves read). Green, yellow and red show relative performance bands within the imported cells.</p>
+<p class="note">At each Model VDD, every cell is ranked by its CR percentile and PR percentile; the weaker drive-ratio percentile determines its wafer-relative grade. Green means both are at or above the median, yellow means the weaker ratio is P25–P50, and red means it is below P25. RSNM and BL Write Trip Margin percentiles are retained for correlation, while residual WSNM remains a separate diagnostic. X=βPG/βPU=PR (right improves write); Y=βPD/βPG=CR (up improves read). These colors are not absolute silicon Pass/Fail.</p>
 {sections}
 <p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. Per-cell target deltas: <code>estimate_vmin_cr_pr_shmoo.csv</code>.</p>
 </main><div id="cell-tooltip" role="tooltip"></div>
@@ -4102,15 +4117,16 @@ const renderCellTooltip=(raw)=>{{
     }});
     cellTooltip.appendChild(metrics);
   }};
-  appendMetricSection('Performance',rows.slice(3,6));
-  appendMetricSection('Drive ratios',rows.slice(6,8));
-  const devices=rows.slice(8);
+  appendMetricSection('Performance and wafer-relative grade',rows.slice(3,11));
+  appendMetricSection('Drive ratios',rows.slice(11,13));
+  appendMetricSection('Balance vs same-VDD median',rows.slice(13,15));
+  const devices=rows.slice(15);
   if(devices.length){{
     cellTooltip.appendChild(makeTooltipNode('tooltip-section-label','Device WAT · PU → PG → PD'));
     const list=document.createElement('div');
     list.className='tooltip-device-list';
     devices.forEach((text)=>{{
-      const match=text.match(/^(PU|PG|PD): Vt ([^ ]+) V \\/ Idsat ([^ ]+) µA$/);
+      const match=text.match(/^(PU|PG|PD): Vt ([^ ]+) V \\(Δmed ([^)]+)\\) \\/ Idsat ([^ ]+) µA \\(Δmed ([^)]+)\\)$/);
       if(match){{
         const card=document.createElement('div');
         card.className='tooltip-device-card';
@@ -4119,12 +4135,20 @@ const renderCellTooltip=(raw)=>{{
         const vt=document.createElement('div');
         vt.className='tooltip-device-value';
         vt.appendChild(makeTooltipNode('tooltip-device-label','Vt'));
-        vt.appendChild(makeTooltipNode('',match[2]+' V'));
+        const vtReading=document.createElement('div');
+        vtReading.className='tooltip-device-reading';
+        vtReading.appendChild(makeTooltipNode('',match[2]+' V'));
+        vtReading.appendChild(makeTooltipNode('tooltip-device-delta',match[3]));
+        vt.appendChild(vtReading);
         card.appendChild(vt);
         const idsat=document.createElement('div');
         idsat.className='tooltip-device-value';
         idsat.appendChild(makeTooltipNode('tooltip-device-label','Idsat'));
-        idsat.appendChild(makeTooltipNode('',match[3]+' µA'));
+        const idsatReading=document.createElement('div');
+        idsatReading.className='tooltip-device-reading';
+        idsatReading.appendChild(makeTooltipNode('',match[4]+' µA'));
+        idsatReading.appendChild(makeTooltipNode('tooltip-device-delta',match[5]));
+        idsat.appendChild(idsatReading);
         card.appendChild(idsat);
         list.appendChild(card);
       }}else{{
@@ -5740,6 +5764,36 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         if drawing is None:
             raise RuntimeError("Could not render multi-chip VTC overlay")
         renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
+    relative_shmoo = analysis["relative_shmoo"]
+    shmoo_svg_name = "03_multi_cell_wafer_relative_shmoo.svg"
+    shmoo_png_name = "03_multi_cell_wafer_relative_shmoo.png"
+    shmoo_svg_path = image_dir / shmoo_svg_name
+    shmoo_svg_path.write_text(estimate_vmin_ratio_shmoo_svg(relative_shmoo), encoding="utf-8")
+    shmoo_drawing = svg2rlg(str(shmoo_svg_path))
+    if shmoo_drawing is None:
+        raise RuntimeError("Could not render Multi-Cell wafer-relative shmoo")
+    renderPM.drawToFile(shmoo_drawing, str(image_dir / shmoo_png_name), fmt="PNG",
+                        dpi=180, backend="rlPyCairo")
+    relative_fields = [
+        "lot_wafer", "chip_id", "rsnm_mv", "write_margin_mv",
+        "cell_ratio_beta", "pull_up_ratio_beta", "read_percentile",
+        "write_percentile", "cr_percentile", "pr_percentile",
+        "performance_grade_score", "wafer_grade_score", "wafer_grade",
+        "robust_low_outlier",
+    ]
+    with (out / "multi_cell_wafer_relative_grades.csv").open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=relative_fields)
+        writer.writeheader()
+        writer.writerows({key: sample.get(key, "") for key in relative_fields}
+                         for sample in relative_shmoo["samples"])
+    with (out / "multi_cell_wafer_distribution_statistics.csv").open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        fields = ["metric", "p05", "q1", "median", "q3", "p95", "mad"]
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for metric, statistics in relative_shmoo["distributions"].items():
+            writer.writerow({"metric": metric, **statistics})
     def family_average(row: dict, family: str, attribute: str) -> float:
         cell = row["cell"]
         return (float(getattr(getattr(cell, f"{family}1"), attribute)) +
@@ -5770,11 +5824,17 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         with open(out / f"median_target_{name}_shmoo.csv", "w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(shmoo["rows"][0]))
             writer.writeheader(); writer.writerows(shmoo["rows"])
+    relative_by_chip = {str(sample["chip_id"]): sample
+                        for sample in relative_shmoo["samples"]}
     body = "".join(
         f'<tr><td>{html.escape(row["chip_id"])}</td><td>{row["upper_rsnm_mv"]:.2f}</td>'
         f'<td>{row["lower_rsnm_mv"]:.2f}</td><td>{row["rsnm_mv"]:.2f}</td>'
         f'<td>{row["write_margin_mv"]:.2f}</td><td>{row["cell_ratio_beta"]:.3f}</td>'
-        f'<td>{row["pull_up_ratio_beta"]:.3f}</td></tr>' for row in analysis["rows"])
+        f'<td>{row["pull_up_ratio_beta"]:.3f}</td>'
+        f'<td>{100.0 * float(relative_by_chip[row["chip_id"]]["cr_percentile"]):.1f}</td>'
+        f'<td>{100.0 * float(relative_by_chip[row["chip_id"]]["pr_percentile"]):.1f}</td>'
+        f'<td>{html.escape(str(relative_by_chip[row["chip_id"]]["wafer_grade"]).upper())}</td></tr>'
+        for row in analysis["rows"])
     median = analysis["median_cell"]
 
     def recommendation_rows(shmoo: dict) -> str:
@@ -5792,7 +5852,17 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
     backup_note = (f'<p class="note">Imported 6T Vt/Idsat backup: <code>{backup_name}</code>. '
                    'This is the original workbook used for this run.</p>'
                    if input_excel_path is not None else '')
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Wafer Multi-Cell Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}.note{{color:#6e6e73}}.warn{{color:#c2410c;font-weight:bold}}</style></head><body><main><h1>HV28 SRAM Wafer Multi-Cell Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} measured cells · Model VDD={analysis["vdd_v"]:.3f} V</p>{backup_note}<section><h2>Conservative wafer reference</h2><p><b>Minimum cell RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum Write Margin:</b> {analysis["worst_write_margin"]["write_margin_mv"]:.2f} mV ({html.escape(analysis["worst_write_margin"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Synthetic median reference cell</h2><p>The median cell is built from the per-device median Vt and Idsat values. It is a statistical reference and may not be a physically measured cell.</p><table><tr><th>RSNM</th><th>Write Margin</th><th>Cell Ratio (CR)</th><th>Pull-up Ratio (PR)</th></tr><tr><td>{median["rsnm_mv"]:.2f} mV</td><td>{median["write_margin_mv"]:.2f} mV</td><td>{median["cell_ratio_beta"]:.3f}</td><td>{median["pull_up_ratio_beta"]:.3f}</td></tr></table></section><section><h2>Worst-to-median adjustment screening</h2><p class="note">Each shmoo moves both devices of one family, one parameter at a time, from the worst cell toward its physical-MOS median in 10% steps. It is a direction-finding compact-model screening, not a simultaneous process correction.</p><h3>Read target: median RSNM = {read_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_rsnm"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(read_shmoo)}</table><h3>Write target: median Write Margin = {write_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_write_margin"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(write_shmoo)}</table><p class="note">Detailed sweep data: <code>median_target_read_shmoo.csv</code> and <code>median_target_write_shmoo.csv</code>.</p></section><section><h2>Read VTC / Mirror VTC</h2><p>Upper and Lower squares are each taken from their own state-limiting cell. Their direct/mirrored VTC pair is highlighted together; the two states are not combined into one artificial cell. The overlay card lists the complete six-MOS Vt/Idsat set for the cell that owns the minimum RSNM.</p><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><p>The overlay card lists the complete six-MOS Vt/Idsat set for the cell that owns the minimum WSNM.</p><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-cell margins</h2><table><tr><th>Cell / Chip ID</th><th>Upper RSNM</th><th>Lower RSNM</th><th>RSNM</th><th>Write Margin</th><th>CR</th><th>PR</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
+    grade_counts = {
+        grade: sum(sample["wafer_grade"] == grade for sample in relative_shmoo["samples"])
+        for grade in ("preferred", "monitor", "low")
+    }
+    statistics_rows = "".join(
+        f'<tr><td>{html.escape(metric)}</td><td>{values["p05"]:.4g}</td>'
+        f'<td>{values["q1"]:.4g}</td><td>{values["median"]:.4g}</td>'
+        f'<td>{values["q3"]:.4g}</td><td>{values["p95"]:.4g}</td>'
+        f'<td>{values["mad"]:.4g}</td></tr>'
+        for metric, values in relative_shmoo["distributions"].items())
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Wafer Multi-Cell Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}.note{{color:#6e6e73}}.warn{{color:#c2410c;font-weight:bold}}</style></head><body><main><h1>HV28 SRAM Wafer Multi-Cell Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} measured cells · Model VDD={analysis["vdd_v"]:.3f} V</p>{backup_note}<section><h2>Conservative wafer reference</h2><p><b>Minimum cell RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum Write Margin:</b> {analysis["worst_write_margin"]["write_margin_mv"]:.2f} mV ({html.escape(analysis["worst_write_margin"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Wafer-relative quartile Shmoo</h2><p>At this fixed VDD, Read drive is ranked from CR and Write drive from PR. The lower drive percentile controls the grade: <b>Preferred</b> ≥ P50, <b>Monitor</b> P25–P50, and <b>Low</b> &lt; P25. RSNM and BL Write Margin percentiles are retained separately for correlation. This is an intra-wafer screening reference, not absolute silicon Pass/Fail.</p><p><b>Preferred:</b> {grade_counts["preferred"]} · <b>Monitor:</b> {grade_counts["monitor"]} · <b>Low:</b> {grade_counts["low"]}</p><img src="images/{shmoo_png_name}" alt="Wafer-relative CR PR quartile shmoo"><h3>Robust distribution statistics</h3><table><tr><th>Metric</th><th>P5</th><th>Q1</th><th>Median</th><th>Q3</th><th>P95</th><th>MAD</th></tr>{statistics_rows}</table><p class="note">Detailed outputs: <code>multi_cell_wafer_relative_grades.csv</code> and <code>multi_cell_wafer_distribution_statistics.csv</code>.</p></section><section><h2>Synthetic median reference cell</h2><p>The median cell is built from the per-device median Vt and Idsat values. It is a statistical reference and may not be a physically measured cell.</p><table><tr><th>RSNM</th><th>Write Margin</th><th>Cell Ratio (CR)</th><th>Pull-up Ratio (PR)</th></tr><tr><td>{median["rsnm_mv"]:.2f} mV</td><td>{median["write_margin_mv"]:.2f} mV</td><td>{median["cell_ratio_beta"]:.3f}</td><td>{median["pull_up_ratio_beta"]:.3f}</td></tr></table></section><section><h2>Worst-to-median adjustment screening</h2><p class="note">Each shmoo moves both devices of one family, one parameter at a time, from the worst cell toward its physical-MOS median in 10% steps. It is a direction-finding compact-model screening, not a simultaneous process correction.</p><h3>Read target: median RSNM = {read_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_rsnm"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(read_shmoo)}</table><h3>Write target: median Write Margin = {write_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_write_margin"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(write_shmoo)}</table><p class="note">Detailed sweep data: <code>median_target_read_shmoo.csv</code> and <code>median_target_write_shmoo.csv</code>.</p></section><section><h2>Read VTC / Mirror VTC</h2><p>Upper and Lower squares are each taken from their own state-limiting cell. Their direct/mirrored VTC pair is highlighted together; the two states are not combined into one artificial cell. The overlay card lists the complete six-MOS Vt/Idsat set for the cell that owns the minimum RSNM.</p><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><p>The overlay card lists the complete six-MOS Vt/Idsat set for the cell that owns the minimum WSNM.</p><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-cell margins and wafer-relative grade</h2><table><tr><th>Cell / Chip ID</th><th>Upper RSNM</th><th>Lower RSNM</th><th>RSNM</th><th>Write Margin</th><th>CR</th><th>PR</th><th>CR pct.</th><th>PR pct.</th><th>Grade</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
     return report
 
 
@@ -6436,12 +6506,10 @@ def launch_gui() -> None:
     bitcell_tab = ttk.Frame(notebook, style="Root.TFrame")
     curve_tab = ttk.Frame(notebook, style="Root.TFrame")
     write_margin_tab = ttk.Frame(notebook, style="Root.TFrame")
-    mismatch_boundary_tab = ttk.Frame(notebook, style="Root.TFrame")
     training_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
     notebook.add(curve_tab, text="Estimate Vmin Curve")
-    notebook.add(mismatch_boundary_tab, text="RSNM Mismatch Boundary")
-    notebook.add(training_tab, text="SRAM Training Lab")
+    notebook.add(training_tab, text="6T Drive Monitor")
 
     # Interactive educational view.  The controls intentionally use the same
     # compact WAT-calibrated model as the main analysis, while making it clear
@@ -6453,10 +6521,10 @@ def launch_gui() -> None:
     training_output_card = ttk.Frame(training_tab, style="Card.TFrame", padding=20)
     training_input_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
     training_output_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-    ttk.Label(training_input_card, text="SRAM Training Lab", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(training_input_card, text="6T Drive Monitor", style="Section.TLabel").pack(anchor="w")
     ttk.Label(
         training_input_card,
-        text="Move a Vt or Idsat slider to observe the 6T read/write trade-off. Values update immediately.",
+        text="Adjust PU / PG / PD Vt or Idsat to monitor the 6T read/write drive-balance trend in real time.",
         style="Meta.TLabel", wraplength=390).pack(anchor="w", pady=(3, 16))
 
     training_defaults = {
@@ -6494,20 +6562,113 @@ def launch_gui() -> None:
 
     ttk.Label(
         training_input_card,
-        text="Teaching model only: slider results show relative 6T trends. Use PDK simulation and measured WT for sign-off.",
+        text="Trend monitor only: results show relative 6T drive changes. Use PDK simulation and measured WT for sign-off.",
         style="Meta.TLabel", wraplength=390).pack(anchor="w", pady=(16, 0))
 
     ttk.Label(training_output_card, text="Live 6T Trend", style="ChartTitle.TLabel").pack(anchor="w")
     training_summary = tk.Label(training_output_card, bg=CARD, fg=SECONDARY,
                                 font=("Calibri", 10), anchor="w", justify="left")
     training_summary.pack(anchor="w", pady=(2, 8))
-    training_canvas = tk.Canvas(training_output_card, bg=CARD, highlightthickness=0, height=460)
-    training_canvas.pack(fill="both", expand=True)
+    training_canvas = tk.Canvas(training_output_card, bg=CARD, highlightthickness=0, height=300)
+    training_canvas.pack(fill="x")
+    ttk.Separator(training_output_card, orient="horizontal").pack(fill="x", pady=(4, 10))
+    ttk.Label(training_output_card, text="Statistical CR / PR Shmoo",
+              style="ChartTitle.TLabel").pack(anchor="w")
+    training_shmoo_summary = tk.Label(
+        training_output_card, bg=CARD, fg=SECONDARY, font=("Calibri", 9),
+        anchor="w", justify="left")
+    training_shmoo_summary.pack(anchor="w", pady=(2, 4))
+    training_shmoo_canvas = tk.Canvas(
+        training_output_card, bg=CARD, highlightthickness=0, height=300)
+    training_shmoo_canvas.pack(fill="both", expand=True)
+
+    def draw_drive_monitor_shmoo(data: dict[str, object]) -> None:
+        reference = drive_monitor_shmoo_reference(training_values["vdd"].get())
+        cr_stats = reference["cr"]
+        pr_stats = reference["pr"]
+        current_cr = float(data["cell_ratio"])
+        current_pr = float(data["pull_up_ratio"])
+        if current_cr >= cr_stats["median"] and current_pr >= pr_stats["median"]:
+            grade, grade_color = "PREFERRED", GREEN
+        elif current_cr >= cr_stats["q1"] and current_pr >= pr_stats["q1"]:
+            grade, grade_color = "MONITOR", "#B77900"
+        else:
+            grade, grade_color = "LOW", RED
+        training_shmoo_summary.configure(
+            text=(f"Auto target @ {reference['vdd_v']:.2f} V · "
+                  f"Median CR {cr_stats['median']:.3f} / PR {pr_stats['median']:.3f} · "
+                  f"Current {grade}"), fg=grade_color)
+
+        canvas = training_shmoo_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 620)
+        height = max(canvas.winfo_height(), 280)
+        left, top, right, bottom = 72.0, 22.0, width - 28.0, height - 54.0
+        x_min = min(pr_stats["p05"], current_pr) * .94
+        x_max = max(pr_stats["p95"], current_pr) * 1.06
+        y_min = min(cr_stats["p05"], current_cr) * .94
+        y_max = max(cr_stats["p95"], current_cr) * 1.06
+        if x_max <= x_min:
+            x_max = x_min + .1
+        if y_max <= y_min:
+            y_max = y_min + .1
+
+        def plot_xy(pr_value: float, cr_value: float) -> tuple[float, float]:
+            x = left + (pr_value - x_min) / (x_max - x_min) * (right - left)
+            y = bottom - (cr_value - y_min) / (y_max - y_min) * (bottom - top)
+            return x, y
+
+        # Nested rectangles intentionally require both axes to reach the same
+        # quartile. This keeps upper-left and lower-right trade-off cells from
+        # being marked green on the strength of only one ratio.
+        canvas.create_rectangle(left, top, right, bottom, fill="#FBE4E1", outline=BORDER)
+        q1_x, q1_y = plot_xy(pr_stats["q1"], cr_stats["q1"])
+        med_x, med_y = plot_xy(pr_stats["median"], cr_stats["median"])
+        canvas.create_rectangle(q1_x, top, right, q1_y, fill="#FFF0C2", outline="")
+        canvas.create_rectangle(med_x, top, right, med_y, fill="#DDF3E2", outline="")
+
+        for fraction in (0.0, .25, .50, .75, 1.0):
+            gx = left + fraction * (right - left)
+            gy = top + fraction * (bottom - top)
+            x_value = x_min + fraction * (x_max - x_min)
+            y_value = y_max - fraction * (y_max - y_min)
+            canvas.create_line(gx, top, gx, bottom, fill="#D8DEE4")
+            canvas.create_line(left, gy, right, gy, fill="#D8DEE4")
+            canvas.create_text(gx, bottom + 18, text=f"{x_value:.2f}",
+                               fill=SECONDARY, font=("Calibri", 9))
+            canvas.create_text(left - 10, gy, text=f"{y_value:.2f}", anchor="e",
+                               fill=SECONDARY, font=("Calibri", 9))
+
+        canvas.create_line(q1_x, top, q1_x, bottom, fill="#B77900", dash=(5, 4), width=2)
+        canvas.create_line(left, q1_y, right, q1_y, fill="#B77900", dash=(5, 4), width=2)
+        canvas.create_line(med_x, top, med_x, bottom, fill="#248A3D", dash=(6, 4), width=2)
+        canvas.create_line(left, med_y, right, med_y, fill="#248A3D", dash=(6, 4), width=2)
+        canvas.create_text(med_x + 8, top + 14, text="Auto target median",
+                           anchor="w", fill="#1B6E35", font=("Calibri", 9, "bold"))
+
+        current_x, current_y = plot_xy(current_pr, current_cr)
+        canvas.create_oval(current_x - 7, current_y - 7, current_x + 7, current_y + 7,
+                           fill=BLUE, outline="#FFFFFF", width=2)
+        label_anchor = "e" if current_x > (left + right) / 2 else "w"
+        label_x = current_x - 11 if label_anchor == "e" else current_x + 11
+        canvas.create_text(
+            label_x, current_y - 10,
+            text=f"Current  PR {current_pr:.3f} / CR {current_cr:.3f}",
+            anchor=label_anchor, fill=TEXT, font=("Calibri", 10, "bold"))
+        canvas.create_text((left + right) / 2, height - 18,
+                           text="Pull-up Ratio  PR = βPG / βPU  (right = easier write)",
+                           fill=TEXT, font=("Calibri", 10, "bold"))
+        canvas.create_text(18, (top + bottom) / 2,
+                           text="CR = βPD / βPG  (up = stronger read)", angle=90,
+                           fill=TEXT, font=("Calibri", 10, "bold"))
+        canvas.create_text(right, bottom + 34,
+                           text="Green: both ≥ Median   Yellow: both ≥ Q1   Red: either < Q1",
+                           anchor="e", fill=SECONDARY, font=("Calibri", 8))
 
     def draw_training_trend(*_args) -> None:
         try:
-            data = educational_sram_metrics(
-                WatPoint("Training", training_values["pu_vt"].get(), training_values["pu_ids"].get(),
+            data = drive_monitor_metrics(
+                WatPoint("DriveMonitor", training_values["pu_vt"].get(), training_values["pu_ids"].get(),
                          training_values["pg_vt"].get(), training_values["pg_ids"].get(),
                          training_values["pd_vt"].get(), training_values["pd_ids"].get()),
                 training_values["vdd"].get())
@@ -6525,25 +6686,25 @@ def launch_gui() -> None:
         canvas = training_canvas
         canvas.delete("all")
         width = max(canvas.winfo_width(), 620)
-        height = max(canvas.winfo_height(), 420)
-        canvas.create_text(28, 24, text="Effective WAT-calibrated drive β (relative)", anchor="w",
+        height = max(canvas.winfo_height(), 290)
+        canvas.create_text(28, 16, text="Effective WAT-calibrated drive β (relative)", anchor="w",
                            fill=TEXT, font=("Calibri", 12, "bold"))
         betas = [("PU", data["beta_pu"], RED), ("PG", data["beta_pg"], GREEN), ("PD", data["beta_pd"], BLUE)]
         max_beta = max(value for _, value, _ in betas) or 1.0
         x0, bar_w, gap = 70, 95, 54
-        chart_bottom, chart_top = 190, 70
+        chart_bottom, chart_top = 118, 38
         for index, (label, beta, color) in enumerate(betas):
             x = x0 + index * (bar_w + gap)
             h = (chart_bottom - chart_top) * beta / max_beta
             canvas.create_rectangle(x, chart_bottom - h, x + bar_w, chart_bottom,
                                     fill=color, outline="")
-            canvas.create_text(x + bar_w / 2, chart_bottom + 18, text=label,
+            canvas.create_text(x + bar_w / 2, chart_bottom + 15, text=label,
                                fill=TEXT, font=("Calibri", 11, "bold"))
             canvas.create_text(x + bar_w / 2, chart_bottom - h - 12, text=f"{beta:.0f}",
                                fill=TEXT, font=("Calibri", 10, "bold"))
         canvas.create_line(48, chart_bottom, 48 + 3 * (bar_w + gap) - gap, chart_bottom,
                            fill=BORDER, width=1)
-        canvas.create_text(28, 238, text="Compact-model margins at selected VDD", anchor="w",
+        canvas.create_text(28, 154, text="Compact-model margins at selected VDD", anchor="w",
                            fill=TEXT, font=("Calibri", 12, "bold"))
         gauges = [
             ("Read SNM", data["read_snm_mv"], 0.5 * training_values["vdd"].get() * 1000.0, BLUE,
@@ -6552,22 +6713,24 @@ def launch_gui() -> None:
              "Higher means PG can overcome PU with more bitline tolerance"),
         ]
         for index, (label, value, scale, color, note) in enumerate(gauges):
-            y = 286 + index * 82
+            y = 190 + index * 50
             fraction = max(0.0, min(1.0, value / max(scale, 1.0)))
             canvas.create_text(48, y, text=label, anchor="w", fill=TEXT, font=("Calibri", 11, "bold"))
-            canvas.create_text(48, y + 20, text=note, anchor="w", fill=SECONDARY, font=("Calibri", 9))
+            canvas.create_text(48, y + 15, text=note, anchor="w", fill=SECONDARY, font=("Calibri", 8))
             left, right = 270, width - 35
             canvas.create_rectangle(left, y - 8, right, y + 12, fill="#E5E5EA", outline="")
             canvas.create_rectangle(left, y - 8, left + (right-left)*fraction, y + 12, fill=color, outline="")
             canvas.create_text(right, y + 2, text=f"{value:.1f} mV", anchor="e", fill=TEXT,
                                font=("Calibri", 11, "bold"))
-        canvas.create_text(48, height - 30,
+        canvas.create_text(48, height - 8,
                            text="Read trend: PD↑ or PG↓ tends to raise CR.  Write trend: PG↑ or PU↓ tends to raise PR.",
                            anchor="w", fill=SECONDARY, font=("Calibri", 10))
+        draw_drive_monitor_shmoo(data)
 
     for variable in training_values.values():
         variable.trace_add("write", draw_training_trend)
     training_canvas.bind("<Configure>", draw_training_trend)
+    training_shmoo_canvas.bind("<Configure>", draw_training_trend)
     root.after_idle(draw_training_trend)
 
     content = ttk.Frame(bitcell_tab, style="Root.TFrame"); content.pack(fill="both", expand=True)
@@ -6690,27 +6853,12 @@ def launch_gui() -> None:
         except Exception as exc:
             messagebox.showerror("Wafer multi-cell import", str(exc))
 
-    def save_multi_chip_template() -> None:
-        selected = filedialog.asksaveasfilename(
-            title="Save Wafer Multi-Cell 6T Template", initialfile="HV28_6T_Wafer_MultiCell_Template.xlsx",
-            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")])
-        if not selected:
-            return
-        try:
-            saved = write_multi_chip_6t_excel_template(selected, 64)
-            status.set(f"Wafer multi-cell template saved: {saved.name}")
-            status_label.configure(fg=GREEN)
-        except Exception as exc:
-            messagebox.showerror("Wafer multi-cell template", str(exc))
-
     ttk.Button(excel_row, text="Save Current...", style="Quiet.TButton",
                command=save_current_excel).pack(side="right")
     ttk.Button(excel_row, text="Import Excel...", style="Quiet.TButton",
                command=pick_excel).pack(side="right", padx=(0, 6))
     ttk.Button(excel_row, text="Import Multi-Cell...", style="Quiet.TButton",
                command=import_multi_chip_excel).pack(side="right", padx=(0, 6))
-    ttk.Button(excel_row, text="Multi-Cell Template...", style="Quiet.TButton",
-               command=save_multi_chip_template).pack(side="right", padx=(0, 6))
 
     schematic = tk.Canvas(left, bg=CARD, highlightthickness=0, height=540)
     schematic.pack(fill="both", expand=True)
@@ -7627,157 +7775,6 @@ def launch_gui() -> None:
         command=open_wtm_report)
     wtm_open_button.pack(fill="x", pady=(7, 0))
     wtm_open_button.state(["disabled"])
-
-    # One-factor-at-a-time Vt/Idsat boundary search for the two Read-SNM eyes.
-    mismatch_boundary_tab.columnconfigure(0, weight=1)
-    mismatch_boundary_tab.rowconfigure(0, weight=1)
-    mismatch_card = ttk.Frame(mismatch_boundary_tab, style="Card.TFrame", padding=20)
-    mismatch_card.grid(row=0, column=0, sticky="nsew")
-    mismatch_card.columnconfigure(0, weight=1)
-    mismatch_card.rowconfigure(4, weight=1)
-    ttk.Label(mismatch_card, text="6T Vt / Isat RSNM=0 Boundaries",
-              style="ChartTitle.TLabel").grid(row=0, column=0, sticky="w")
-    ttk.Label(
-        mismatch_card,
-        text=("Uses the six independent MOS values from the 6T tab. One Vt or Isat is swept "
-              "at a time while the other eleven values remain fixed."),
-        style="Meta.TLabel", wraplength=1000).grid(row=1, column=0, sticky="w", pady=(3, 4))
-    ttk.Label(
-        mismatch_card,
-        text=("Boundary means the first Upper or Lower Read-SNM eye reaches 0 in this compact model. "
-              "It is a sensitivity reference, not a simultaneous six-parameter process limit."),
-        style="Meta.TLabel", wraplength=1000).grid(row=2, column=0, sticky="w", pady=(0, 10))
-
-    mismatch_summary = tk.StringVar(value="Analyze the current 6T inputs to estimate mismatch boundaries.")
-    mismatch_summary_label = tk.Label(
-        mismatch_card, textvariable=mismatch_summary, bg=CARD, fg=SECONDARY,
-        font=("Calibri", 10, "bold"), anchor="w", justify="left")
-    mismatch_summary_label.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-
-    mismatch_table_frame = ttk.Frame(mismatch_card, style="Card.TFrame")
-    mismatch_table_frame.grid(row=4, column=0, sticky="nsew")
-    mismatch_table_frame.columnconfigure(0, weight=1)
-    mismatch_table_frame.rowconfigure(0, weight=1)
-    mismatch_columns = (
-        "device", "parameter", "direction", "baseline", "boundary", "unit",
-        "failed_state", "upper", "lower", "status",
-    )
-    mismatch_tree = ttk.Treeview(
-        mismatch_table_frame, columns=mismatch_columns, show="headings", height=18)
-    headings = {
-        "device": "Device", "parameter": "Parameter", "direction": "Direction",
-        "baseline": "Baseline", "boundary": "Boundary", "unit": "Unit",
-        "failed_state": "First zero state", "upper": "Upper (mV)",
-        "lower": "Lower (mV)", "status": "Status",
-    }
-    widths = {"device": 70, "parameter": 75, "direction": 85, "baseline": 85,
-              "boundary": 95, "unit": 55, "failed_state": 125, "upper": 90,
-              "lower": 90, "status": 125}
-    for column in mismatch_columns:
-        mismatch_tree.heading(column, text=headings[column])
-        mismatch_tree.column(column, width=widths[column], minwidth=50,
-                             anchor="w" if column in ("device", "parameter", "direction",
-                                                       "failed_state", "status") else "e")
-    mismatch_y_scroll = ttk.Scrollbar(
-        mismatch_table_frame, orient="vertical", command=mismatch_tree.yview)
-    mismatch_x_scroll = ttk.Scrollbar(
-        mismatch_table_frame, orient="horizontal", command=mismatch_tree.xview)
-    mismatch_tree.configure(yscrollcommand=mismatch_y_scroll.set,
-                            xscrollcommand=mismatch_x_scroll.set)
-    mismatch_tree.grid(row=0, column=0, sticky="nsew")
-    mismatch_y_scroll.grid(row=0, column=1, sticky="ns")
-    mismatch_x_scroll.grid(row=1, column=0, sticky="ew")
-
-    mismatch_status = tk.StringVar(value="Ready to analyze mismatch boundaries")
-    mismatch_status_label = tk.Label(
-        mismatch_card, textvariable=mismatch_status, bg=CARD, fg=SECONDARY,
-        font=("Calibri", 9), anchor="w", justify="left")
-    mismatch_status_label.grid(row=5, column=0, sticky="ew", pady=(10, 5))
-    mismatch_progress = ttk.Progressbar(
-        mismatch_card, mode="indeterminate", style="Apple.Horizontal.TProgressbar")
-    mismatch_progress.grid(row=6, column=0, sticky="ew", pady=(0, 8))
-    mismatch_result_queue: queue.Queue = queue.Queue()
-    mismatch_report_path: Path | None = None
-
-    def mismatch_worker(cell: SixTWatCell, cfg: Config,
-                        out_path: Path, wafer_id: str) -> None:
-        try:
-            analysis = analyze_mismatch_rsnm_boundaries(cell, cfg)
-            run_dir = create_run_output_dir(out_path, wafer_id, "rsnm_mismatch_boundary")
-            report = write_mismatch_boundary_outputs(analysis, run_dir)
-            mismatch_result_queue.put((True, analysis, report))
-        except Exception as exc:
-            mismatch_result_queue.put((False, None, exc))
-
-    def poll_mismatch_result() -> None:
-        nonlocal mismatch_report_path
-        try:
-            ok, analysis, payload = mismatch_result_queue.get_nowait()
-        except queue.Empty:
-            root.after(80, poll_mismatch_result)
-            return
-        mismatch_progress.stop()
-        mismatch_analyze_button.state(["!disabled"])
-        if ok:
-            mismatch_report_path = Path(payload)
-            mismatch_tree.delete(*mismatch_tree.get_children())
-            found = 0
-            for row in analysis["rows"]:
-                found += row["status"] == "BOUNDARY FOUND"
-                mismatch_tree.insert("", "end", values=(
-                    row["device"], row["parameter"], row["direction"].title(),
-                    f'{row["baseline_value"]:.5g}', _fmt(row["boundary_value"], 5),
-                    row["unit"], row["failed_state"] or "N/A",
-                    _fmt(row["upper_rsnm_mv"], 2), _fmt(row["lower_rsnm_mv"], 2),
-                    row["status"],
-                ))
-            mismatch_summary.set(
-                f'Baseline Upper {analysis["baseline_upper_rsnm_mv"]:.1f} mV / '
-                f'Lower {analysis["baseline_lower_rsnm_mv"]:.1f} mV · '
-                f'{found} of {len(analysis["rows"])} directions bracketed')
-            mismatch_summary_label.configure(fg=TEXT)
-            mismatch_status.set(f"Complete - saved to {mismatch_report_path.parent}")
-            mismatch_status_label.configure(fg=GREEN)
-            mismatch_open_button.state(["!disabled"])
-        else:
-            mismatch_status.set("Mismatch boundary analysis could not be completed")
-            mismatch_status_label.configure(fg=RED)
-            messagebox.showerror("RSNM mismatch boundary", str(payload))
-
-    def execute_mismatch_analysis() -> None:
-        try:
-            cell, cfg, _targets = collect_inputs()
-        except Exception as exc:
-            mismatch_status.set("Check the shared 6T input values")
-            mismatch_status_label.configure(fg=RED)
-            messagebox.showerror("Invalid 6T input", str(exc))
-            return
-        mismatch_status.set("Sweeping 6T Vt / Isat boundaries...")
-        mismatch_status_label.configure(fg=BLUE)
-        mismatch_analyze_button.state(["disabled"])
-        mismatch_open_button.state(["disabled"])
-        mismatch_progress.start(10)
-        wafer_id = values["corner"].get().strip() or "Manual"
-        threading.Thread(
-            target=mismatch_worker,
-            args=(cell, cfg, Path(values["out"].get()), wafer_id), daemon=True).start()
-        root.after(80, poll_mismatch_result)
-
-    def open_mismatch_report() -> None:
-        if mismatch_report_path and mismatch_report_path.exists():
-            webbrowser.open(mismatch_report_path.resolve().as_uri())
-
-    mismatch_actions = ttk.Frame(mismatch_card, style="Card.TFrame")
-    mismatch_actions.grid(row=7, column=0, sticky="ew")
-    mismatch_analyze_button = ttk.Button(
-        mismatch_actions, text="Analyze RSNM=0 Boundaries",
-        style="Accent.TButton", command=execute_mismatch_analysis)
-    mismatch_analyze_button.pack(side="left", fill="x", expand=True)
-    mismatch_open_button = ttk.Button(
-        mismatch_actions, text="Open HTML Result", style="Quiet.TButton",
-        command=open_mismatch_report)
-    mismatch_open_button.pack(side="left", padx=(8, 0))
-    mismatch_open_button.state(["disabled"])
 
     def persist_and_close() -> None:
         state = {

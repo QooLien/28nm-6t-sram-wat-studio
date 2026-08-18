@@ -51,7 +51,7 @@ py -3 -m unittest -q
 ## 公司電腦操作
 
 1. 雙擊 `launchers/windows/open_sram_wat_analyzer.cmd`。
-2. 手動輸入六顆 MOS WAT，或使用 `Import Excel...` 選擇 `input/templates/HV28_6T_WAT_12Point_VDD_Sweep_Template.xlsx` 格式的資料。
+2. 手動輸入六顆 MOS WAT，或使用 `Import Excel...` 選擇符合 README 欄位格式的 WAT Excel；Multi-Cell 可先使用 `input/multi_cell_example.xlsx` 驗證。
 3. 填入 PU／PG／PD WAT Target 與 Model Settings。
 4. 選擇輸出資料夾。
 5. 執行一般分析或 `Analyze Excel VDD Sweep`。
