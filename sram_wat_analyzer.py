@@ -3397,6 +3397,195 @@ def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]]) -> dict:
             "definition": "Each VDD point is the minimum per-cell margin in the imported Multi-Cell summary data."}
 
 
+_MULTI_LOT_COLORS = ("#007AFF", "#AF52DE", "#00A844", "#FF9500",
+                     "#FF375F", "#5E5CE6", "#00A6A6", "#8E5A2B")
+
+
+def read_estimate_vmin_output_folders(
+        folders: Iterable[str | os.PathLike[str]]) -> list[dict[str, object]]:
+    """Read two or more Estimate-Vmin output folders and group by Lot/Wafer."""
+    selected = [Path(item).expanduser() for item in folders]
+    if len(selected) < 2:
+        raise ValueError("Select at least two Estimate Vmin output folders")
+    grouped: dict[str, dict[float, dict[str, object]]] = {}
+    sources: dict[str, set[str]] = {}
+
+    def add_row(lot: str, vdd: float, values: dict[str, float], source: Path) -> None:
+        clean_lot = lot.strip() or source.parent.name or "Unknown_Wafer"
+        by_vdd = grouped.setdefault(clean_lot, {})
+        row = by_vdd.setdefault(vdd, {"vdd_v": vdd, "sample_count": 0})
+        row["sample_count"] = int(row["sample_count"]) + 1
+        for key, value in values.items():
+            if key not in row or value < float(row[key]):
+                row[key] = value
+                row[f"{key}_lot_wafer"] = clean_lot
+        sources.setdefault(clean_lot, set()).add(str(source.resolve()))
+
+    for selected_path in selected:
+        folder = selected_path.parent if selected_path.is_file() else selected_path
+        if not folder.is_dir():
+            raise FileNotFoundError(f"Estimate Vmin output folder was not found: {folder}")
+        detail_path = folder / "estimate_vmin_cr_pr_shmoo.csv"
+        combined_path = folder / "multi_chip_snm_summary_combined.csv"
+        if detail_path.is_file():
+            with detail_path.open(newline="", encoding="utf-8-sig") as stream:
+                reader = csv.DictReader(stream)
+                required = {"vdd_v", "lot_wafer", "rsnm_mv", "wsnm_mv", "write_margin_mv"}
+                if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                    raise ValueError(f"{detail_path} is not a valid Estimate Vmin shmoo export")
+                for number, raw in enumerate(reader, 2):
+                    try:
+                        add_row(str(raw["lot_wafer"]), float(raw["vdd_v"]),
+                                {key: float(raw[key]) for key, *_ in _ESTIMATE_VMIN_METRICS},
+                                detail_path)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"{detail_path.name} row {number}: invalid curve value") from exc
+        elif combined_path.is_file():
+            with combined_path.open(newline="", encoding="utf-8-sig") as stream:
+                reader = csv.DictReader(stream)
+                required = {"vdd_v", "rsnm_mv", "wsnm_mv", "write_margin_mv"}
+                if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                    raise ValueError(f"{combined_path} is not a valid Estimate Vmin combined export")
+                for number, raw in enumerate(reader, 2):
+                    lot = (raw.get("rsnm_mv_lot_wafer") or
+                           raw.get("write_margin_mv_lot_wafer") or folder.parent.name)
+                    try:
+                        add_row(str(lot), float(raw["vdd_v"]),
+                                {key: float(raw.get(key, raw["write_margin_mv"]))
+                                 for key, *_ in _ESTIMATE_VMIN_METRICS}, combined_path)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"{combined_path.name} row {number}: invalid curve value") from exc
+        else:
+            raise FileNotFoundError(
+                f"{folder} does not contain estimate_vmin_cr_pr_shmoo.csv or "
+                "multi_chip_snm_summary_combined.csv")
+
+    datasets = []
+    for index, (lot, by_vdd) in enumerate(sorted(grouped.items())):
+        rows = [by_vdd[vdd] for vdd in sorted(by_vdd)]
+        if len(rows) < 2:
+            raise ValueError(f"Lot/Wafer {lot} has fewer than two Model VDD points")
+        datasets.append({"lot_wafer": lot, "rows": rows,
+                         "color": _MULTI_LOT_COLORS[index % len(_MULTI_LOT_COLORS)],
+                         "sources": sorted(sources[lot])})
+    if len(datasets) < 2:
+        raise ValueError("The selected folders must contain at least two different Lot/Wafer names")
+    return datasets
+
+
+def estimate_vmin_multi_lot_svg(datasets: list[dict[str, object]],
+                                width: int = 1500, height: int = 1180) -> str:
+    """Overlay two or more Lot/Wafer VDD curves in three aligned panels."""
+    groups = (("rsnm_mv", "Read SNM", "RSNM (mV)"),
+              ("wsnm_mv", "Write SNM", "Write SNM (mV)"),
+              ("write_margin_mv", "BL Write Margin", "Vtrip (mV)"))
+    left, right, bottom, gap = 120, 55, 70, 78
+    legend_items = [(str(item["lot_wafer"]),
+                     max(210.0, 78.0 + len(str(item["lot_wafer"])) * 9.5),
+                     str(item["color"])) for item in datasets]
+    legend_rows: list[list[tuple[str, float, str]]] = [[]]
+    current_width = 0.0
+    for item in legend_items:
+        if legend_rows[-1] and current_width + item[1] > width - left - right:
+            legend_rows.append([]); current_width = 0.0
+        legend_rows[-1].append(item); current_width += item[1]
+    top = 134 + len(legend_rows) * 28
+    plot_w = width - left - right
+    panel_h = (height - top - bottom - gap * (len(groups) - 1)) / len(groups)
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
+             '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+             f'<text x="{width/2:.1f}" y="52" text-anchor="middle" fill="#1D1D1F" font-size="34" font-weight="700">Multi Lot/Wafer Estimate Vmin Curve Comparison</text>',
+             f'<text x="{width/2:.1f}" y="80" text-anchor="middle" fill="#6E6E73" font-size="16">{len(datasets)} Lot/Wafer data sets · labels show measured margin at each Model VDD</text>']
+    for row_index, legend_row in enumerate(legend_rows):
+        row_width = sum(item[1] for item in legend_row)
+        legend_x = (width - row_width) / 2.0
+        legend_y = 112 + row_index * 28
+        for label_text, item_width, color in legend_row:
+            label = html.escape(label_text)
+            parts += [f'<path d="M{legend_x} {legend_y-5}h30" stroke="{color}" stroke-width="4"/>',
+                      f'<text x="{legend_x+38}" y="{legend_y}" fill="#30343B" font-size="14" font-weight="700">{label}</text>']
+            legend_x += item_width
+    for panel_index, (key, title, y_label) in enumerate(groups):
+        panel_top = top + panel_index * (panel_h + gap)
+        panel_bottom = panel_top + panel_h
+        maximum = max(float(row[key]) for dataset in datasets for row in dataset["rows"])
+        y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
+
+        def xy(vdd: float, value: float) -> tuple[float, float]:
+            return (left + vdd / SNM_PLOT_AXIS_MAX_V * plot_w,
+                    panel_top + (1 - value / y_max) * panel_h)
+
+        parts += [f'<rect x="{left}" y="{panel_top}" width="{plot_w}" height="{panel_h:.1f}" fill="#FFFFFF" stroke="#D8DDE3"/>',
+                  f'<text x="{left+plot_w/2:.1f}" y="{panel_top-16:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="20" font-weight="700">{title}</text>']
+        for step in range(5):
+            value = y_max * step / 4
+            _x, y = xy(0, value)
+            parts += [f'<path d="M{left} {y:.1f}H{left+plot_w}" stroke="#E5E5EA"/>',
+                      f'<text x="{left-10}" y="{y+4:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{value:.0f}</text>']
+        for vdd_step in range(7):
+            voltage = vdd_step * .2
+            x, _y = xy(voltage, 0)
+            parts += [f'<path d="M{x:.1f} {panel_top}V{panel_bottom}" stroke="#F1F1F4"/>',
+                      f'<text x="{x:.1f}" y="{panel_bottom+20:.1f}" text-anchor="middle" fill="#6E6E73" font-size="11">{voltage:.1f}</text>']
+        all_points = [xy(float(row["vdd_v"]), float(row[key]))
+                      for dataset in datasets for row in dataset["rows"]]
+        label_requests: list[tuple[float, float, str]] = []
+        label_metadata: list[tuple[dict[str, object], dict[str, object], float, float]] = []
+        for dataset in datasets:
+            points = [xy(float(row["vdd_v"]), float(row[key])) for row in dataset["rows"]]
+            parts.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in points)}" fill="none" stroke="{dataset["color"]}" stroke-width="3"/>')
+            for row, (x, y) in zip(dataset["rows"], points):
+                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{dataset["color"]}" stroke-width="2"/>')
+                label_requests.append((x, y, f'{float(row[key]):.1f}'))
+                label_metadata.append((dataset, row, x, y))
+        placed_labels = _place_chart_labels(
+            label_requests, all_points,
+            (left + 5, panel_top + 5, left + plot_w - 5, panel_bottom - 5), 11.0)
+        for (label_x, label_y, anchor), (dataset, row, point_x, point_y) in zip(
+                placed_labels, label_metadata):
+            label = f'{float(row[key]):.1f}'
+            label_width = max(42.0, len(label) * 11.0 * .56)
+            label_left = (label_x - label_width / 2 if anchor == "middle" else
+                          label_x - label_width if anchor == "end" else label_x)
+            parts += [f'<path d="M{point_x:.1f} {point_y:.1f}L{label_x:.1f} {label_y-5:.1f}" stroke="{dataset["color"]}" stroke-width="1" opacity=".42"/>',
+                      f'<rect x="{label_left-3:.1f}" y="{label_y-13:.1f}" width="{label_width+6:.1f}" height="17" rx="3" fill="#FFFFFF" fill-opacity=".90"/>',
+                      f'<text class="multi-lot-data-label" x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" fill="{dataset["color"]}" font-size="11" font-weight="700">{label}</text>']
+        center_y = panel_top + panel_h / 2
+        parts.append(f'<text x="30" y="{center_y:.1f}" transform="rotate(-90 30 {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_label}</text>')
+    parts += [f'<text x="{left+plot_w/2}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
+    return "".join(parts)
+
+
+def write_estimate_vmin_multi_lot_outputs(datasets: list[dict[str, object]],
+                                          out_dir: str | os.PathLike[str]) -> Path:
+    """Export the multi-Lot/Wafer comparison as HTML, SVG, PNG and CSV."""
+    out = Path(out_dir); image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
+    svg_path = image_dir / "01_multi_lot_wafer_vmin_comparison.svg"
+    png_path = image_dir / "01_multi_lot_wafer_vmin_comparison.png"
+    svg_path.write_text(estimate_vmin_multi_lot_svg(datasets), encoding="utf-8")
+    try:
+        from reportlab.graphics import renderPM
+        from svglib.svglib import svg2rlg
+    except ImportError as exc:
+        raise RuntimeError("PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
+    drawing = svg2rlg(str(svg_path))
+    if drawing is None:
+        raise RuntimeError("Could not render multi-Lot/Wafer comparison")
+    renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
+    fields = ["lot_wafer", "vdd_v", "sample_count", "rsnm_mv", "wsnm_mv", "write_margin_mv", "source_folders"]
+    with (out / "multi_lot_wafer_vmin_comparison.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader()
+        for dataset in datasets:
+            for row in dataset["rows"]:
+                writer.writerow({"lot_wafer": dataset["lot_wafer"], "vdd_v": row["vdd_v"],
+                                 "sample_count": row["sample_count"], "rsnm_mv": row["rsnm_mv"],
+                                 "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
+                                 "source_folders": " | ".join(dataset["sources"])})
+    report = out / "multi_lot_wafer_vmin_comparison.html"
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Multi Lot/Wafer Vmin Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1650px;margin:auto}}h1,.note,.downloads{{text-align:center}}section{{background:#fff;padding:22px;border-radius:16px}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}</style></head><body><main><h1>Multi Lot/Wafer Estimate Vmin Comparison</h1><p class="note">Compared Lot/Wafer: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}</p><section><img src="images/{png_path.name}" alt="Multi Lot Wafer Vmin curve comparison"></section><p class="downloads">Downloads: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a> · <a href="multi_lot_wafer_vmin_comparison.csv">CSV</a></p></main></body></html>''', encoding="utf-8")
+    return report
+
+
 def _legacy_estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height: int = 1040) -> str:
     """Render upper-right-good drive balance plus PU/PG/PD tuning views."""
     samples = shmoo["samples"]
@@ -3596,12 +3785,11 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
                     f'Idsat {float(item[idsat_key]):.3f} µA')
         tooltip_text = " | ".join(tooltip_rows)
         tooltip_attr = html.escape(tooltip_text, quote=True)
-        native_title = html.escape("\n".join(tooltip_rows))
         parts.append(
             f'<circle class="measured-cell" data-cell-tooltip="{tooltip_attr}" '
+            f'aria-label="{tooltip_attr}" '
             f'cx="{x:.1f}" cy="{y:.1f}" r="6" fill="#26323D" '
-            f'stroke="#FFFFFF" stroke-width="1.2" tabindex="0">'
-            f'<title>{native_title}</title></circle>')
+            f'stroke="#FFFFFF" stroke-width="1.2" tabindex="0"/>')
 
     target = shmoo["target"]
     tx, ty = xy(float(target[x_key]), float(target[y_key]))
@@ -3850,14 +4038,16 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
     backup_dir = out / "imported_multi_chip_summaries"; backup_dir.mkdir(exist_ok=True)
     for index, source in enumerate(source_paths, 1):
         source_path = Path(source); shutil.copy2(source_path, backup_dir / f"{index:02d}_{source_path.name}")
-    sections = '<section><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows) + "".join(shmoo_sections)
+    sections = '<section id="stacked-trends"><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows) + "".join(shmoo_sections)
     report = out / "estimate_vmin_report.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Estimate Vmin Curve</title>
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HV28 SRAM Estimate Vmin Curve</title>
 <style>
-body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}
-main{{max-width:1500px;margin:auto}}
+*{{box-sizing:border-box}}
+body{{font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:0;padding:clamp(10px,2vw,32px)}}
+main{{width:100%;max-width:1600px;margin:auto}}
 section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}
 img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px solid #e5e5ea;border-radius:12px}}
+.interactive-shmoo{{width:100%;min-width:0;overflow-x:auto}}
 .interactive-shmoo circle.measured-cell{{cursor:help}}
 .note{{color:#6e6e73}}
 #cell-tooltip{{position:fixed;z-index:9999;display:none;width:390px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:hidden;padding:18px 20px;border-radius:14px;background:#1d1d1f;color:#fff;box-shadow:0 10px 34px rgba(0,0,0,.26);font-size:13px;line-height:1.45;pointer-events:none}}
@@ -4123,7 +4313,7 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
         header_y = panel_top - 38
         parts.append(f'<text x="{left}" y="{header_y:.1f}" fill="#1D1D1F" font-size="21" font-weight="700">{group_label}</text>')
         legend_x = left + 360
-        for curve in curves:
+        for curve_index, curve in enumerate(curves):
             parts += [f'<path d="M{legend_x} {header_y-6:.1f} h26" stroke="{curve["color"]}" stroke-width="4"/>',
                       f'<text x="{legend_x+34}" y="{header_y:.1f}" fill="#3A3A3C" font-size="15">{curve["label"]}</text>']
             legend_x += 220
@@ -4147,8 +4337,25 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
                     f'<path data-extrapolated-to-zero="true" d="M{closure_x:.1f} {closure_y:.1f}L{first_x:.1f} {first_y:.1f}" '
                     f'fill="none" stroke="{curve["color"]}" stroke-width="3.5" '
                     f'stroke-dasharray="8 6" stroke-linecap="round"/>')
-            for _row, (x, y) in zip(curve["rows"], points):
+            for point_index, (_row, (x, y)) in enumerate(zip(curve["rows"], points)):
                 parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
+                # Keep the two SNM series readable when their points are close:
+                # Read labels sit above and Write labels below.  A label near
+                # the panel edge is flipped back inside the plotting area.
+                label_above = curve_index == 0
+                label_y = y - 10 if label_above else y + 17
+                if label_y < panel_top + 13:
+                    label_y = y + 17
+                elif label_y > panel_bottom - 5:
+                    label_y = y - 10
+                label_anchor = "middle"
+                # Alternate a small horizontal offset for dense adjacent data.
+                label_x = x + (-3 if point_index % 2 else 3)
+                parts.append(
+                    f'<text class="curve-data-label" data-series="{html.escape(str(curve["label"]), quote=True)}" '
+                    f'x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{label_anchor}" '
+                    f'fill="{curve["color"]}" font-size="11" font-weight="700">'
+                    f'{float(_row["margin_mv"]):.1f} mV</text>')
         if "rsnm_mv" in keys:
             rows = analysis["curves"]["rsnm_mv"]["rows"]
             if len(rows) >= 2:
@@ -4158,7 +4365,9 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
                                          (pair[1]["vdd_v"] - pair[0]["vdd_v"])))
                 marker_x, _marker_y = xy(marker["vdd_v"], marker["margin_mv"])
                 parts += [f'<path d="M{marker_x:.1f} {panel_top} V{panel_bottom}" stroke="#FF385C" stroke-width="2" stroke-dasharray="5 5"/>',
-                          f'<text x="{marker_x+8:.1f}" y="{panel_top+20:.1f}" fill="#C13515" font-size="13" font-weight="700">Largest RSNM slope: {marker["vdd_v"]:.2f} V</text>']
+                          f'<text x="{marker_x+8:.1f}" y="{panel_top+20:.1f}" fill="#C13515" font-size="13" font-weight="700">Largest RSNM slope: {marker["vdd_v"]:.2f} V</text>',
+                          f'<rect x="{marker_x-29:.1f}" y="{panel_bottom+29:.1f}" width="58" height="22" rx="5" fill="#FFF1F3" stroke="#FF385C"/>',
+                          f'<text class="vertical-vdd-label" x="{marker_x:.1f}" y="{panel_bottom+45:.1f}" text-anchor="middle" fill="#C13515" font-size="12" font-weight="700">{marker["vdd_v"]:.2f} V</text>']
         for vdd_step in range(7):
             voltage = vdd_step * .2
             x, _y = xy(voltage, 0)
@@ -6759,8 +6968,8 @@ def launch_gui() -> None:
 
     # Estimate Vmin tab: consumes conservative results exported by the
     # Multi-Cell 6T analysis rather than a second manual/IV input path.
-    curve_tab.columnconfigure(0, weight=6)
-    curve_tab.columnconfigure(1, weight=7)
+    curve_tab.columnconfigure(0, weight=4)
+    curve_tab.columnconfigure(1, weight=9)
     curve_tab.rowconfigure(0, weight=1)
     curve_input_card = ttk.Frame(curve_tab, style="Card.TFrame", padding=18)
     curve_input_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
@@ -6785,6 +6994,12 @@ def launch_gui() -> None:
         selected_summary_text.set(
             f"{len(selected_summary_paths)} previously selected summary file(s)\n" +
             "\n".join(Path(item).name for item in selected_summary_paths[:5]))
+    comparison_output_folders: list[str] = []
+    comparison_folder_text = tk.StringVar(
+        value="Multi Curve comparison: no Estimate Vmin output folders selected")
+    tk.Label(curve_input_card, textvariable=comparison_folder_text, bg=CARD, fg=SECONDARY,
+             font=("Calibri", 9), anchor="w", justify="left", wraplength=560).pack(
+                 fill="x", pady=(0, 8))
 
     curve_status = tk.StringVar(value="Ready to analyze the VDD sweep")
     curve_status_label = tk.Label(curve_input_card, textvariable=curve_status, bg=CARD, fg=SECONDARY,
@@ -6821,7 +7036,7 @@ def launch_gui() -> None:
                                    font=("Calibri", 10, "bold"), anchor="w", justify="left")
     curve_summary_label.grid(row=2, column=0, sticky="ew", pady=(0, 6))
     curve_canvas = tk.Canvas(curve_chart_card, bg=CARD, highlightthickness=0, bd=0,
-                             width=620, height=550)
+                             width=760, height=620)
     curve_canvas.grid(row=3, column=0, sticky="nsew")
     curve_result: dict | None = None
     curve_report_path: Path | None = None
@@ -6879,15 +7094,24 @@ def launch_gui() -> None:
                     curve_canvas.create_line(x, panel_top, x, panel_bottom, fill="#F1F1F4")
                     curve_canvas.create_text(x, panel_bottom + 13, text=f"{vdd_step*.2:.1f}",
                                              fill=SECONDARY, font=("Calibri", 8))
-                for curve in curves:
+                for curve_index, curve in enumerate(curves):
                     points = [stacked_xy(row["vdd_v"], row["margin_mv"]) for row in curve["rows"]]
                     if len(points) >= 2:
                         curve_canvas.create_line(
                             *[coordinate for point in points for coordinate in point],
                             fill=curve["color"], width=2)
-                    for _row, (x, y) in zip(curve["rows"], points):
+                    for point_index, (_row, (x, y)) in enumerate(zip(curve["rows"], points)):
                         curve_canvas.create_oval(x-3, y-3, x+3, y+3,
                                                  fill=CARD, outline=curve["color"], width=2)
+                        label_y = y - 11 if curve_index == 0 else y + 13
+                        if label_y < panel_top + 9:
+                            label_y = y + 13
+                        elif label_y > panel_bottom - 4:
+                            label_y = y - 11
+                        label_x = x + (-3 if point_index % 2 else 3)
+                        curve_canvas.create_text(
+                            label_x, label_y, text=f'{_row["margin_mv"]:.1f} mV',
+                            fill=curve["color"], font=("Calibri", 8, "bold"))
                 if "rsnm_mv" in keys:
                     rows = curve_result["curves"]["rsnm_mv"]["rows"]
                     if len(rows) >= 2:
@@ -6895,6 +7119,12 @@ def launch_gui() -> None:
                         x, _ = stacked_xy(marker["vdd_v"], marker["margin_mv"])
                         curve_canvas.create_line(x, panel_top, x, panel_bottom, fill="#FF385C", dash=(4, 4))
                         curve_canvas.create_text(x + 5, panel_top + 8, text=f"Largest slope\n{marker['vdd_v']:.2f} V", anchor="nw", fill="#C13515", font=("Calibri", 8, "bold"))
+                        curve_canvas.create_rectangle(
+                            x - 25, panel_bottom + 22, x + 25, panel_bottom + 40,
+                            fill="#FFF1F3", outline="#FF385C")
+                        curve_canvas.create_text(
+                            x, panel_bottom + 31, text=f'{marker["vdd_v"]:.2f} V',
+                            fill="#C13515", font=("Calibri", 8, "bold"))
             curve_canvas.create_text(left_margin + plot_width / 2, height - 8, text="Model VDD (V)", fill=TEXT, font=("Calibri", 11, "bold"))
             return
         curve = curve_result["curves"][curve_kind.get()]
@@ -7068,6 +7298,7 @@ def launch_gui() -> None:
     draw_curve_chart()
 
     curve_result_queue: queue.Queue = queue.Queue()
+    comparison_result_queue: queue.Queue = queue.Queue()
 
     def import_multi_cell_summaries() -> None:
         selected = filedialog.askopenfilenames(title="Import Multi-Cell SNM Summary CSV", initialdir=values["out"].get(), filetypes=[("Multi-Cell summary CSV", "*.csv"), ("All files", "*.*")])
@@ -7085,6 +7316,70 @@ def launch_gui() -> None:
             curve_result_queue.put((True, analysis, report))
         except Exception as exc:
             curve_result_queue.put((False, None, exc))
+
+    def comparison_worker(folders: list[str], out_path: Path) -> None:
+        try:
+            datasets = read_estimate_vmin_output_folders(folders)
+            run_dir = create_run_output_dir(
+                out_path, "Multi_Lot_Wafer", "estimate_vmin_curve_comparison")
+            report = write_estimate_vmin_multi_lot_outputs(datasets, run_dir)
+            comparison_result_queue.put((True, datasets, report))
+        except Exception as exc:
+            comparison_result_queue.put((False, None, exc))
+
+    def add_comparison_output_folder() -> None:
+        selected = filedialog.askdirectory(
+            title="Add Estimate Vmin output folder",
+            initialdir=values["out"].get())
+        if not selected:
+            return
+        resolved = str(Path(selected).resolve())
+        if resolved not in comparison_output_folders:
+            comparison_output_folders.append(resolved)
+        comparison_folder_text.set(
+            f"Multi Curve comparison: {len(comparison_output_folders)} folder(s)\n" +
+            "\n".join(Path(item).name for item in comparison_output_folders[-4:]))
+
+    def clear_comparison_output_folders() -> None:
+        comparison_output_folders.clear()
+        comparison_folder_text.set(
+            "Multi Curve comparison: no Estimate Vmin output folders selected")
+
+    def poll_comparison_result() -> None:
+        try:
+            ok, datasets, payload = comparison_result_queue.get_nowait()
+        except queue.Empty:
+            root.after(80, poll_comparison_result)
+            return
+        curve_progress.stop()
+        curve_compare_button.state(["!disabled"])
+        if ok:
+            curve_status.set(
+                f"Multi Curve comparison complete: {len(datasets)} Lot/Wafer curves")
+            curve_status_label.configure(fg=GREEN)
+            webbrowser.open(Path(payload).resolve().as_uri())
+        else:
+            curve_status.set("Multi Curve folder comparison could not be completed")
+            curve_status_label.configure(fg=RED)
+            messagebox.showerror("Multi Curve Comparison", str(payload))
+
+    def execute_folder_comparison() -> None:
+        if len(comparison_output_folders) < 2:
+            curve_status.set("Add at least two Estimate Vmin output folders")
+            curve_status_label.configure(fg=RED)
+            messagebox.showerror(
+                "Multi Curve Comparison",
+                "Add at least two output folders. Click 'Add Comparison Folder' once for each folder.")
+            return
+        curve_status.set("Reading output folders and comparing curves by Lot/Wafer...")
+        curve_status_label.configure(fg=BLUE)
+        curve_compare_button.state(["disabled"])
+        curve_progress.start(10)
+        threading.Thread(
+            target=comparison_worker,
+            args=(list(comparison_output_folders), Path(values["out"].get())),
+            daemon=True).start()
+        root.after(80, poll_comparison_result)
 
     def poll_curve_result() -> None:
         nonlocal curve_result, curve_report_path
@@ -7148,11 +7443,11 @@ def launch_gui() -> None:
             webbrowser.open(curve_report_path.resolve().as_uri())
 
     def open_stacked_curve_png() -> None:
-        if not curve_report_path:
-            return
-        stacked_png = curve_report_path.parent / "images" / "05_estimate_vmin_stacked.png"
-        if stacked_png.exists():
-            webbrowser.open(stacked_png.resolve().as_uri())
+        if curve_report_path and curve_report_path.exists():
+            # Open the responsive report wrapper instead of a raw PNG.  Chrome
+            # and Edge on Windows otherwise present a large PNG as a reduced
+            # image preview, which makes the chart look like a thumbnail.
+            webbrowser.open(curve_report_path.resolve().as_uri() + "#stacked-trends")
 
     def open_transparent_stacked_curve_png() -> None:
         if not curve_report_path:
@@ -7173,7 +7468,7 @@ def launch_gui() -> None:
                                    style="Quiet.TButton", command=open_curve_report)
     curve_open_button.pack(fill="x", pady=(7, 0))
     curve_open_button.state(["disabled"])
-    curve_stacked_button = ttk.Button(curve_action_row, text="Open Stacked PNG",
+    curve_stacked_button = ttk.Button(curve_action_row, text="Open Full-Size Stacked View",
                                       style="Quiet.TButton", command=open_stacked_curve_png)
     curve_stacked_button.pack(fill="x", pady=(7, 0))
     curve_stacked_button.state(["disabled"])
@@ -7182,6 +7477,15 @@ def launch_gui() -> None:
         command=open_transparent_stacked_curve_png)
     curve_transparent_button.pack(fill="x", pady=(7, 0))
     curve_transparent_button.state(["disabled"])
+    ttk.Separator(curve_action_row, orient="horizontal").pack(fill="x", pady=(12, 7))
+    ttk.Button(curve_action_row, text="Add Comparison Folder...", style="Quiet.TButton",
+               command=add_comparison_output_folder).pack(fill="x")
+    ttk.Button(curve_action_row, text="Clear Comparison Folders", style="Quiet.TButton",
+               command=clear_comparison_output_folders).pack(fill="x", pady=(7, 0))
+    curve_compare_button = ttk.Button(
+        curve_action_row, text="Compare 2+ Lot/Wafer Curves", style="Accent.TButton",
+        command=execute_folder_comparison)
+    curve_compare_button.pack(fill="x", pady=(7, 0))
 
     # Independent write-trip analysis. It intentionally reuses the same manual
     # VDD/WAT rows so Read and Write trends are compared from identical inputs.
