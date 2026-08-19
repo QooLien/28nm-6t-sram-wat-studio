@@ -3454,59 +3454,62 @@ def read_estimate_vmin_combined_files(
 
 
 def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
-                                width: int = 1500, height: int = 1180) -> str:
+                                width: int = 1500, height: int = 720,
+                                transparent_background: bool = False) -> str:
     """Overlay combined-summary files in paired SNM and BL-margin panels."""
     groups = (
         ("Read / Write SNM",
          (("rsnm_mv", "R", ""), ("wsnm_mv", "W", "8 5")), "SNM (mV)"),
         ("BL Write Margin", (("write_margin_mv", "BL", ""),), "Vtrip (mV)"),
     )
-    left, right, bottom, gap = 120, 55, 92, 108
+    left, right, bottom, panel_gap = 92, 48, 84, 72
     legend_items = [(str(item["lot_wafer"]),
                      max(210.0, 78.0 + len(str(item["lot_wafer"])) * 9.5),
                      str(item["color"])) for item in datasets]
     legend_rows: list[list[tuple[str, float, str]]] = [[]]
     current_width = 0.0
     for item in legend_items:
-        if legend_rows[-1] and current_width + item[1] > width - left - right:
+        if legend_rows[-1] and current_width + item[1] > width - 700:
             legend_rows.append([]); current_width = 0.0
         legend_rows[-1].append(item); current_width += item[1]
-    top = 164 + len(legend_rows) * 28
-    plot_w = width - left - right
-    panel_h = (height - top - bottom - gap * (len(groups) - 1)) / len(groups)
-    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
-             '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-             f'<text x="{width/2:.1f}" y="52" text-anchor="middle" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
-             f'<text x="{width/2:.1f}" y="80" text-anchor="middle" fill="#6E6E73" font-size="16">{len(datasets)} combined summary files · solid Read / dashed Write · measured VDD guides only</text>',
-             '<path d="M120 109h30" stroke="#3A3A3C" stroke-width="4"/><text x="160" y="114" fill="#3A3A3C" font-size="14">Read SNM / BL Write Margin</text>',
-             '<path d="M390 109h30" stroke="#3A3A3C" stroke-width="4" stroke-dasharray="8 5"/><text x="430" y="114" fill="#3A3A3C" font-size="14">Write SNM</text>']
+    top = 145 + len(legend_rows) * 27
+    plot_w = (width - left - right - panel_gap) / len(groups)
+    panel_h = height - top - bottom
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">']
+    if not transparent_background:
+        parts.append('<rect width="100%" height="100%" fill="#FFFFFF"/>')
+    panel_fill = "none" if transparent_background else "#FFFFFF"
+    parts += ['<text x="56" y="46" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
+             f'<text x="56" y="73" fill="#6E6E73" font-size="16">{len(datasets)} combined summary files · measured VDD guides only</text>',
+             '<path d="M56 108h30" stroke="#3A3A3C" stroke-width="4"/><text x="96" y="113" fill="#3A3A3C" font-size="14">Read SNM / BL Write Margin</text>',
+             '<path d="M330 108h30" stroke="#3A3A3C" stroke-width="4" stroke-dasharray="8 5"/><text x="370" y="113" fill="#3A3A3C" font-size="14">Write SNM</text>']
     for row_index, legend_row in enumerate(legend_rows):
-        row_width = sum(item[1] for item in legend_row)
-        legend_x = (width - row_width) / 2.0
-        legend_y = 142 + row_index * 28
+        legend_x = 650 if row_index == 0 else 56
+        legend_y = 113 + row_index * 27
         for label_text, item_width, color in legend_row:
             label = html.escape(label_text)
             parts += [f'<path d="M{legend_x} {legend_y-5}h30" stroke="{color}" stroke-width="4"/>',
                       f'<text x="{legend_x+38}" y="{legend_y}" fill="#30343B" font-size="14" font-weight="700">{label}</text>']
             legend_x += item_width
     for panel_index, (title, series_specs, y_label) in enumerate(groups):
-        panel_top = top + panel_index * (panel_h + gap)
+        panel_left = left + panel_index * (plot_w + panel_gap)
+        panel_top = top
         panel_bottom = panel_top + panel_h
         maximum = max(float(row[key]) for dataset in datasets
                       for key, _prefix, _dash in series_specs for row in dataset["rows"])
         y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
 
         def xy(vdd: float, value: float) -> tuple[float, float]:
-            return (left + vdd / SNM_PLOT_AXIS_MAX_V * plot_w,
+            return (panel_left + vdd / SNM_PLOT_AXIS_MAX_V * plot_w,
                     panel_top + (1 - value / y_max) * panel_h)
 
-        parts += [f'<rect x="{left}" y="{panel_top}" width="{plot_w}" height="{panel_h:.1f}" fill="#FFFFFF" stroke="#D8DDE3"/>',
-                  f'<text x="{left+plot_w/2:.1f}" y="{panel_top-16:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="20" font-weight="700">{title}</text>']
+        parts += [f'<rect x="{panel_left}" y="{panel_top}" width="{plot_w}" height="{panel_h:.1f}" fill="{panel_fill}" stroke="#D8DDE3"/>',
+                  f'<text x="{panel_left:.1f}" y="{panel_top-16:.1f}" fill="#1D1D1F" font-size="20" font-weight="700">{title}</text>']
         for step in range(5):
             value = y_max * step / 4
             _x, y = xy(0, value)
-            parts += [f'<path d="M{left} {y:.1f}H{left+plot_w}" stroke="#E5E5EA"/>',
-                      f'<text x="{left-10}" y="{y+4:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{value:.0f}</text>']
+            parts += [f'<path d="M{panel_left} {y:.1f}H{panel_left+plot_w}" stroke="#E5E5EA"/>',
+                      f'<text x="{panel_left-10}" y="{y+4:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{value:.0f}</text>']
         for vdd_step in range(7):
             voltage = vdd_step * .2
             x, _y = xy(voltage, 0)
@@ -3530,7 +3533,7 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
                     label_metadata.append((dataset, row, key, x, y))
         placed_labels = _place_chart_labels(
             label_requests, all_points,
-            (left + 5, panel_top + 5, left + plot_w - 5, panel_bottom - 5), 11.0)
+            (panel_left + 5, panel_top + 5, panel_left + plot_w - 5, panel_bottom - 5), 11.0)
         for (label_x, label_y, anchor), (dataset, row, metric_key, point_x, point_y) in zip(
                 placed_labels, label_metadata):
             label = f'{float(row[metric_key]):.1f} mV'
@@ -3543,8 +3546,10 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
                 f'<text class="vertical-vdd-label" x="{x:.1f}" y="{panel_bottom+24:.1f}" text-anchor="middle" fill="#0062CC" font-size="12" font-weight="700">{voltage:.2f} V</text>',
             ]
         center_y = panel_top + panel_h / 2
-        parts.append(f'<text x="30" y="{center_y:.1f}" transform="rotate(-90 30 {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_label}</text>')
-    parts += [f'<text x="{left+plot_w/2}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
+        axis_x = panel_left - 54
+        parts += [f'<text x="{axis_x:.1f}" y="{center_y:.1f}" transform="rotate(-90 {axis_x:.1f} {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_label}</text>',
+                  f'<text x="{panel_left+plot_w/2:.1f}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Model VDD (V)</text>']
+    parts.append('</svg>')
     return "".join(parts)
 
 
@@ -3554,7 +3559,12 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
     out = Path(out_dir); image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
     svg_path = image_dir / "01_estimate_vmin_combined_comparison.svg"
     png_path = image_dir / "01_estimate_vmin_combined_comparison.png"
+    transparent_svg_path = image_dir / "01_estimate_vmin_combined_comparison_transparent.svg"
+    transparent_png_path = image_dir / "01_estimate_vmin_combined_comparison_transparent.png"
     svg_path.write_text(estimate_vmin_combined_comparison_svg(datasets), encoding="utf-8")
+    transparent_svg_path.write_text(
+        estimate_vmin_combined_comparison_svg(datasets, transparent_background=True),
+        encoding="utf-8")
     try:
         from reportlab.graphics import renderPM
         from svglib.svglib import svg2rlg
@@ -3564,6 +3574,12 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
     if drawing is None:
         raise RuntimeError("Could not render multi-Lot/Wafer comparison")
     renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
+    transparent_drawing = svg2rlg(str(transparent_svg_path))
+    if transparent_drawing is None:
+        raise RuntimeError("Could not render transparent combined comparison")
+    renderPM.drawToFile(
+        transparent_drawing, str(transparent_png_path), fmt="PNG", dpi=180,
+        bg=None, backend="rlPyCairo", backendFmt="RGBA")
     fields = ["lot_wafer", "vdd_v", "sample_count", "rsnm_mv", "wsnm_mv", "write_margin_mv", "source_files"]
     with (out / "estimate_vmin_combined_comparison.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader()
@@ -3574,7 +3590,7 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
                                  "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
                                  "source_files": " | ".join(dataset["sources"])})
     report = out / "estimate_vmin_combined_comparison.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estimate Vmin Combined Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1650px;margin:auto}}h1,.note,.downloads{{text-align:center}}section{{background:#fff;padding:22px;border-radius:16px}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}</style></head><body><main><h1>Estimate Vmin Curves - Comparison View</h1><p class="note">Compared summaries: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}</p><section><img src="images/{png_path.name}" alt="Estimate Vmin combined summary comparison"></section><p class="downloads">Downloads: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a> · <a href="estimate_vmin_combined_comparison.csv">CSV</a></p></main></body></html>''', encoding="utf-8")
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estimate Vmin Combined Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1650px;margin:auto}}h1,.note,.downloads{{text-align:center}}section{{background:#fff;padding:22px;border-radius:16px}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}</style></head><body><main><h1>Estimate Vmin Curves - Comparison View</h1><p class="note">Compared summaries: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}</p><section><img src="images/{png_path.name}" alt="Estimate Vmin combined summary comparison"></section><p class="downloads">Original: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a>　 Transparent background: <a href="images/{transparent_svg_path.name}">SVG</a> · <a href="images/{transparent_png_path.name}">PNG</a>　 Data: <a href="estimate_vmin_combined_comparison.csv">CSV</a></p></main></body></html>''', encoding="utf-8")
     return report
 
 
@@ -4312,51 +4328,49 @@ def _legacy_estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height:
     return "".join(parts)
 
 
-def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 920,
+def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 620,
                               transparent_background: bool = False) -> str:
-    """Render paired comparison panels for SNM and BL write margin."""
+    """Render SNM and BL write margin as two aligned side-by-side panels."""
     groups = (
         ("Read / Write SNM", ("rsnm_mv", "wsnm_mv"), "SNM (mV)"),
         ("BL Write Margin", ("write_margin_mv",), "Vtrip (mV)"),
     )
-    # Reserve independent bands for the report header, each panel header,
-    # axis tick labels and the next panel.  This prevents the lower title and
-    # legend from colliding with the upper panel's VDD labels.
-    left, right, top, bottom, gap = 125, 65, 148, 72, 104
-    plot_w = width - left - right
-    panel_h = (height - top - bottom - gap) / len(groups)
+    left, right, top, bottom, panel_gap = 92, 48, 145, 78, 72
+    plot_w = (width - left - right - panel_gap) / len(groups)
+    panel_h = height - top - bottom
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
     ]
     if not transparent_background:
         parts.append('<rect width="100%" height="100%" fill="#FFFFFF"/>')
     parts += [
-        '<text x="56" y="52" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
-        '<text x="56" y="78" fill="#6E6E73" font-size="16">Top: Read / Write SNM. Bottom: BL write-trip margin. X-axis is Model VDD (V).</text>',
+        '<text x="56" y="46" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
+        '<text x="56" y="73" fill="#6E6E73" font-size="16">Left: Read / Write SNM · Right: BL Write Margin · X-axis: Model VDD (V)</text>',
     ]
     for index, (group_label, keys, y_axis_label) in enumerate(groups):
-        panel_top = top + index * (panel_h + gap)
+        panel_left = left + index * (plot_w + panel_gap)
+        panel_top = top
         panel_bottom = panel_top + panel_h
         curves = [analysis["curves"][key] for key in keys]
         maximum = max((row["margin_mv"] for curve in curves for row in curve["rows"]), default=50.0)
         y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
 
         def xy(vdd: float, margin: float) -> tuple[float, float]:
-            return (left + vdd / SNM_PLOT_AXIS_MAX_V * plot_w,
+            return (panel_left + vdd / SNM_PLOT_AXIS_MAX_V * plot_w,
                     panel_top + (1 - margin / y_max) * panel_h)
 
-        header_y = panel_top - 38
-        parts.append(f'<text x="{left}" y="{header_y:.1f}" fill="#1D1D1F" font-size="21" font-weight="700">{group_label}</text>')
-        legend_x = left + 360
+        header_y = panel_top - 24
+        parts.append(f'<text x="{panel_left}" y="{header_y:.1f}" fill="#1D1D1F" font-size="20" font-weight="700">{group_label}</text>')
+        legend_x = panel_left + (210 if index == 0 else 230)
         for curve_index, curve in enumerate(curves):
             parts += [f'<path d="M{legend_x} {header_y-6:.1f} h26" stroke="{curve["color"]}" stroke-width="4"/>',
-                      f'<text x="{legend_x+34}" y="{header_y:.1f}" fill="#3A3A3C" font-size="15">{curve["label"]}</text>']
-            legend_x += 220
+                      f'<text x="{legend_x+34}" y="{header_y:.1f}" fill="#3A3A3C" font-size="14">{curve["label"]}</text>']
+            legend_x += 145
         for step in range(5):
             margin = y_max * step / 4
             _x, y = xy(0, margin)
-            parts += [f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA"/>',
-                      f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{margin:.0f}</text>']
+            parts += [f'<path d="M{panel_left} {y:.1f} H{panel_left+plot_w}" stroke="#E5E5EA"/>',
+                      f'<text x="{panel_left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{margin:.0f}</text>']
         for vdd_step in range(7):
             x, _y = xy(vdd_step * .2, 0)
             parts.append(f'<path d="M{x:.1f} {panel_top} V{panel_bottom}" stroke="#F1F1F4"/>')
@@ -4399,8 +4413,10 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
                 f'{voltage:.2f} V</text>',
             ]
         center_y = panel_top + panel_h / 2
-        parts.append(f'<text x="36" y="{center_y:.1f}" transform="rotate(-90 36 {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_axis_label}</text>')
-    parts += [f'<text x="{left+plot_w/2}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
+        axis_x = panel_left - 54
+        parts += [f'<text x="{axis_x:.1f}" y="{center_y:.1f}" transform="rotate(-90 {axis_x:.1f} {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_axis_label}</text>',
+                  f'<text x="{panel_left+plot_w/2:.1f}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Model VDD (V)</text>']
+    parts.append('</svg>')
     return "".join(parts)
 
 

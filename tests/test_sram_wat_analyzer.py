@@ -598,6 +598,8 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn('>90.0 mV</text>', stacked)
         self.assertIn('class="vertical-vdd-label"', stacked)
         self.assertIn('>0.50 V</text>', stacked)
+        self.assertIn('Left: Read / Write SNM', stacked)
+        self.assertEqual(stacked.count('>Model VDD (V)</text>'), 2)
         self.assertEqual(stacked.count('class="measured-vdd-guide"'), 6)
         self.assertIn('stroke="#8E8E93" stroke-width="1.4" stroke-dasharray="5 5"', stacked)
         self.assertNotIn('data-extrapolated-to-zero="true"', stacked)
@@ -644,8 +646,9 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("Write SNM", svg)
             self.assertIn("BL Write Margin", svg)
             self.assertIn('class="multi-lot-data-label"', svg)
-            self.assertIn('text-anchor="middle" fill="#1D1D1F" font-size="34"', svg)
-            self.assertIn('text-anchor="middle" fill="#1D1D1F" font-size="20"', svg)
+            self.assertIn('<text x="56" y="46" fill="#1D1D1F" font-size="34"', svg)
+            self.assertEqual(svg.count('y="156.0" fill="#1D1D1F" font-size="20"'), 2)
+            self.assertEqual(svg.count('>Model VDD (V)</text>'), 2)
             self.assertIn('opacity=".42"', svg)
             self.assertIn('>50.0 mV</text>', svg)
             self.assertNotIn('>R 50.0', svg)
@@ -655,6 +658,11 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual(svg.count('class="measured-vdd-guide"'), 4)
             self.assertEqual(svg.count('>0.50 V</text>'), 2)
             self.assertIn('stroke-dasharray="8 5"', svg)
+            transparent = estimate_vmin_combined_comparison_svg(
+                datasets, transparent_background=True)
+            self.assertNotIn('<rect width="100%" height="100%" fill="#FFFFFF"/>',
+                             transparent)
+            self.assertIn('fill="none" stroke="#D8DDE3"', transparent)
 
     def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):
         rows = []
