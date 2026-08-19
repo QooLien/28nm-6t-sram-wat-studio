@@ -3383,89 +3383,85 @@ def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]]) -> dict:
             "definition": "Each VDD point is the minimum per-cell margin in the imported Multi-Cell summary data."}
 
 
-_MULTI_LOT_COLORS = ("#007AFF", "#AF52DE", "#00A844", "#FF9500",
-                     "#FF375F", "#5E5CE6", "#00A6A6", "#8E5A2B")
+_COMPARISON_COLORS = ("#007AFF", "#AF52DE", "#00A844", "#FF9500",
+                      "#FF375F", "#5E5CE6", "#00A6A6", "#8E5A2B")
 
 
-def read_estimate_vmin_output_folders(
-        folders: Iterable[str | os.PathLike[str]]) -> list[dict[str, object]]:
-    """Read two or more Estimate-Vmin output folders and group by Lot/Wafer."""
-    selected = [Path(item).expanduser() for item in folders]
+def read_estimate_vmin_combined_files(
+        paths: Iterable[str | os.PathLike[str]]) -> list[dict[str, object]]:
+    """Read two or more generated ``multi_chip_snm_summary_combined.csv`` files.
+
+    One selected file becomes one comparison data set.  The function does not
+    inspect parent folders or substitute another Estimate-Vmin export, keeping
+    the Comparison View source explicit and reproducible.
+    """
+    selected = [Path(item).expanduser() for item in paths]
     if len(selected) < 2:
-        raise ValueError("Select at least two Estimate Vmin output folders")
-    grouped: dict[str, dict[float, dict[str, object]]] = {}
-    sources: dict[str, set[str]] = {}
-
-    def add_row(lot: str, vdd: float, values: dict[str, float], source: Path) -> None:
-        clean_lot = lot.strip() or source.parent.name or "Unknown_Wafer"
-        by_vdd = grouped.setdefault(clean_lot, {})
-        row = by_vdd.setdefault(vdd, {"vdd_v": vdd, "sample_count": 0})
-        row["sample_count"] = int(row["sample_count"]) + 1
-        for key, value in values.items():
-            if key not in row or value < float(row[key]):
-                row[key] = value
-                row[f"{key}_lot_wafer"] = clean_lot
-        sources.setdefault(clean_lot, set()).add(str(source.resolve()))
-
-    for selected_path in selected:
-        folder = selected_path.parent if selected_path.is_file() else selected_path
-        if not folder.is_dir():
-            raise FileNotFoundError(f"Estimate Vmin output folder was not found: {folder}")
-        detail_path = folder / "estimate_vmin_cr_pr_shmoo.csv"
-        combined_path = folder / "multi_chip_snm_summary_combined.csv"
-        if detail_path.is_file():
-            with detail_path.open(newline="", encoding="utf-8-sig") as stream:
-                reader = csv.DictReader(stream)
-                required = {"vdd_v", "lot_wafer", "rsnm_mv", "wsnm_mv", "write_margin_mv"}
-                if not reader.fieldnames or not required.issubset(reader.fieldnames):
-                    raise ValueError(f"{detail_path} is not a valid Estimate Vmin shmoo export")
-                for number, raw in enumerate(reader, 2):
-                    try:
-                        add_row(str(raw["lot_wafer"]), float(raw["vdd_v"]),
-                                {key: float(raw[key]) for key, *_ in _ESTIMATE_VMIN_METRICS},
-                                detail_path)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(f"{detail_path.name} row {number}: invalid curve value") from exc
-        elif combined_path.is_file():
-            with combined_path.open(newline="", encoding="utf-8-sig") as stream:
-                reader = csv.DictReader(stream)
-                required = {"vdd_v", "rsnm_mv", "wsnm_mv", "write_margin_mv"}
-                if not reader.fieldnames or not required.issubset(reader.fieldnames):
-                    raise ValueError(f"{combined_path} is not a valid Estimate Vmin combined export")
-                for number, raw in enumerate(reader, 2):
-                    lot = (raw.get("rsnm_mv_lot_wafer") or
-                           raw.get("write_margin_mv_lot_wafer") or folder.parent.name)
-                    try:
-                        add_row(str(lot), float(raw["vdd_v"]),
-                                {key: float(raw.get(key, raw["write_margin_mv"]))
-                                 for key, *_ in _ESTIMATE_VMIN_METRICS}, combined_path)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(f"{combined_path.name} row {number}: invalid curve value") from exc
-        else:
-            raise FileNotFoundError(
-                f"{folder} does not contain estimate_vmin_cr_pr_shmoo.csv or "
-                "multi_chip_snm_summary_combined.csv")
-
-    datasets = []
-    for index, (lot, by_vdd) in enumerate(sorted(grouped.items())):
-        rows = [by_vdd[vdd] for vdd in sorted(by_vdd)]
+        raise ValueError("Select at least two multi_chip_snm_summary_combined.csv files")
+    datasets: list[dict[str, object]] = []
+    used_labels: set[str] = set()
+    required = {"vdd_v", "rsnm_mv", "wsnm_mv", "write_margin_mv"}
+    for index, path in enumerate(selected):
+        if not path.is_file():
+            raise FileNotFoundError(f"Estimate Vmin combined summary was not found: {path}")
+        if path.suffix.lower() != ".csv":
+            raise ValueError(f"{path.name} is not a CSV combined summary")
+        rows: list[dict[str, object]] = []
+        lot_names: list[str] = []
+        with path.open(newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                raise ValueError(
+                    f"{path.name} is not a valid multi_chip_snm_summary_combined.csv export")
+            for number, raw in enumerate(reader, 2):
+                try:
+                    vdd = float(raw["vdd_v"])
+                    if not 0 < vdd <= SNM_PLOT_AXIS_MAX_V:
+                        raise ValueError
+                    row: dict[str, object] = {
+                        "vdd_v": vdd,
+                        "sample_count": int(float(raw.get("sample_count") or 1)),
+                    }
+                    for key, *_ in _ESTIMATE_VMIN_METRICS:
+                        row[key] = float(raw[key])
+                        lot_key = f"{key}_lot_wafer"
+                        chip_key = f"{key}_chip_id"
+                        if raw.get(lot_key):
+                            row[lot_key] = str(raw[lot_key]).strip()
+                            lot_names.append(str(raw[lot_key]).strip())
+                        if raw.get(chip_key):
+                            row[chip_key] = str(raw[chip_key]).strip()
+                    rows.append(row)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{path.name} row {number}: invalid curve value") from exc
+        rows.sort(key=lambda item: float(item["vdd_v"]))
         if len(rows) < 2:
-            raise ValueError(f"Lot/Wafer {lot} has fewer than two Model VDD points")
-        datasets.append({"lot_wafer": lot, "rows": rows,
-                         "color": _MULTI_LOT_COLORS[index % len(_MULTI_LOT_COLORS)],
-                         "sources": sorted(sources[lot])})
-    if len(datasets) < 2:
-        raise ValueError("The selected folders must contain at least two different Lot/Wafer names")
+            raise ValueError(f"{path.name} has fewer than two Model VDD points")
+        unique_lots = sorted({item for item in lot_names if item})
+        label = unique_lots[0] if len(unique_lots) == 1 else path.parent.name
+        if not label:
+            label = path.stem
+        if label in used_labels:
+            label = f"{label} · {path.parent.name}"
+        used_labels.add(label)
+        datasets.append({
+            "lot_wafer": label,
+            "rows": rows,
+            "color": _COMPARISON_COLORS[index % len(_COMPARISON_COLORS)],
+            "sources": [str(path.resolve())],
+        })
     return datasets
 
 
-def estimate_vmin_multi_lot_svg(datasets: list[dict[str, object]],
+def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
                                 width: int = 1500, height: int = 1180) -> str:
-    """Overlay two or more Lot/Wafer VDD curves in three aligned panels."""
-    groups = (("rsnm_mv", "Read SNM", "RSNM (mV)"),
-              ("wsnm_mv", "Write SNM", "Write SNM (mV)"),
-              ("write_margin_mv", "BL Write Margin", "Vtrip (mV)"))
-    left, right, bottom, gap = 120, 55, 70, 78
+    """Overlay combined-summary files in paired SNM and BL-margin panels."""
+    groups = (
+        ("Read / Write SNM",
+         (("rsnm_mv", "R", ""), ("wsnm_mv", "W", "8 5")), "SNM (mV)"),
+        ("BL Write Margin", (("write_margin_mv", "BL", ""),), "Vtrip (mV)"),
+    )
+    left, right, bottom, gap = 120, 55, 92, 108
     legend_items = [(str(item["lot_wafer"]),
                      max(210.0, 78.0 + len(str(item["lot_wafer"])) * 9.5),
                      str(item["color"])) for item in datasets]
@@ -3475,26 +3471,29 @@ def estimate_vmin_multi_lot_svg(datasets: list[dict[str, object]],
         if legend_rows[-1] and current_width + item[1] > width - left - right:
             legend_rows.append([]); current_width = 0.0
         legend_rows[-1].append(item); current_width += item[1]
-    top = 134 + len(legend_rows) * 28
+    top = 164 + len(legend_rows) * 28
     plot_w = width - left - right
     panel_h = (height - top - bottom - gap * (len(groups) - 1)) / len(groups)
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
              '<rect width="100%" height="100%" fill="#FFFFFF"/>',
-             f'<text x="{width/2:.1f}" y="52" text-anchor="middle" fill="#1D1D1F" font-size="34" font-weight="700">Multi Lot/Wafer Estimate Vmin Curve Comparison</text>',
-             f'<text x="{width/2:.1f}" y="80" text-anchor="middle" fill="#6E6E73" font-size="16">{len(datasets)} Lot/Wafer data sets · labels show measured margin at each Model VDD</text>']
+             f'<text x="{width/2:.1f}" y="52" text-anchor="middle" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
+             f'<text x="{width/2:.1f}" y="80" text-anchor="middle" fill="#6E6E73" font-size="16">{len(datasets)} combined summary files · solid Read / dashed Write · measured VDD guides only</text>',
+             '<path d="M120 109h30" stroke="#3A3A3C" stroke-width="4"/><text x="160" y="114" fill="#3A3A3C" font-size="14">Read SNM / BL Write Margin</text>',
+             '<path d="M390 109h30" stroke="#3A3A3C" stroke-width="4" stroke-dasharray="8 5"/><text x="430" y="114" fill="#3A3A3C" font-size="14">Write SNM</text>']
     for row_index, legend_row in enumerate(legend_rows):
         row_width = sum(item[1] for item in legend_row)
         legend_x = (width - row_width) / 2.0
-        legend_y = 112 + row_index * 28
+        legend_y = 142 + row_index * 28
         for label_text, item_width, color in legend_row:
             label = html.escape(label_text)
             parts += [f'<path d="M{legend_x} {legend_y-5}h30" stroke="{color}" stroke-width="4"/>',
                       f'<text x="{legend_x+38}" y="{legend_y}" fill="#30343B" font-size="14" font-weight="700">{label}</text>']
             legend_x += item_width
-    for panel_index, (key, title, y_label) in enumerate(groups):
+    for panel_index, (title, series_specs, y_label) in enumerate(groups):
         panel_top = top + panel_index * (panel_h + gap)
         panel_bottom = panel_top + panel_h
-        maximum = max(float(row[key]) for dataset in datasets for row in dataset["rows"])
+        maximum = max(float(row[key]) for dataset in datasets
+                      for key, _prefix, _dash in series_specs for row in dataset["rows"])
         y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
 
         def xy(vdd: float, value: float) -> tuple[float, float]:
@@ -3511,44 +3510,57 @@ def estimate_vmin_multi_lot_svg(datasets: list[dict[str, object]],
         for vdd_step in range(7):
             voltage = vdd_step * .2
             x, _y = xy(voltage, 0)
-            parts += [f'<path d="M{x:.1f} {panel_top}V{panel_bottom}" stroke="#F1F1F4"/>',
-                      f'<text x="{x:.1f}" y="{panel_bottom+20:.1f}" text-anchor="middle" fill="#6E6E73" font-size="11">{voltage:.1f}</text>']
+            parts.append(f'<path d="M{x:.1f} {panel_top}V{panel_bottom}" stroke="#F1F1F4"/>')
         all_points = [xy(float(row["vdd_v"]), float(row[key]))
-                      for dataset in datasets for row in dataset["rows"]]
+                      for dataset in datasets for key, _prefix, _dash in series_specs
+                      for row in dataset["rows"]]
         label_requests: list[tuple[float, float, str]] = []
-        label_metadata: list[tuple[dict[str, object], dict[str, object], float, float]] = []
+        label_metadata: list[tuple[dict[str, object], dict[str, object], str, float, float]] = []
+        measured_guides: dict[float, float] = {}
         for dataset in datasets:
-            points = [xy(float(row["vdd_v"]), float(row[key])) for row in dataset["rows"]]
-            parts.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in points)}" fill="none" stroke="{dataset["color"]}" stroke-width="3"/>')
-            for row, (x, y) in zip(dataset["rows"], points):
-                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{dataset["color"]}" stroke-width="2"/>')
-                label_requests.append((x, y, f'{float(row[key]):.1f}'))
-                label_metadata.append((dataset, row, x, y))
+            for key, prefix, dash in series_specs:
+                points = [xy(float(row["vdd_v"]), float(row[key])) for row in dataset["rows"]]
+                dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
+                parts.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in points)}" fill="none" stroke="{dataset["color"]}" stroke-width="3"{dash_attr}/>')
+                for row, (x, y) in zip(dataset["rows"], points):
+                    voltage = float(row["vdd_v"])
+                    measured_guides[voltage] = min(y, measured_guides.get(voltage, panel_bottom))
+                    parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{dataset["color"]}" stroke-width="2"/>')
+                    label_requests.append((x, y, f'{prefix} {float(row[key]):.1f}'))
+                    label_metadata.append((dataset, row, prefix, x, y))
         placed_labels = _place_chart_labels(
             label_requests, all_points,
             (left + 5, panel_top + 5, left + plot_w - 5, panel_bottom - 5), 11.0)
-        for (label_x, label_y, anchor), (dataset, row, point_x, point_y) in zip(
+        for (label_x, label_y, anchor), (dataset, row, prefix, point_x, point_y) in zip(
                 placed_labels, label_metadata):
-            label = f'{float(row[key]):.1f}'
+            metric_key = ("rsnm_mv" if prefix == "R" else
+                          "wsnm_mv" if prefix == "W" else "write_margin_mv")
+            label = f'{prefix} {float(row[metric_key]):.1f}'
             label_width = max(42.0, len(label) * 11.0 * .56)
             label_left = (label_x - label_width / 2 if anchor == "middle" else
                           label_x - label_width if anchor == "end" else label_x)
             parts += [f'<path d="M{point_x:.1f} {point_y:.1f}L{label_x:.1f} {label_y-5:.1f}" stroke="{dataset["color"]}" stroke-width="1" opacity=".42"/>',
                       f'<rect x="{label_left-3:.1f}" y="{label_y-13:.1f}" width="{label_width+6:.1f}" height="17" rx="3" fill="#FFFFFF" fill-opacity=".90"/>',
                       f'<text class="multi-lot-data-label" x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" fill="{dataset["color"]}" font-size="11" font-weight="700">{label}</text>']
+        for voltage, guide_y in sorted(measured_guides.items()):
+            x, _y = xy(voltage, 0)
+            parts += [
+                f'<path class="measured-vdd-guide" data-vdd="{voltage:.4f}" d="M{x:.1f} {guide_y+6:.1f}V{panel_bottom:.1f}" stroke="#B9D7FF" stroke-width="1.4"/>',
+                f'<text class="vertical-vdd-label" x="{x:.1f}" y="{panel_bottom+24:.1f}" text-anchor="middle" fill="#0062CC" font-size="12" font-weight="700">{voltage:.2f} V</text>',
+            ]
         center_y = panel_top + panel_h / 2
         parts.append(f'<text x="30" y="{center_y:.1f}" transform="rotate(-90 30 {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_label}</text>')
     parts += [f'<text x="{left+plot_w/2}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
     return "".join(parts)
 
 
-def write_estimate_vmin_multi_lot_outputs(datasets: list[dict[str, object]],
+def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, object]],
                                           out_dir: str | os.PathLike[str]) -> Path:
     """Export the multi-Lot/Wafer comparison as HTML, SVG, PNG and CSV."""
     out = Path(out_dir); image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
-    svg_path = image_dir / "01_multi_lot_wafer_vmin_comparison.svg"
-    png_path = image_dir / "01_multi_lot_wafer_vmin_comparison.png"
-    svg_path.write_text(estimate_vmin_multi_lot_svg(datasets), encoding="utf-8")
+    svg_path = image_dir / "01_estimate_vmin_combined_comparison.svg"
+    png_path = image_dir / "01_estimate_vmin_combined_comparison.png"
+    svg_path.write_text(estimate_vmin_combined_comparison_svg(datasets), encoding="utf-8")
     try:
         from reportlab.graphics import renderPM
         from svglib.svglib import svg2rlg
@@ -3558,17 +3570,17 @@ def write_estimate_vmin_multi_lot_outputs(datasets: list[dict[str, object]],
     if drawing is None:
         raise RuntimeError("Could not render multi-Lot/Wafer comparison")
     renderPM.drawToFile(drawing, str(png_path), fmt="PNG", dpi=180, backend="rlPyCairo")
-    fields = ["lot_wafer", "vdd_v", "sample_count", "rsnm_mv", "wsnm_mv", "write_margin_mv", "source_folders"]
-    with (out / "multi_lot_wafer_vmin_comparison.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+    fields = ["lot_wafer", "vdd_v", "sample_count", "rsnm_mv", "wsnm_mv", "write_margin_mv", "source_files"]
+    with (out / "estimate_vmin_combined_comparison.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader()
         for dataset in datasets:
             for row in dataset["rows"]:
                 writer.writerow({"lot_wafer": dataset["lot_wafer"], "vdd_v": row["vdd_v"],
                                  "sample_count": row["sample_count"], "rsnm_mv": row["rsnm_mv"],
                                  "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
-                                 "source_folders": " | ".join(dataset["sources"])})
-    report = out / "multi_lot_wafer_vmin_comparison.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Multi Lot/Wafer Vmin Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1650px;margin:auto}}h1,.note,.downloads{{text-align:center}}section{{background:#fff;padding:22px;border-radius:16px}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}</style></head><body><main><h1>Multi Lot/Wafer Estimate Vmin Comparison</h1><p class="note">Compared Lot/Wafer: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}</p><section><img src="images/{png_path.name}" alt="Multi Lot Wafer Vmin curve comparison"></section><p class="downloads">Downloads: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a> · <a href="multi_lot_wafer_vmin_comparison.csv">CSV</a></p></main></body></html>''', encoding="utf-8")
+                                 "source_files": " | ".join(dataset["sources"])})
+    report = out / "estimate_vmin_combined_comparison.html"
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estimate Vmin Combined Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1650px;margin:auto}}h1,.note,.downloads{{text-align:center}}section{{background:#fff;padding:22px;border-radius:16px}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}</style></head><body><main><h1>Estimate Vmin Curves - Comparison View</h1><p class="note">Compared summaries: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}</p><section><img src="images/{png_path.name}" alt="Estimate Vmin combined summary comparison"></section><p class="downloads">Downloads: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a> · <a href="estimate_vmin_combined_comparison.csv">CSV</a></p></main></body></html>''', encoding="utf-8")
     return report
 
 
@@ -4063,24 +4075,25 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 .interactive-shmoo{{width:100%;min-width:0;overflow-x:auto}}
 .interactive-shmoo circle.measured-cell{{cursor:help}}
 .note{{color:#6e6e73}}
-#cell-tooltip{{position:fixed;z-index:9999;display:none;width:390px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:hidden;padding:18px 20px;border-radius:14px;background:#1d1d1f;color:#fff;box-shadow:0 10px 34px rgba(0,0,0,.26);font-size:13px;line-height:1.45;pointer-events:none}}
+#cell-tooltip{{position:fixed;z-index:9999;display:none;width:520px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow-x:hidden;overflow-y:auto;padding:15px 17px;border-radius:14px;background:#1d1d1f;color:#fff;box-shadow:0 10px 34px rgba(0,0,0,.26);font-size:13px;line-height:1.35;pointer-events:auto;overscroll-behavior:contain;scrollbar-width:thin}}
 .tooltip-title{{font-size:17px;font-weight:700;margin-bottom:6px}}
-.tooltip-meta{{display:grid;grid-template-columns:1fr;gap:3px;color:#c8c8cc;margin-bottom:16px}}
+.tooltip-meta{{display:grid;grid-template-columns:1fr;gap:2px;color:#c8c8cc;margin-bottom:11px}}
 .tooltip-section-label{{color:#aeb0b5;font-size:11px;font-weight:700;letter-spacing:.07em;margin:0 0 7px;text-transform:uppercase}}
-.tooltip-metrics{{display:grid;grid-template-columns:1fr;gap:1px;margin-bottom:16px;border-radius:9px;overflow:hidden;background:#46464b}}
-.tooltip-metric{{display:flex;align-items:baseline;justify-content:space-between;gap:18px;padding:9px 11px;background:#303034}}
+.tooltip-metrics{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;margin-bottom:11px;border-radius:9px;overflow:hidden;background:#46464b}}
+.tooltip-metric{{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding:7px 9px;background:#303034;min-width:0}}
 .tooltip-metric-label{{color:#b8b8bd;font-size:12px}}
 .tooltip-metric-value{{color:#fff;font-weight:700;text-align:right;font-variant-numeric:tabular-nums}}
-.tooltip-device-list{{display:grid;grid-template-columns:1fr;gap:9px}}
-.tooltip-device-card{{display:grid;grid-template-columns:1fr;gap:5px;padding:10px 12px;border-left:3px solid #8e8e93;border-radius:9px;background:#303034;font-variant-numeric:tabular-nums}}
+.tooltip-device-list{{display:grid;grid-template-columns:1fr;gap:6px}}
+.tooltip-device-card{{display:grid;grid-template-columns:1fr;gap:3px;padding:7px 10px;border-left:3px solid #8e8e93;border-radius:9px;background:#303034;font-variant-numeric:tabular-nums}}
 .tooltip-device-card[data-family="PU"]{{border-left-color:#ff453a}}
 .tooltip-device-card[data-family="PG"]{{border-left-color:#30d158}}
 .tooltip-device-card[data-family="PD"]{{border-left-color:#0a84ff}}
-.tooltip-device-name{{font-size:14px;font-weight:700;color:#fff;padding-bottom:5px;margin-bottom:1px;border-bottom:1px solid #47474c}}
+.tooltip-device-name{{font-size:14px;font-weight:700;color:#fff;padding-bottom:3px;margin-bottom:1px;border-bottom:1px solid #47474c}}
 .tooltip-device-value{{display:flex;justify-content:space-between;gap:16px;color:#fff}}
 .tooltip-device-label{{color:#aeb0b5}}
 .tooltip-device-reading{{display:flex;align-items:baseline;gap:8px;text-align:right}}
 .tooltip-device-delta{{color:#ffd60a;font-size:11px;font-weight:700}}
+@media(max-width:600px){{.tooltip-metrics{{grid-template-columns:1fr}}}}
 </style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1>
 <p class="note">{html.escape(analysis["definition"])}</p>
 <p class="note">At each Model VDD, every cell is ranked by its CR percentile and PR percentile; the weaker drive-ratio percentile determines its wafer-relative grade. Green means both are at or above the median, yellow means the weaker ratio is P25–P50, and red means it is below P25. RSNM and BL Write Trip Margin percentiles are retained for correlation, while residual WSNM remains a separate diagnostic. X=βPG/βPU=PR (right improves write); Y=βPD/βPG=CR (up improves read). These colors are not absolute silicon Pass/Fail.</p>
@@ -4089,6 +4102,7 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 </main><div id="cell-tooltip" role="tooltip"></div>
 <script>
 const cellTooltip=document.getElementById('cell-tooltip');
+let cellTooltipHideTimer=null;
 const makeTooltipNode=(className,text)=>{{
   const node=document.createElement('div');
   node.className=className;
@@ -4168,19 +4182,22 @@ const moveCellTooltip=(event)=>{{
 }};
 document.querySelectorAll('[data-cell-tooltip]').forEach((mark)=>{{
   const show=(event)=>{{
+    clearTimeout(cellTooltipHideTimer);
     renderCellTooltip(mark.dataset.cellTooltip);
     cellTooltip.style.display='block';
     moveCellTooltip(event);
   }};
   mark.addEventListener('mouseenter',show);
   mark.addEventListener('mousemove',moveCellTooltip);
-  mark.addEventListener('mouseleave',()=>{{cellTooltip.style.display='none';}});
+  mark.addEventListener('mouseleave',()=>{{cellTooltipHideTimer=setTimeout(()=>{{cellTooltip.style.display='none';}},160);}});
   mark.addEventListener('focus',()=>{{
     const box=mark.getBoundingClientRect();
     show({{clientX:box.left+box.width/2,clientY:box.top+box.height/2}});
   }});
-  mark.addEventListener('blur',()=>{{cellTooltip.style.display='none';}});
+  mark.addEventListener('blur',()=>{{cellTooltipHideTimer=setTimeout(()=>{{cellTooltip.style.display='none';}},160);}});
 }});
+cellTooltip.addEventListener('mouseenter',()=>clearTimeout(cellTooltipHideTimer));
+cellTooltip.addEventListener('mouseleave',()=>{{cellTooltip.style.display='none';}});
 </script></body></html>''', encoding="utf-8")
     return report
 
@@ -4349,19 +4366,14 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
         for vdd_step in range(7):
             x, _y = xy(vdd_step * .2, 0)
             parts.append(f'<path d="M{x:.1f} {panel_top} V{panel_bottom}" stroke="#F1F1F4"/>')
-        for curve in curves:
+        measured_vdd_guides: dict[float, float] = {}
+        for curve_index, curve in enumerate(curves):
             points = [xy(row["vdd_v"], row["margin_mv"]) for row in curve["rows"]]
             point_string = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
             parts.append(f'<polyline points="{point_string}" fill="none" stroke="{curve["color"]}" stroke-width="3.5"/>')
-            closure = curve.get("eye_closure")
-            if closure and closure.get("extrapolated") and points:
-                closure_x, closure_y = xy(float(closure["estimated_vdd_v"]), 0.0)
-                first_x, first_y = points[0]
-                parts.append(
-                    f'<path data-extrapolated-to-zero="true" d="M{closure_x:.1f} {closure_y:.1f}L{first_x:.1f} {first_y:.1f}" '
-                    f'fill="none" stroke="{curve["color"]}" stroke-width="3.5" '
-                    f'stroke-dasharray="8 6" stroke-linecap="round"/>')
             for point_index, (_row, (x, y)) in enumerate(zip(curve["rows"], points)):
+                vdd = float(_row["vdd_v"])
+                measured_vdd_guides[vdd] = min(y, measured_vdd_guides.get(vdd, panel_bottom))
                 parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{curve["color"]}" stroke-width="2.2"/>')
                 # Keep the two SNM series readable when their points are close:
                 # Read labels sit above and Write labels below.  A label near
@@ -4380,22 +4392,18 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
                     f'x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{label_anchor}" '
                     f'fill="{curve["color"]}" font-size="11" font-weight="700">'
                     f'{float(_row["margin_mv"]):.1f} mV</text>')
-        if "rsnm_mv" in keys:
-            rows = analysis["curves"]["rsnm_mv"]["rows"]
-            if len(rows) >= 2:
-                _low, marker = max(
-                    zip(rows, rows[1:]),
-                    key=lambda pair: abs((pair[1]["margin_mv"] - pair[0]["margin_mv"]) /
-                                         (pair[1]["vdd_v"] - pair[0]["vdd_v"])))
-                marker_x, _marker_y = xy(marker["vdd_v"], marker["margin_mv"])
-                parts += [f'<path d="M{marker_x:.1f} {panel_top} V{panel_bottom}" stroke="#FF385C" stroke-width="2" stroke-dasharray="5 5"/>',
-                          f'<text x="{marker_x+8:.1f}" y="{panel_top+20:.1f}" fill="#C13515" font-size="13" font-weight="700">Largest RSNM slope: {marker["vdd_v"]:.2f} V</text>',
-                          f'<rect x="{marker_x-29:.1f}" y="{panel_bottom+29:.1f}" width="58" height="22" rx="5" fill="#FFF1F3" stroke="#FF385C"/>',
-                          f'<text class="vertical-vdd-label" x="{marker_x:.1f}" y="{panel_bottom+45:.1f}" text-anchor="middle" fill="#C13515" font-size="12" font-weight="700">{marker["vdd_v"]:.2f} V</text>']
-        for vdd_step in range(7):
-            voltage = vdd_step * .2
+        # One measured-VDD guide per voltage and panel.  Read and Write SNM
+        # share the same guide in the upper panel instead of duplicating it.
+        for voltage, guide_y in sorted(measured_vdd_guides.items()):
             x, _y = xy(voltage, 0)
-            parts.append(f'<text x="{x:.1f}" y="{panel_bottom+23:.1f}" text-anchor="middle" fill="#6E6E73" font-size="12">{voltage:.1f}</text>')
+            parts += [
+                f'<path class="measured-vdd-guide" data-vdd="{voltage:.4f}" '
+                f'd="M{x:.1f} {guide_y+6:.1f}V{panel_bottom:.1f}" '
+                'stroke="#B9D7FF" stroke-width="1.4"/>',
+                f'<text class="vertical-vdd-label" x="{x:.1f}" y="{panel_bottom+23:.1f}" '
+                f'text-anchor="middle" fill="#0062CC" font-size="12" font-weight="700">'
+                f'{voltage:.2f} V</text>',
+            ]
         center_y = panel_top + panel_h / 2
         parts.append(f'<text x="36" y="{center_y:.1f}" transform="rotate(-90 36 {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_axis_label}</text>')
     parts += [f'<text x="{left+plot_w/2}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="18" font-weight="700">Model VDD (V)</text>', '</svg>']
@@ -7142,10 +7150,18 @@ def launch_gui() -> None:
         selected_summary_text.set(
             f"{len(selected_summary_paths)} previously selected summary file(s)\n" +
             "\n".join(Path(item).name for item in selected_summary_paths[:5]))
-    comparison_output_folders: list[str] = []
-    comparison_folder_text = tk.StringVar(
-        value="Multi Curve comparison: no Estimate Vmin output folders selected")
-    tk.Label(curve_input_card, textvariable=comparison_folder_text, bg=CARD, fg=SECONDARY,
+    comparison_summary_paths: list[str] = []
+    saved_comparison_paths = saved_state.get("estimate_vmin_comparison_paths", [])
+    if isinstance(saved_comparison_paths, list):
+        comparison_summary_paths.extend(
+            str(item) for item in saved_comparison_paths if Path(str(item)).is_file())
+    comparison_file_text = tk.StringVar(
+        value="Comparison View: no combined summary files selected")
+    if comparison_summary_paths:
+        comparison_file_text.set(
+            f"Comparison View: {len(comparison_summary_paths)} combined file(s)\n" +
+            "\n".join(Path(item).name for item in comparison_summary_paths[:5]))
+    tk.Label(curve_input_card, textvariable=comparison_file_text, bg=CARD, fg=SECONDARY,
              font=("Calibri", 9), anchor="w", justify="left", wraplength=560).pack(
                  fill="x", pady=(0, 8))
 
@@ -7465,33 +7481,34 @@ def launch_gui() -> None:
         except Exception as exc:
             curve_result_queue.put((False, None, exc))
 
-    def comparison_worker(folders: list[str], out_path: Path) -> None:
+    def comparison_worker(summary_files: list[str], out_path: Path) -> None:
         try:
-            datasets = read_estimate_vmin_output_folders(folders)
+            datasets = read_estimate_vmin_combined_files(summary_files)
             run_dir = create_run_output_dir(
-                out_path, "Multi_Lot_Wafer", "estimate_vmin_curve_comparison")
-            report = write_estimate_vmin_multi_lot_outputs(datasets, run_dir)
+                out_path, "Combined_Summaries", "estimate_vmin_curve_comparison")
+            report = write_estimate_vmin_combined_comparison_outputs(datasets, run_dir)
             comparison_result_queue.put((True, datasets, report))
         except Exception as exc:
             comparison_result_queue.put((False, None, exc))
 
-    def add_comparison_output_folder() -> None:
-        selected = filedialog.askdirectory(
-            title="Add Estimate Vmin output folder",
-            initialdir=values["out"].get())
+    def import_comparison_combined_files() -> None:
+        selected = filedialog.askopenfilenames(
+            title="Import multi_chip_snm_summary_combined.csv files",
+            initialdir=values["out"].get(),
+            filetypes=[("Estimate Vmin combined summary", "*.csv"),
+                       ("All files", "*.*")])
         if not selected:
             return
-        resolved = str(Path(selected).resolve())
-        if resolved not in comparison_output_folders:
-            comparison_output_folders.append(resolved)
-        comparison_folder_text.set(
-            f"Multi Curve comparison: {len(comparison_output_folders)} folder(s)\n" +
-            "\n".join(Path(item).name for item in comparison_output_folders[-4:]))
+        comparison_summary_paths[:] = [str(Path(item).resolve()) for item in selected]
+        comparison_file_text.set(
+            f"Comparison View: {len(comparison_summary_paths)} combined file(s)\n" +
+            "\n".join(Path(item).name for item in comparison_summary_paths[:5]))
+        curve_status.set("Ready to compare selected combined summary files")
+        curve_status_label.configure(fg=SECONDARY)
 
-    def clear_comparison_output_folders() -> None:
-        comparison_output_folders.clear()
-        comparison_folder_text.set(
-            "Multi Curve comparison: no Estimate Vmin output folders selected")
+    def clear_comparison_summary_files() -> None:
+        comparison_summary_paths.clear()
+        comparison_file_text.set("Comparison View: no combined summary files selected")
 
     def poll_comparison_result() -> None:
         try:
@@ -7503,29 +7520,29 @@ def launch_gui() -> None:
         curve_compare_button.state(["!disabled"])
         if ok:
             curve_status.set(
-                f"Multi Curve comparison complete: {len(datasets)} Lot/Wafer curves")
+                f"Comparison View complete: {len(datasets)} combined summaries")
             curve_status_label.configure(fg=GREEN)
             webbrowser.open(Path(payload).resolve().as_uri())
         else:
-            curve_status.set("Multi Curve folder comparison could not be completed")
+            curve_status.set("Combined-summary comparison could not be completed")
             curve_status_label.configure(fg=RED)
             messagebox.showerror("Multi Curve Comparison", str(payload))
 
-    def execute_folder_comparison() -> None:
-        if len(comparison_output_folders) < 2:
-            curve_status.set("Add at least two Estimate Vmin output folders")
+    def execute_combined_file_comparison() -> None:
+        if len(comparison_summary_paths) < 2:
+            curve_status.set("Select at least two combined summary CSV files")
             curve_status_label.configure(fg=RED)
             messagebox.showerror(
                 "Multi Curve Comparison",
-                "Add at least two output folders. Click 'Add Comparison Folder' once for each folder.")
+                "Select at least two multi_chip_snm_summary_combined.csv files.")
             return
-        curve_status.set("Reading output folders and comparing curves by Lot/Wafer...")
+        curve_status.set("Reading combined summaries and drawing Comparison View...")
         curve_status_label.configure(fg=BLUE)
         curve_compare_button.state(["disabled"])
         curve_progress.start(10)
         threading.Thread(
             target=comparison_worker,
-            args=(list(comparison_output_folders), Path(values["out"].get())),
+            args=(list(comparison_summary_paths), Path(values["out"].get())),
             daemon=True).start()
         root.after(80, poll_comparison_result)
 
@@ -7626,13 +7643,13 @@ def launch_gui() -> None:
     curve_transparent_button.pack(fill="x", pady=(7, 0))
     curve_transparent_button.state(["disabled"])
     ttk.Separator(curve_action_row, orient="horizontal").pack(fill="x", pady=(12, 7))
-    ttk.Button(curve_action_row, text="Add Comparison Folder...", style="Quiet.TButton",
-               command=add_comparison_output_folder).pack(fill="x")
-    ttk.Button(curve_action_row, text="Clear Comparison Folders", style="Quiet.TButton",
-               command=clear_comparison_output_folders).pack(fill="x", pady=(7, 0))
+    ttk.Button(curve_action_row, text="Import Combined Summaries...", style="Quiet.TButton",
+               command=import_comparison_combined_files).pack(fill="x")
+    ttk.Button(curve_action_row, text="Clear Comparison Files", style="Quiet.TButton",
+               command=clear_comparison_summary_files).pack(fill="x", pady=(7, 0))
     curve_compare_button = ttk.Button(
-        curve_action_row, text="Compare 2+ Lot/Wafer Curves", style="Accent.TButton",
-        command=execute_folder_comparison)
+        curve_action_row, text="Create Comparison View", style="Accent.TButton",
+        command=execute_combined_file_comparison)
     curve_compare_button.pack(fill="x", pady=(7, 0))
 
     # Independent write-trip analysis. It intentionally reuses the same manual
@@ -7786,6 +7803,7 @@ def launch_gui() -> None:
             "assumptions": {key: variable.get() for key, variable in assumption_values.items()},
             "training": {key: variable.get() for key, variable in training_values.items()},
             "estimate_vmin_summary_paths": list(selected_summary_paths),
+            "estimate_vmin_comparison_paths": list(comparison_summary_paths),
         }
         try:
             save_gui_state(state)

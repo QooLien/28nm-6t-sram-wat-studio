@@ -9,7 +9,7 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_curve_svg, estimate_vmin_multi_lot_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_output_folders,
+    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_combined_comparison_svg, estimate_vmin_curve_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_combined_files,
     analyze_write_trip_margin_curve,
     generic_28nm_assumption_rows,
     drive_monitor_metrics, drive_monitor_shmoo_reference,
@@ -598,34 +598,45 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn('>90.0 mV</text>', stacked)
         self.assertIn('class="vertical-vdd-label"', stacked)
         self.assertIn('>0.50 V</text>', stacked)
+        self.assertEqual(stacked.count('class="measured-vdd-guide"'), 6)
+        self.assertNotIn('data-extrapolated-to-zero="true"', stacked)
+        self.assertNotIn("Largest RSNM slope:", stacked)
         transparent = estimate_vmin_stacked_svg(result, transparent_background=True)
         self.assertNotIn('<rect width="100%" height="100%" fill="#FFFFFF"/>', transparent)
 
-    def test_multi_lot_curve_comparison_reads_two_output_folders(self):
+    def test_combined_summary_comparison_reads_two_files(self):
         with tempfile.TemporaryDirectory() as td:
-            folders = []
-            fields = ["vdd_v", "lot_wafer", "chip_id", "rsnm_mv", "wsnm_mv",
-                      "write_margin_mv"]
+            paths = []
+            fields = ["vdd_v", "sample_count", "rsnm_mv", "rsnm_mv_lot_wafer",
+                      "rsnm_mv_chip_id", "wsnm_mv", "wsnm_mv_lot_wafer",
+                      "wsnm_mv_chip_id", "write_margin_mv",
+                      "write_margin_mv_lot_wafer", "write_margin_mv_chip_id"]
             for folder_index, lot in enumerate(("LOT_A_W01", "LOT_B_W02")):
                 folder = Path(td) / f"output_{folder_index+1}"
                 folder.mkdir()
-                with (folder / "estimate_vmin_cr_pr_shmoo.csv").open(
+                path = folder / "multi_chip_snm_summary_combined.csv"
+                with path.open(
                         "w", newline="", encoding="utf-8-sig") as stream:
                     writer = csv.DictWriter(stream, fieldnames=fields)
                     writer.writeheader()
                     for vdd, base in ((.5, 50.0), (.7, 90.0)):
-                        writer.writerow({"vdd_v": vdd, "lot_wafer": lot,
-                                         "chip_id": "C01",
+                        writer.writerow({"vdd_v": vdd, "sample_count": 8,
                                          "rsnm_mv": base + folder_index * 10,
+                                         "rsnm_mv_lot_wafer": lot,
+                                         "rsnm_mv_chip_id": "C01",
                                          "wsnm_mv": base + 20 + folder_index * 10,
-                                         "write_margin_mv": base / 2 + folder_index * 5})
-                folders.append(folder)
-            datasets = read_estimate_vmin_output_folders(folders)
+                                         "wsnm_mv_lot_wafer": lot,
+                                         "wsnm_mv_chip_id": "C02",
+                                         "write_margin_mv": base / 2 + folder_index * 5,
+                                         "write_margin_mv_lot_wafer": lot,
+                                         "write_margin_mv_chip_id": "C03"})
+                paths.append(path)
+            datasets = read_estimate_vmin_combined_files(paths)
             self.assertEqual([item["lot_wafer"] for item in datasets],
                              ["LOT_A_W01", "LOT_B_W02"])
             self.assertEqual(len(datasets[0]["rows"]), 2)
-            svg = estimate_vmin_multi_lot_svg(datasets)
-            self.assertIn("Multi Lot/Wafer Estimate Vmin Curve Comparison", svg)
+            svg = estimate_vmin_combined_comparison_svg(datasets)
+            self.assertIn("Estimate Vmin Curves - Comparison View", svg)
             self.assertIn("LOT_A_W01", svg)
             self.assertIn("LOT_B_W02", svg)
             self.assertIn("Read SNM", svg)
@@ -635,6 +646,9 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn('text-anchor="middle" fill="#1D1D1F" font-size="34"', svg)
             self.assertIn('text-anchor="middle" fill="#1D1D1F" font-size="20"', svg)
             self.assertIn('opacity=".42"', svg)
+            self.assertEqual(svg.count('class="measured-vdd-guide"'), 4)
+            self.assertEqual(svg.count('>0.50 V</text>'), 2)
+            self.assertIn('stroke-dasharray="8 5"', svg)
 
     def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):
         rows = []
