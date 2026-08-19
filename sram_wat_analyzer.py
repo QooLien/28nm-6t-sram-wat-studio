@@ -3526,26 +3526,20 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
                     voltage = float(row["vdd_v"])
                     measured_guides[voltage] = min(y, measured_guides.get(voltage, panel_bottom))
                     parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{dataset["color"]}" stroke-width="2"/>')
-                    label_requests.append((x, y, f'{prefix} {float(row[key]):.1f}'))
-                    label_metadata.append((dataset, row, prefix, x, y))
+                    label_requests.append((x, y, f'{float(row[key]):.1f} mV'))
+                    label_metadata.append((dataset, row, key, x, y))
         placed_labels = _place_chart_labels(
             label_requests, all_points,
             (left + 5, panel_top + 5, left + plot_w - 5, panel_bottom - 5), 11.0)
-        for (label_x, label_y, anchor), (dataset, row, prefix, point_x, point_y) in zip(
+        for (label_x, label_y, anchor), (dataset, row, metric_key, point_x, point_y) in zip(
                 placed_labels, label_metadata):
-            metric_key = ("rsnm_mv" if prefix == "R" else
-                          "wsnm_mv" if prefix == "W" else "write_margin_mv")
-            label = f'{prefix} {float(row[metric_key]):.1f}'
-            label_width = max(42.0, len(label) * 11.0 * .56)
-            label_left = (label_x - label_width / 2 if anchor == "middle" else
-                          label_x - label_width if anchor == "end" else label_x)
+            label = f'{float(row[metric_key]):.1f} mV'
             parts += [f'<path d="M{point_x:.1f} {point_y:.1f}L{label_x:.1f} {label_y-5:.1f}" stroke="{dataset["color"]}" stroke-width="1" opacity=".42"/>',
-                      f'<rect x="{label_left-3:.1f}" y="{label_y-13:.1f}" width="{label_width+6:.1f}" height="17" rx="3" fill="#FFFFFF" fill-opacity=".90"/>',
                       f'<text class="multi-lot-data-label" x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" fill="{dataset["color"]}" font-size="11" font-weight="700">{label}</text>']
         for voltage, guide_y in sorted(measured_guides.items()):
             x, _y = xy(voltage, 0)
             parts += [
-                f'<path class="measured-vdd-guide" data-vdd="{voltage:.4f}" d="M{x:.1f} {guide_y+6:.1f}V{panel_bottom:.1f}" stroke="#B9D7FF" stroke-width="1.4"/>',
+                f'<path class="measured-vdd-guide" data-vdd="{voltage:.4f}" d="M{x:.1f} {guide_y+6:.1f}V{panel_bottom:.1f}" stroke="#8E8E93" stroke-width="1.4" stroke-dasharray="5 5" opacity=".78"/>',
                 f'<text class="vertical-vdd-label" x="{x:.1f}" y="{panel_bottom+24:.1f}" text-anchor="middle" fill="#0062CC" font-size="12" font-weight="700">{voltage:.2f} V</text>',
             ]
         center_y = panel_top + panel_h / 2
@@ -4399,7 +4393,7 @@ def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 9
             parts += [
                 f'<path class="measured-vdd-guide" data-vdd="{voltage:.4f}" '
                 f'd="M{x:.1f} {guide_y+6:.1f}V{panel_bottom:.1f}" '
-                'stroke="#B9D7FF" stroke-width="1.4"/>',
+                'stroke="#8E8E93" stroke-width="1.4" stroke-dasharray="5 5" opacity=".78"/>',
                 f'<text class="vertical-vdd-label" x="{x:.1f}" y="{panel_bottom+23:.1f}" '
                 f'text-anchor="middle" fill="#0062CC" font-size="12" font-weight="700">'
                 f'{voltage:.2f} V</text>',
