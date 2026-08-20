@@ -3125,8 +3125,8 @@ def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list
             raise ValueError(
                 f"{path.name} is not UTF-8 CSV text. Select the generated "
                 "multi_chip_snm_summary.csv file instead of an Excel or binary file.") from exc
-    if len(grouped) < 2:
-        raise ValueError("Select Multi-Cell summaries from at least two Model VDD points")
+    if not grouped:
+        raise ValueError("The selected Multi-Cell summary contains no usable Model VDD data")
     rows: list[dict[str, object]] = []
     for vdd in sorted(grouped):
         samples = grouped[vdd]
@@ -3318,6 +3318,106 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
     return shmoos
 
 
+def build_drive_to_preferred_advice(
+        shmoo: dict[str, object], chip_id: str,
+        target_percentile: float = .55,
+        lot_wafer: str | None = None) -> dict[str, object]:
+    """Build a same-VDD, population-relative CR/PR adjustment screen.
+
+    The default P55 guardband sits just above the Preferred P50 boundary.  PG
+    is held as the common denominator so read and write gaps can be addressed
+    independently: PD is strengthened only when CR is short, and PU is
+    weakened only when PR is short.  Suggested Idsat values are fixed-Vt
+    equivalents, not independent process prescriptions.
+    """
+    probability = float(target_percentile)
+    if not .50 <= probability <= .95:
+        raise ValueError("Advisor target percentile must be between P50 and P95")
+    samples = list(shmoo.get("samples", []))
+    matches = [sample for sample in samples
+               if str(sample.get("chip_id")) == str(chip_id)
+               and (lot_wafer is None or str(sample.get("lot_wafer")) == str(lot_wafer))]
+    if not matches:
+        raise ValueError(f"Cell {chip_id} was not found in this VDD population")
+    sample = matches[0]
+    cr_values = [float(item["cell_ratio_beta"]) for item in samples]
+    pr_values = [float(item["pull_up_ratio_beta"]) for item in samples]
+    target_cr = _linear_quantile(cr_values, probability)
+    target_pr = _linear_quantile(pr_values, probability)
+    current_cr = float(sample["cell_ratio_beta"])
+    current_pr = float(sample["pull_up_ratio_beta"])
+    planned_cr = max(current_cr, target_cr)
+    planned_pr = max(current_pr, target_pr)
+
+    # Normalize βPG to 1.0.  Only ratios are needed, so this avoids implying
+    # that the compact-model β proxy has a foundry-calibrated absolute unit.
+    current_beta = {"PD": current_cr, "PG": 1.0, "PU": 1.0 / current_pr}
+    target_beta = {"PD": planned_cr, "PG": 1.0, "PU": 1.0 / planned_pr}
+    device_rows: list[dict[str, object]] = []
+    directions = {
+        "PD": ("Idsat ↑ or Vt ↓", "Strengthen read pull-down"),
+        "PG": ("Hold", "Keep the shared read/write denominator fixed"),
+        "PU": ("Idsat ↓ or |Vt| ↑", "Reduce write contention"),
+    }
+    for family in ("PD", "PG", "PU"):
+        current = current_beta[family]
+        target = target_beta[family]
+        change_pct = 100.0 * (target / current - 1.0)
+        field = family.lower()
+        idsat = sample.get(f"{field}_idsat_ua")
+        vt = sample.get(f"{field}_vt_v")
+        idsat_target = (float(idsat) * target / current
+                        if idsat is not None else None)
+        if abs(change_pct) < .05:
+            action, reason = "HOLD", "Already meets this ratio target"
+        else:
+            action, reason = directions[family]
+        device_rows.append({
+            "family": family,
+            "beta_current_relative": current,
+            "beta_target_relative": target,
+            "beta_change_pct": change_pct,
+            "action": action,
+            "reason": reason,
+            "vt_v": float(vt) if vt is not None else None,
+            "idsat_current_ua": float(idsat) if idsat is not None else None,
+            "idsat_target_fixed_vt_ua": idsat_target,
+        })
+
+    predicted_cr_percentile = _midrank_percentile(cr_values, planned_cr)
+    predicted_pr_percentile = _midrank_percentile(pr_values, planned_pr)
+    predicted_score = min(predicted_cr_percentile, predicted_pr_percentile)
+    predicted_grade = ("preferred" if predicted_score >= .50 else
+                       "monitor" if predicted_score >= .25 else "low")
+    current_score = min(float(sample.get("cr_percentile", 0.0)),
+                        float(sample.get("pr_percentile", 0.0)))
+    return {
+        "vdd_v": float(shmoo["vdd_v"]),
+        "lot_wafer": str(sample.get("lot_wafer", "")),
+        "chip_id": str(sample.get("chip_id", chip_id)),
+        "target_percentile": probability,
+        "current": {
+            "cr": current_cr, "pr": current_pr,
+            "cr_percentile": float(sample.get("cr_percentile", 0.0)),
+            "pr_percentile": float(sample.get("pr_percentile", 0.0)),
+            "score": current_score,
+            "grade": str(sample.get("wafer_grade", "unknown")),
+        },
+        "target": {"cr": target_cr, "pr": target_pr},
+        "predicted": {
+            "cr": planned_cr, "pr": planned_pr,
+            "cr_percentile": predicted_cr_percentile,
+            "pr_percentile": predicted_pr_percentile,
+            "score": predicted_score, "grade": predicted_grade,
+        },
+        "devices": device_rows,
+        "method": ("P55 same-VDD population guardband; βPG held, βPD raised for CR "
+                   "and βPU lowered for PR only where required."),
+        "caution": ("Relative compact-model sensitivity only. Vt and Idsat are correlated; "
+                    "confirm any process action with Device/PDK and measured WT."),
+    }
+
+
 def _estimate_zero_boundary(rows: list[dict[str, object]], key: str) -> dict[str, object] | None:
     """Locate margin=0 by interpolation, or extrapolate from the low-VDD end."""
     for low, high in zip(rows, rows[1:]):
@@ -3358,10 +3458,11 @@ def _estimate_zero_boundary(rows: list[dict[str, object]], key: str) -> dict[str
     return None
 
 
-def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]]) -> dict:
+def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]],
+                                 force_shmoo_only: bool = False) -> dict:
     """Build RSNM, WSNM and Write-Margin VDD trends from Multi-Cell summaries."""
-    if len(summary_rows) < 2:
-        raise ValueError("At least two Multi-Cell VDD summary points are required")
+    if not summary_rows:
+        raise ValueError("At least one Multi-Cell VDD summary point is required")
     ordered = sorted(summary_rows, key=lambda row: float(row["vdd_v"]))
     curves: dict[str, dict] = {}
     for key, short_label, label, color in _ESTIMATE_VMIN_METRICS:
@@ -3378,9 +3479,14 @@ def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]]) -> dict:
         curves[key] = {"key": key, "short_label": short_label, "label": label,
                        "color": color, "rows": rows,
                        "eye_closure": _estimate_zero_boundary(curve_source_rows, key)}
+    shmoo_only = bool(force_shmoo_only) or len(ordered) == 1
     return {"rows": ordered, "curves": curves,
             "ratio_shmoos": _build_estimate_vmin_ratio_shmoos(ordered),
-            "definition": "Each VDD point is the minimum per-cell margin in the imported Multi-Cell summary data."}
+            "mode": "shmoo_only" if shmoo_only else "estimate_vmin",
+            "definition": (
+                "Single-file or single-VDD input: only same-VDD CR/PR Shmoo screening is produced."
+                if shmoo_only else
+                "Each VDD point is the minimum per-cell margin in the imported Multi-Cell summary data.")}
 
 
 _COMPARISON_COLORS = ("#007AFF", "#AF52DE", "#00A844", "#FF9500",
@@ -3978,41 +4084,90 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
     return "".join(parts)
 
 
+def _drive_advisor_html(shmoo: dict[str, object], index: int) -> tuple[str, list[dict[str, object]]]:
+    """Return one interactive same-VDD advisor section and its flat records."""
+    advice = [build_drive_to_preferred_advice(
+        shmoo, str(sample["chip_id"]), .55, str(sample.get("lot_wafer", "")))
+        for sample in shmoo["samples"]]
+    grade_order = {"low": 0, "monitor": 1, "preferred": 2}
+    advice.sort(key=lambda item: (
+        grade_order.get(str(item["current"]["grade"]), 9),
+        float(item["current"]["score"]), str(item["chip_id"])))
+    options = "".join(
+        f'<option value="{position}">{html.escape(str(item["chip_id"]))} · '
+        f'{html.escape(str(item["current"]["grade"]).upper())} · '
+        f'P{100*float(item["current"]["score"]):.0f}</option>'
+        for position, item in enumerate(advice))
+    payload = json.dumps(advice, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    section = f'''<section id="drive-advisor-{index}" class="drive-advisor" data-advisor-index="{index}">
+<div class="advisor-head"><div><p class="eyebrow">SAME-VDD RELATIVE SCREEN</p><h2>Drive-to-Preferred Advisor</h2><p class="note">Select a cell to estimate the smallest decoupled β change needed to reach a P55 guardband above the P50 Preferred boundary.</p></div><div class="advisor-select-wrap"><label for="advisor-select-{index}">Cell / Chip</label><select id="advisor-select-{index}" class="advisor-select">{options}</select></div></div>
+<div class="advisor-kpis"><div class="advisor-kpi"><span>Current grade</span><strong data-field="current-grade">—</strong><small data-field="current-score">—</small></div><div class="advisor-kpi"><span>Current balance</span><strong data-field="current-ratios">—</strong><small data-field="current-percentiles">—</small></div><div class="advisor-kpi"><span>P55 target</span><strong data-field="target-ratios">—</strong><small>Same-VDD population quantile</small></div><div class="advisor-kpi advisor-result"><span>Predicted grade</span><strong data-field="predicted-grade">—</strong><small data-field="predicted-score">—</small></div></div>
+<div class="advisor-device-grid" data-field="devices"></div>
+<p class="advisor-method" data-field="method"></p><p class="advisor-caution" data-field="caution"></p>
+<script type="application/json" class="advisor-data">{payload}</script>
+</section>'''
+    flat_rows: list[dict[str, object]] = []
+    for item in advice:
+        for device in item["devices"]:
+            flat_rows.append({
+                "vdd_v": item["vdd_v"], "lot_wafer": item["lot_wafer"],
+                "chip_id": item["chip_id"], "current_grade": item["current"]["grade"],
+                "current_score": item["current"]["score"],
+                "target_percentile": item["target_percentile"],
+                "target_cr": item["target"]["cr"], "target_pr": item["target"]["pr"],
+                "predicted_cr": item["predicted"]["cr"],
+                "predicted_pr": item["predicted"]["pr"],
+                "predicted_grade": item["predicted"]["grade"],
+                "family": device["family"],
+                "beta_current_relative": device["beta_current_relative"],
+                "beta_target_relative": device["beta_target_relative"],
+                "beta_change_pct": device["beta_change_pct"],
+                "action": device["action"], "vt_v": device["vt_v"],
+                "idsat_current_ua": device["idsat_current_ua"],
+                "idsat_target_fixed_vt_ua": device["idsat_target_fixed_vt_ua"],
+            })
+    return section, flat_rows
+
+
 def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                                 source_paths: Iterable[str | os.PathLike[str]]) -> Path:
     """Write all imported Multi-Cell estimate curves and an HTML selector report."""
     out = Path(out_dir); image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
+    source_paths = list(source_paths)
+    shmoo_only = (analysis.get("mode") == "shmoo_only" or
+                   len(analysis.get("rows", [])) == 1 or len(source_paths) == 1)
     try:
         from reportlab.graphics import renderPM
         from svglib.svglib import svg2rlg
     except ImportError as exc:
         raise RuntimeError("PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
     image_rows = []
-    for index, (key, _short, _label, _color) in enumerate(_ESTIMATE_VMIN_METRICS, 1):
-        svg_name = f"{index:02d}_{key}_estimate_vmin.svg"; png_name = svg_name.replace(".svg", ".png")
-        svg_path = image_dir / svg_name; svg_path.write_text(estimate_vmin_curve_svg(analysis["curves"][key]), encoding="utf-8")
-        drawing = svg2rlg(str(svg_path))
-        if drawing is None: raise RuntimeError("Could not render Estimate Vmin chart")
-        renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
-        image_rows.append((key, png_name))
-    # The stacked export is intentionally a single portable PNG so its four
-    # VDD trends can be reviewed together without mixing their mV scales.
-    stacked_svg = image_dir / "05_estimate_vmin_stacked.svg"
-    stacked_png = image_dir / "05_estimate_vmin_stacked.png"
-    transparent_svg = image_dir / "05_estimate_vmin_stacked_transparent.svg"
-    transparent_png = image_dir / "05_estimate_vmin_stacked_transparent.png"
-    stacked_svg.write_text(estimate_vmin_stacked_svg(analysis), encoding="utf-8")
-    drawing = svg2rlg(str(stacked_svg))
-    if drawing is None: raise RuntimeError("Could not render stacked Estimate Vmin chart")
-    renderPM.drawToFile(drawing, str(stacked_png), fmt="PNG", dpi=180, backend="rlPyCairo")
-    transparent_svg.write_text(
-        estimate_vmin_stacked_svg(analysis, transparent_background=True), encoding="utf-8")
-    transparent_drawing = svg2rlg(str(transparent_svg))
-    if transparent_drawing is None:
-        raise RuntimeError("Could not render transparent stacked Estimate Vmin chart")
-    renderPM.drawToFile(transparent_drawing, str(transparent_png), fmt="PNG", dpi=180,
-                        bg=None, backend="rlPyCairo", backendFmt="RGBA")
+    if not shmoo_only:
+        for index, (key, _short, _label, _color) in enumerate(_ESTIMATE_VMIN_METRICS, 1):
+            svg_name = f"{index:02d}_{key}_estimate_vmin.svg"; png_name = svg_name.replace(".svg", ".png")
+            svg_path = image_dir / svg_name; svg_path.write_text(estimate_vmin_curve_svg(analysis["curves"][key]), encoding="utf-8")
+            drawing = svg2rlg(str(svg_path))
+            if drawing is None: raise RuntimeError("Could not render Estimate Vmin chart")
+            renderPM.drawToFile(drawing, str(image_dir / png_name), fmt="PNG", dpi=180, backend="rlPyCairo")
+            image_rows.append((key, png_name))
+        # Multi-VDD only: a single portable comparison image for the trends.
+        stacked_svg = image_dir / "05_estimate_vmin_stacked.svg"
+        stacked_png = image_dir / "05_estimate_vmin_stacked.png"
+        transparent_svg = image_dir / "05_estimate_vmin_stacked_transparent.svg"
+        transparent_png = image_dir / "05_estimate_vmin_stacked_transparent.png"
+        stacked_svg.write_text(estimate_vmin_stacked_svg(analysis), encoding="utf-8")
+        drawing = svg2rlg(str(stacked_svg))
+        if drawing is None: raise RuntimeError("Could not render stacked Estimate Vmin chart")
+        renderPM.drawToFile(drawing, str(stacked_png), fmt="PNG", dpi=180, backend="rlPyCairo")
+        transparent_svg.write_text(
+            estimate_vmin_stacked_svg(analysis, transparent_background=True), encoding="utf-8")
+        transparent_drawing = svg2rlg(str(transparent_svg))
+        if transparent_drawing is None:
+            raise RuntimeError("Could not render transparent stacked Estimate Vmin chart")
+        renderPM.drawToFile(transparent_drawing, str(transparent_png), fmt="PNG", dpi=180,
+                            bg=None, backend="rlPyCairo", backendFmt="RGBA")
     shmoo_sections = []
+    advisor_rows: list[dict[str, object]] = []
     shmoo_fields = ["vdd_v", "lot_wafer", "chip_id", "read_score", "write_score",
                     "balanced_score", "best_region", "read_percentile", "write_percentile",
                     "cr_percentile", "pr_percentile", "performance_grade_score",
@@ -4047,6 +4202,8 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                 raise RuntimeError("Could not render Estimate Vmin CR/PR shmoo")
             renderPM.drawToFile(shmoo_drawing, str(image_dir / png_name), fmt="PNG",
                                 dpi=180, backend="rlPyCairo")
+            advisor_section, advisor_records = _drive_advisor_html(shmoo, index)
+            advisor_rows.extend(advisor_records)
             shmoo_sections.append(
                 f'<section><h2>Model VDD {shmoo["vdd_v"]:.3f} V — Drive-Balance Shmoo</h2>'
                 f'<p class="note">Whole-wafer median center: CR={shmoo["target"]["cell_ratio_beta"]:.3f}; '
@@ -4057,7 +4214,8 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                 'Color regions use the weaker CR/PR population percentile: green ≥P50, yellow P25–P50, red &lt;P25. RSNM and BL-Vtrip percentiles remain available for correlation. These are relative screening within this VDD, not silicon Pass/Fail.</p>'
                 f'<div class="interactive-shmoo">{shmoo_svg_text}</div>'
                 f'<p class="note">Downloads: <a href="images/{svg_name}">interactive SVG</a> · '
-                f'<a href="images/{png_name}">PNG</a></p></section>')
+                f'<a href="images/{png_name}">PNG</a></p></section>'
+                f'{advisor_section}')
             for sample in shmoo["samples"]:
                 record = {key: sample.get(key, "") for key in shmoo_fields}
                 record["vdd_v"] = shmoo["vdd_v"]
@@ -4066,14 +4224,40 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                 statistics_writer.writerow({"vdd_v": shmoo["vdd_v"], "metric": metric,
                                              **values})
     statistics_stream.close()
-    with (out / "multi_chip_snm_summary_combined.csv").open("w", newline="", encoding="utf-8-sig") as stream:
-        fields = ["vdd_v", "sample_count"] + [field for key, *_ in _ESTIMATE_VMIN_METRICS
-                  for field in (key, f"{key}_lot_wafer", f"{key}_chip_id")]
-        writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader(); writer.writerows({key: row.get(key) for key in fields} for row in analysis["rows"])
+    advisor_fields = [
+        "vdd_v", "lot_wafer", "chip_id", "current_grade", "current_score",
+        "target_percentile", "target_cr", "target_pr", "predicted_cr",
+        "predicted_pr", "predicted_grade", "family", "beta_current_relative",
+        "beta_target_relative", "beta_change_pct", "action", "vt_v",
+        "idsat_current_ua", "idsat_target_fixed_vt_ua",
+    ]
+    with (out / "estimate_vmin_drive_to_preferred_advisor.csv").open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=advisor_fields)
+        writer.writeheader()
+        writer.writerows(advisor_rows)
+    if not shmoo_only:
+        with (out / "multi_chip_snm_summary_combined.csv").open(
+                "w", newline="", encoding="utf-8-sig") as stream:
+            fields = ["vdd_v", "sample_count"] + [
+                field for key, *_ in _ESTIMATE_VMIN_METRICS
+                for field in (key, f"{key}_lot_wafer", f"{key}_chip_id")]
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows({key: row.get(key) for key in fields}
+                             for row in analysis["rows"])
     backup_dir = out / "imported_multi_chip_summaries"; backup_dir.mkdir(exist_ok=True)
     for index, source in enumerate(source_paths, 1):
         source_path = Path(source); shutil.copy2(source_path, backup_dir / f"{index:02d}_{source_path.name}")
-    sections = '<section id="stacked-trends"><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows) + "".join(shmoo_sections)
+    if shmoo_only:
+        vdd_list = ", ".join(f'{float(row["vdd_v"]):.3f} V' for row in analysis["rows"])
+        sections = (f'<section class="shmoo-only-notice"><h2>Shmoo-only mode</h2>'
+                    f'<p>Analyzed Model VDD: {vdd_list}. This run was started from one source file '
+                    'or contains only one VDD, so Estimate Vmin trends and eye-closure extrapolation '
+                    'are omitted. Only same-VDD Shmoo screening and the Drive-to-Preferred Advisor are output.</p></section>'
+                    + "".join(shmoo_sections))
+    else:
+        sections = '<section id="stacked-trends"><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows) + "".join(shmoo_sections)
     report = out / "estimate_vmin_report.html"
     report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HV28 SRAM Estimate Vmin Curve</title>
 <style>
@@ -4085,6 +4269,24 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 .interactive-shmoo{{width:100%;min-width:0;overflow-x:auto}}
 .interactive-shmoo circle.measured-cell{{cursor:help}}
 .note{{color:#6e6e73}}
+.eyebrow{{margin:0 0 5px;color:#ff385c;font-size:12px;font-weight:700;letter-spacing:.09em}}
+.advisor-head{{display:flex;align-items:flex-end;justify-content:space-between;gap:28px}}
+.advisor-head h2{{margin:.1rem 0 .35rem}}
+.advisor-select-wrap{{display:grid;gap:7px;min-width:270px;color:#6e6e73;font-size:13px;font-weight:700}}
+.advisor-select{{width:100%;padding:11px 38px 11px 12px;border:1px solid #d2d2d7;border-radius:10px;background:#fff;color:#1d1d1f;font:600 15px Calibri,"Microsoft JhengHei",Arial,sans-serif}}
+.advisor-kpis{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:22px 0}}
+.advisor-kpi{{display:grid;gap:5px;padding:16px;border:1px solid #e5e5ea;border-radius:14px;background:#fafafa}}
+.advisor-kpi span,.advisor-kpi small{{color:#6e6e73}}
+.advisor-kpi strong{{font-size:21px;font-variant-numeric:tabular-nums}}
+.advisor-result{{background:#f0faf3;border-color:#c8e9d1}}
+.advisor-device-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}}
+.advisor-device{{padding:16px;border-radius:14px;border:1px solid #e5e5ea;background:#fff}}
+.advisor-device[data-family="PD"]{{border-top:4px solid #007aff}}.advisor-device[data-family="PG"]{{border-top:4px solid #34c759}}.advisor-device[data-family="PU"]{{border-top:4px solid #ff385c}}
+.advisor-device-top{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}}
+.advisor-device-name{{font-size:19px;font-weight:700}}.advisor-action{{color:#6e6e73;font-weight:700}}
+.advisor-change{{font-size:25px;font-weight:700;font-variant-numeric:tabular-nums}}
+.advisor-device dl{{display:grid;grid-template-columns:1fr auto;gap:7px 12px;margin:10px 0 0;font-variant-numeric:tabular-nums}}.advisor-device dt{{color:#6e6e73}}.advisor-device dd{{margin:0;text-align:right;font-weight:700}}
+.advisor-method{{margin:18px 0 4px;font-weight:700}}.advisor-caution{{margin:0;color:#9a6700}}
 #cell-tooltip{{position:fixed;z-index:9999;display:none;width:520px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow-x:hidden;overflow-y:auto;padding:15px 17px;border-radius:14px;background:#1d1d1f;color:#fff;box-shadow:0 10px 34px rgba(0,0,0,.26);font-size:13px;line-height:1.35;pointer-events:auto;overscroll-behavior:contain;scrollbar-width:thin}}
 .tooltip-title{{font-size:17px;font-weight:700;margin-bottom:6px}}
 .tooltip-meta{{display:grid;grid-template-columns:1fr;gap:2px;color:#c8c8cc;margin-bottom:11px}}
@@ -4103,12 +4305,13 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 .tooltip-device-label{{color:#aeb0b5}}
 .tooltip-device-reading{{display:flex;align-items:baseline;gap:8px;text-align:right}}
 .tooltip-device-delta{{color:#ffd60a;font-size:11px;font-weight:700}}
-@media(max-width:600px){{.tooltip-metrics{{grid-template-columns:1fr}}}}
+@media(max-width:900px){{.advisor-head{{align-items:stretch;flex-direction:column}}.advisor-select-wrap{{min-width:0}}.advisor-kpis{{grid-template-columns:repeat(2,minmax(0,1fr))}}.advisor-device-grid{{grid-template-columns:1fr}}}}
+@media(max-width:600px){{.tooltip-metrics,.advisor-kpis{{grid-template-columns:1fr}}}}
 </style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1>
 <p class="note">{html.escape(analysis["definition"])}</p>
 <p class="note">At each Model VDD, every cell is ranked by its CR percentile and PR percentile; the weaker drive-ratio percentile determines its wafer-relative grade. Green means both are at or above the median, yellow means the weaker ratio is P25–P50, and red means it is below P25. RSNM and BL Write Trip Margin percentiles are retained for correlation, while residual WSNM remains a separate diagnostic. X=βPG/βPU=PR (right improves write); Y=βPD/βPG=CR (up improves read). These colors are not absolute silicon Pass/Fail.</p>
 {sections}
-<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. Per-cell target deltas: <code>estimate_vmin_cr_pr_shmoo.csv</code>.</p>
+<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. {('Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. ' if not shmoo_only else '')}Per-cell Shmoo results: <code>estimate_vmin_cr_pr_shmoo.csv</code>. Advisor details: <code>estimate_vmin_drive_to_preferred_advisor.csv</code>.</p>
 </main><div id="cell-tooltip" role="tooltip"></div>
 <script>
 const cellTooltip=document.getElementById('cell-tooltip');
@@ -4208,6 +4411,42 @@ document.querySelectorAll('[data-cell-tooltip]').forEach((mark)=>{{
 }});
 cellTooltip.addEventListener('mouseenter',()=>clearTimeout(cellTooltipHideTimer));
 cellTooltip.addEventListener('mouseleave',()=>{{cellTooltip.style.display='none';}});
+const fmt=(value,digits=3)=>Number(value).toFixed(digits);
+const pct=(value)=>'P'+Math.round(Number(value)*100);
+document.querySelectorAll('.drive-advisor').forEach((card)=>{{
+  const records=JSON.parse(card.querySelector('.advisor-data').textContent);
+  const select=card.querySelector('.advisor-select');
+  const setText=(field,value)=>{{card.querySelector(`[data-field="${{field}}"]`).textContent=value;}};
+  const draw=()=>{{
+    const item=records[Number(select.value)||0];
+    setText('current-grade',String(item.current.grade).toUpperCase());
+    setText('current-score',`${{item.chip_id}} · ${{pct(item.current.score)}}`);
+    setText('current-ratios',`CR ${{fmt(item.current.cr)}} · PR ${{fmt(item.current.pr)}}`);
+    setText('current-percentiles',`Read ${{pct(item.current.cr_percentile)}} · Write ${{pct(item.current.pr_percentile)}}`);
+    setText('target-ratios',`CR ${{fmt(item.target.cr)}} · PR ${{fmt(item.target.pr)}}`);
+    setText('predicted-grade',String(item.predicted.grade).toUpperCase());
+    setText('predicted-score',`Read ${{pct(item.predicted.cr_percentile)}} · Write ${{pct(item.predicted.pr_percentile)}}`);
+    setText('method',item.method);
+    setText('caution',item.caution);
+    const deviceGrid=card.querySelector('[data-field="devices"]');
+    deviceGrid.replaceChildren();
+    item.devices.forEach((device)=>{{
+      const panel=document.createElement('article');panel.className='advisor-device';panel.dataset.family=device.family;
+      const top=document.createElement('div');top.className='advisor-device-top';
+      top.appendChild(makeTooltipNode('advisor-device-name',device.family));
+      top.appendChild(makeTooltipNode('advisor-action',device.action));panel.appendChild(top);
+      const change=(Number(device.beta_change_pct)>=0?'+':'')+fmt(device.beta_change_pct,1)+'% β';
+      panel.appendChild(makeTooltipNode('advisor-change',change));
+      const list=document.createElement('dl');
+      const add=(label,value)=>{{list.appendChild(makeTooltipNode('',label));const dd=document.createElement('dd');dd.textContent=value;list.appendChild(dd);}};
+      add('Relative β',`${{fmt(device.beta_current_relative)}} → ${{fmt(device.beta_target_relative)}}`);
+      add('Current Vt',device.vt_v==null?'—':fmt(device.vt_v,4)+' V');
+      add('Idsat @ fixed Vt',device.idsat_current_ua==null?'—':`${{fmt(device.idsat_current_ua,2)}} → ${{fmt(device.idsat_target_fixed_vt_ua,2)}} µA`);
+      panel.appendChild(list);deviceGrid.appendChild(panel);
+    }});
+  }};
+  select.addEventListener('change',draw);draw();
+}});
 </script></body></html>''', encoding="utf-8")
     return report
 
@@ -7146,7 +7385,7 @@ def launch_gui() -> None:
 
     ttk.Label(curve_input_card, text="Multi-Cell Estimate Vmin", style="Section.TLabel").pack(anchor="w")
     ttk.Label(curve_input_card,
-              text="Select one or more multi_chip_snm_summary.csv files exported by 6T Bitcell Analysis. The selected data must contain at least two Model VDD values; each VDD point uses the minimum measured cell result.",
+              text="Select multi_chip_snm_summary.csv files exported by 6T Bitcell Analysis. One selected file runs Shmoo-only analysis. Select two or more files with at least two total VDD points to also generate Estimate Vmin curves.",
               style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(2, 12))
     selected_summary_paths: list[str] = []
     selected_summary_text = tk.StringVar(value="No Multi-Cell summary selected")
@@ -7191,6 +7430,9 @@ def launch_gui() -> None:
     def select_curve_kind() -> None:
         draw_curve_chart()
         if curve_result:
+            if curve_result.get("mode") == "shmoo_only":
+                curve_summary.set("Single-VDD input: Shmoo and Advisor outputs only.")
+                return
             if curve_kind.get() == "stacked":
                 curve_summary.set("Comparison view: Read/Write SNM and BL Write Margin versus Model VDD.")
                 return
@@ -7205,7 +7447,7 @@ def launch_gui() -> None:
                         command=select_curve_kind).pack(side="left", padx=(0, 12))
     ttk.Radiobutton(curve_switch, text="Stacked", value="stacked", variable=curve_kind,
                     command=select_curve_kind).pack(side="left", padx=(0, 12))
-    curve_summary = tk.StringVar(value="Import at least two Multi-Cell summary CSV files to display an estimate curve.")
+    curve_summary = tk.StringVar(value="Import one VDD for Shmoo analysis, or two or more VDD points for Estimate Vmin curves.")
     curve_summary_label = tk.Label(curve_chart_card, textvariable=curve_summary, bg=CARD, fg=SECONDARY,
                                    font=("Calibri", 10, "bold"), anchor="w", justify="left")
     curve_summary_label.grid(row=2, column=0, sticky="ew", pady=(0, 6))
@@ -7225,6 +7467,20 @@ def launch_gui() -> None:
         if not curve_result:
             curve_canvas.create_text(width / 2, height / 2, text="Estimate Vmin curve will appear here",
                                      fill=SECONDARY, font=("Calibri", 13))
+            return
+        if curve_result.get("mode") == "shmoo_only":
+            curve_title.set("Multi-Cell Shmoo Analysis")
+            vdds = [float(row["vdd_v"]) for row in curve_result["rows"]]
+            vdd_text = (f"{vdds[0]:.3f} V" if len(vdds) == 1 else
+                        f"{vdds[0]:.3f}–{vdds[-1]:.3f} V ({len(vdds)} points)")
+            curve_canvas.create_text(
+                width / 2, height / 2 - 18,
+                text=f"Model VDD {vdd_text} · Shmoo-only output complete",
+                fill=TEXT, font=("Calibri", 16, "bold"))
+            curve_canvas.create_text(
+                width / 2, height / 2 + 18,
+                text="Open HTML Result to inspect the CR/PR Shmoo and Drive-to-Preferred Advisor.",
+                fill=SECONDARY, font=("Calibri", 11))
             return
         if curve_kind.get() == "stacked":
             curve_title.set("Estimate Vmin Curves - Comparison View")
@@ -7484,7 +7740,9 @@ def launch_gui() -> None:
 
     def curve_worker(summary_paths: list[str], out_path: Path, wafer_id: str) -> None:
         try:
-            analysis = analyze_estimate_vmin_curves(read_multi_chip_snm_summary(summary_paths))
+            analysis = analyze_estimate_vmin_curves(
+                read_multi_chip_snm_summary(summary_paths),
+                force_shmoo_only=len(summary_paths) == 1)
             run_dir = create_run_output_dir(out_path, wafer_id, "estimate_vmin_curve")
             report = write_estimate_vmin_outputs(analysis, run_dir, summary_paths)
             curve_result_queue.put((True, analysis, report))
@@ -7568,7 +7826,11 @@ def launch_gui() -> None:
         if ok:
             curve_result = analysis
             curve_report_path = Path(payload)
-            if curve_kind.get() == "stacked":
+            if analysis.get("mode") == "shmoo_only":
+                summary = (f'Shmoo-only analysis complete for {len(analysis["rows"])} '
+                           'VDD point(s); Estimate Vmin curves were not generated.')
+                curve_summary_label.configure(fg=SECONDARY)
+            elif curve_kind.get() == "stacked":
                 summary = "Comparison view: Read/Write SNM and BL Write Margin versus Model VDD."
                 curve_summary_label.configure(fg=SECONDARY)
             else:
@@ -7586,8 +7848,12 @@ def launch_gui() -> None:
                 f"Complete - {len(analysis['rows'])} VDD point(s); saved to {Path(payload).parent}")
             curve_status_label.configure(fg=GREEN)
             curve_open_button.state(["!disabled"])
-            curve_stacked_button.state(["!disabled"])
-            curve_transparent_button.state(["!disabled"])
+            if analysis.get("mode") == "shmoo_only":
+                curve_stacked_button.state(["disabled"])
+                curve_transparent_button.state(["disabled"])
+            else:
+                curve_stacked_button.state(["!disabled"])
+                curve_transparent_button.state(["!disabled"])
             draw_curve_chart()
         else:
             curve_status.set("Estimate Vmin analysis could not be completed")
@@ -7598,7 +7864,7 @@ def launch_gui() -> None:
         if not selected_summary_paths:
             curve_status.set("Select at least one Multi-Cell summary CSV file")
             curve_status_label.configure(fg=RED)
-            messagebox.showerror("Estimate Vmin Curve", "Select Multi-Cell summary CSV data containing at least two Model VDD points.")
+            messagebox.showerror("Estimate Vmin Curve", "Select at least one Multi-Cell summary CSV file.")
             return
         curve_status.set("Combining minimum RSNM / WSNM / Write Margin by Model VDD...")
         curve_status_label.configure(fg=BLUE)

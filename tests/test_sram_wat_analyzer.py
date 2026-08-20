@@ -11,6 +11,7 @@ from sram_wat_analyzer import (
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_combined_comparison_svg, estimate_vmin_curve_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_combined_files,
     analyze_write_trip_margin_curve,
+    build_drive_to_preferred_advice, _drive_advisor_html,
     generic_28nm_assumption_rows,
     drive_monitor_metrics, drive_monitor_shmoo_reference,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
@@ -18,7 +19,7 @@ from sram_wat_analyzer import (
     save_gui_state,
     validate_config, wat_electrical_snm_rows,
     write_iv_curve_excel_template, write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
-    write_trip_margin_curve_svg, write_write_trip_margin_outputs,
+    write_estimate_vmin_outputs, write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
 
 
@@ -767,6 +768,99 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("PU: Vt", svg)
         self.assertIn("PG: Vt", svg)
         self.assertIn("PD: Vt", svg)
+
+    def test_drive_to_preferred_advisor_uses_same_vdd_p55_and_holds_pg(self):
+        samples = []
+        for index, ratio in enumerate((1.0, 1.2, 1.4, 1.6, 1.8), 1):
+            samples.append({
+                "lot_wafer": "W01", "chip_id": f"C{index:02d}",
+                "rsnm_mv": 40.0 + index, "wsnm_mv": 30.0 + index,
+                "write_margin_mv": 20.0 + index,
+                "cell_ratio_beta": ratio,
+                "pull_up_ratio_beta": ratio,
+                "pu_vt_v": .38, "pu_idsat_ua": 50.0,
+                "pg_vt_v": .36, "pg_idsat_ua": 80.0,
+                "pd_vt_v": .35, "pd_idsat_ua": 110.0,
+            })
+        row = {"vdd_v": .68, "sample_count": len(samples), "samples": samples}
+        for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
+            row[key] = min(sample[key] for sample in samples)
+            row[f"{key}_chip_id"] = "C01"
+            row[f"{key}_lot_wafer"] = "W01"
+        second = {**row, "vdd_v": .70,
+                  "samples": [dict(sample) for sample in samples]}
+        shmoo = analyze_estimate_vmin_curves([row, second])["ratio_shmoos"][0]
+        advice = build_drive_to_preferred_advice(shmoo, "C01", .55, "W01")
+        self.assertAlmostEqual(advice["target"]["cr"], 1.44)
+        self.assertAlmostEqual(advice["target"]["pr"], 1.44)
+        devices = {item["family"]: item for item in advice["devices"]}
+        self.assertAlmostEqual(devices["PG"]["beta_change_pct"], 0.0)
+        self.assertGreater(devices["PD"]["beta_change_pct"], 0.0)
+        self.assertLess(devices["PU"]["beta_change_pct"], 0.0)
+        self.assertAlmostEqual(devices["PD"]["idsat_target_fixed_vt_ua"], 158.4)
+        self.assertAlmostEqual(devices["PU"]["idsat_target_fixed_vt_ua"],
+                               50.0 / 1.44)
+        self.assertEqual(advice["predicted"]["grade"], "preferred")
+        section, rows = _drive_advisor_html(shmoo, 1)
+        self.assertIn("Drive-to-Preferred Advisor", section)
+        self.assertIn("P55 guardband", section)
+        self.assertEqual(len(rows), 15)
+
+    def test_single_vdd_multi_cell_summary_outputs_shmoo_only(self):
+        fieldnames = [
+            "lot_wafer", "chip_id", "model_vdd_v", "rsnm_mv", "wsnm_mv",
+            "write_margin_mv", "cell_ratio_beta", "pull_up_ratio_beta",
+            "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
+            "pd_vt_v", "pd_idsat_ua",
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "multi_chip_snm_summary.csv"
+            with source.open("w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                writer.writeheader()
+                for index, ratio in enumerate((1.1, 1.3, 1.5, 1.7), 1):
+                    writer.writerow({
+                        "lot_wafer": "W01", "chip_id": f"C{index:02d}",
+                        "model_vdd_v": .68, "rsnm_mv": 50 + index,
+                        "wsnm_mv": 40 + index, "write_margin_mv": 30 + index,
+                        "cell_ratio_beta": ratio,
+                        "pull_up_ratio_beta": ratio + .2,
+                        "pu_vt_v": .38, "pu_idsat_ua": 50,
+                        "pg_vt_v": .36, "pg_idsat_ua": 80,
+                        "pd_vt_v": .35, "pd_idsat_ua": 110,
+                    })
+            rows = read_multi_chip_snm_summary([source])
+            self.assertEqual(len(rows), 1)
+            analysis = analyze_estimate_vmin_curves(rows)
+            self.assertEqual(analysis["mode"], "shmoo_only")
+            report = write_estimate_vmin_outputs(analysis, root / "result", [source])
+            report_text = report.read_text(encoding="utf-8")
+            self.assertIn("Shmoo-only mode", report_text)
+            self.assertIn("Drive-to-Preferred Advisor", report_text)
+            self.assertTrue((report.parent / "estimate_vmin_cr_pr_shmoo.csv").exists())
+            self.assertTrue((report.parent / "estimate_vmin_drive_to_preferred_advisor.csv").exists())
+            self.assertFalse((report.parent / "multi_chip_snm_summary_combined.csv").exists())
+            self.assertFalse((report.parent / "images" / "05_estimate_vmin_stacked.png").exists())
+            self.assertFalse((report.parent / "images" / "01_rsnm_mv_estimate_vmin.png").exists())
+
+    def test_single_source_can_force_multi_vdd_rows_to_shmoo_only(self):
+        rows = []
+        for vdd in (.68, .80):
+            samples = [{
+                "lot_wafer": "W01", "chip_id": "C01", "rsnm_mv": 60.0,
+                "wsnm_mv": 50.0, "write_margin_mv": 40.0,
+                "cell_ratio_beta": 1.4, "pull_up_ratio_beta": 1.6,
+            }]
+            row = {"vdd_v": vdd, "sample_count": 1, "samples": samples}
+            for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
+                row[key] = samples[0][key]
+                row[f"{key}_chip_id"] = "C01"
+                row[f"{key}_lot_wafer"] = "W01"
+            rows.append(row)
+        analysis = analyze_estimate_vmin_curves(rows, force_shmoo_only=True)
+        self.assertEqual(analysis["mode"], "shmoo_only")
+        self.assertEqual(len(analysis["ratio_shmoos"]), 2)
 
     def test_estimate_vmin_balance_does_not_reward_large_residual_wsnm(self):
         samples = [
