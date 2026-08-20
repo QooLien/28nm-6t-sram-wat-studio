@@ -11,7 +11,8 @@ from sram_wat_analyzer import (
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_combined_comparison_svg, estimate_vmin_curve_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_combined_files,
     analyze_write_trip_margin_curve,
-    build_drive_to_preferred_advice, _drive_advisor_html,
+    build_batch_drive_to_preferred_advice, build_drive_to_preferred_advice,
+    _drive_advisor_html,
     generic_28nm_assumption_rows,
     drive_monitor_metrics, drive_monitor_shmoo_reference,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
@@ -748,7 +749,9 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("Best measured cell", svg)
         self.assertIn("#FFC447", svg)
         self.assertIn("P50/P50 relative boundary", svg)
-        self.assertIn("β_PG / β_PU", svg)
+        self.assertIn('font-family="Times New Roman">MOS</tspan>', svg)
+        self.assertIn('baseline-shift="sub"', svg)
+        self.assertIn("drive</tspan>", svg)
         self.assertIn("right = easier write", svg)
         self.assertNotIn("1/PR", svg)
         self.assertIn("#DDF3E2", svg)
@@ -801,10 +804,20 @@ class AnalyzerTests(unittest.TestCase):
         self.assertAlmostEqual(devices["PU"]["idsat_target_fixed_vt_ua"],
                                50.0 / 1.44)
         self.assertEqual(advice["predicted"]["grade"], "preferred")
-        section, rows = _drive_advisor_html(shmoo, 1)
+        batch = build_batch_drive_to_preferred_advice(shmoo, .55)
+        self.assertEqual(batch["affected_count"], 2)
+        self.assertAlmostEqual(batch["devices"][0]["drive_multiplier"], 1.44)
+        self.assertAlmostEqual(batch["devices"][1]["drive_multiplier"], 1.0)
+        self.assertAlmostEqual(batch["devices"][2]["drive_multiplier"], 1.0 / 1.44)
+        self.assertAlmostEqual(batch["affected_coverage_after_pct"], 100.0)
+        self.assertIn("preserves CR/PR rank ordering", batch["caution"])
+        section, rows, batch_rows = _drive_advisor_html(shmoo, 1)
         self.assertIn("Drive-to-Preferred Advisor", section)
         self.assertIn("P55 guardband", section)
+        self.assertIn("Low / Monitor Batch Adjustment", section)
+        self.assertIn("MOS<sub>drive</sub>", section)
         self.assertEqual(len(rows), 15)
+        self.assertEqual(len(batch_rows), 3)
 
     def test_single_vdd_multi_cell_summary_outputs_shmoo_only(self):
         fieldnames = [
@@ -840,6 +853,7 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("Drive-to-Preferred Advisor", report_text)
             self.assertTrue((report.parent / "estimate_vmin_cr_pr_shmoo.csv").exists())
             self.assertTrue((report.parent / "estimate_vmin_drive_to_preferred_advisor.csv").exists())
+            self.assertTrue((report.parent / "estimate_vmin_batch_drive_advisor.csv").exists())
             self.assertFalse((report.parent / "multi_chip_snm_summary_combined.csv").exists())
             self.assertFalse((report.parent / "images" / "05_estimate_vmin_stacked.png").exists())
             self.assertFalse((report.parent / "images" / "01_rsnm_mv_estimate_vmin.png").exists())

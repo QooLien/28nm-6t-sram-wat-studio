@@ -3312,8 +3312,8 @@ def _build_estimate_vmin_ratio_shmoos(rows: list[dict[str, object]]) -> list[dic
                                        "RSNM and BL Write Trip Margin percentiles plus the balanced "
                                        "max-normalized score are retained for correlation; "
                                        "residual WSNM is reported separately. "
-                                       "X=β_PG/β_PU=PR (right is easier write); "
-                                       "Y=β_PD/β_PG=CR (up is stronger read). "
+                                       "X=MOSdrive(PG)/MOSdrive(PU)=PR (right is easier write); "
+                                       "Y=MOSdrive(PD)/MOSdrive(PG)=CR (up is stronger read). "
                                        "This is relative screening, not absolute silicon Pass/Fail.")})
     return shmoos
 
@@ -3349,8 +3349,8 @@ def build_drive_to_preferred_advice(
     planned_cr = max(current_cr, target_cr)
     planned_pr = max(current_pr, target_pr)
 
-    # Normalize βPG to 1.0.  Only ratios are needed, so this avoids implying
-    # that the compact-model β proxy has a foundry-calibrated absolute unit.
+    # Normalize the PG MOS-drive proxy to 1.0. Only ratios are needed, so this
+    # avoids implying that the internal beta proxy has a calibrated absolute unit.
     current_beta = {"PD": current_cr, "PG": 1.0, "PU": 1.0 / current_pr}
     target_beta = {"PD": planned_cr, "PG": 1.0, "PU": 1.0 / planned_pr}
     device_rows: list[dict[str, object]] = []
@@ -3411,10 +3411,100 @@ def build_drive_to_preferred_advice(
             "score": predicted_score, "grade": predicted_grade,
         },
         "devices": device_rows,
-        "method": ("P55 same-VDD population guardband; βPG held, βPD raised for CR "
-                   "and βPU lowered for PR only where required."),
+        "method": ("P55 same-VDD population guardband; PG MOSdrive held, PD MOSdrive "
+                   "raised for CR and PU MOSdrive lowered for PR only where required."),
         "caution": ("Relative compact-model sensitivity only. Vt and Idsat are correlated; "
                     "confirm any process action with Device/PDK and measured WT."),
+    }
+
+
+def build_batch_drive_to_preferred_advice(
+        shmoo: dict[str, object],
+        target_percentile: float = .55) -> dict[str, object]:
+    """Estimate one common drive shift for the Low/Monitor batch population.
+
+    The P55 CR/PR targets are frozen from the current same-VDD population.
+    A common PD multiplier and PU multiplier are then chosen from the most
+    limiting Low/Monitor cells while PG is held.  Uniform shifts do not change
+    percentile ranks if the population target is recalculated, so the reported
+    coverage is explicitly against the frozen pre-adjustment target.
+    """
+    probability = float(target_percentile)
+    if not .50 <= probability <= .95:
+        raise ValueError("Batch Advisor target percentile must be between P50 and P95")
+    samples = list(shmoo.get("samples", []))
+    if not samples:
+        raise ValueError("Batch Advisor requires at least one same-VDD cell")
+    cr_values = [float(item["cell_ratio_beta"]) for item in samples]
+    pr_values = [float(item["pull_up_ratio_beta"]) for item in samples]
+    target_cr = _linear_quantile(cr_values, probability)
+    target_pr = _linear_quantile(pr_values, probability)
+    affected = [item for item in samples
+                if str(item.get("wafer_grade", "low")) in {"low", "monitor"}]
+    limiting = affected or samples
+    read_limit = min(limiting, key=lambda item: float(item["cell_ratio_beta"]))
+    write_limit = min(limiting, key=lambda item: float(item["pull_up_ratio_beta"]))
+    pd_multiplier = max(1.0, target_cr / float(read_limit["cell_ratio_beta"]))
+    pu_multiplier = min(1.0, float(write_limit["pull_up_ratio_beta"]) / target_pr)
+    pg_multiplier = 1.0
+
+    def reaches_frozen_target(item: dict[str, object], adjusted: bool) -> bool:
+        cr = float(item["cell_ratio_beta"]) * (pd_multiplier if adjusted else 1.0)
+        pr = float(item["pull_up_ratio_beta"]) / (pu_multiplier if adjusted else 1.0)
+        return cr >= target_cr - 1e-12 and pr >= target_pr - 1e-12
+
+    before_count = sum(reaches_frozen_target(item, False) for item in samples)
+    after_count = sum(reaches_frozen_target(item, True) for item in samples)
+    affected_after = sum(reaches_frozen_target(item, True) for item in affected)
+    device_rows: list[dict[str, object]] = []
+    for family, multiplier, action, driver in (
+            ("PD", pd_multiplier, "Idsat ↑ or Vt ↓", read_limit),
+            ("PG", pg_multiplier, "HOLD", None),
+            ("PU", pu_multiplier, "Idsat ↓ or |Vt| ↑", write_limit)):
+        field = family.lower()
+        vt_values = [float(item[f"{field}_vt_v"]) for item in samples
+                     if item.get(f"{field}_vt_v") is not None]
+        idsat_values = [float(item[f"{field}_idsat_ua"]) for item in samples
+                        if item.get(f"{field}_idsat_ua") is not None]
+        median_vt = statlib.median(vt_values) if vt_values else None
+        median_idsat = statlib.median(idsat_values) if idsat_values else None
+        change_pct = 100.0 * (multiplier - 1.0)
+        if abs(change_pct) < .05:
+            action = "HOLD"
+        device_rows.append({
+            "family": family,
+            "drive_multiplier": multiplier,
+            "drive_change_pct": change_pct,
+            "action": action,
+            "median_vt_v": median_vt,
+            "median_idsat_current_ua": median_idsat,
+            "median_idsat_target_fixed_vt_ua": (
+                median_idsat * multiplier if median_idsat is not None else None),
+            "limiting_chip_id": (str(driver.get("chip_id", "")) if driver else ""),
+        })
+    grade_counts = {
+        grade: sum(str(item.get("wafer_grade")) == grade for item in samples)
+        for grade in ("preferred", "monitor", "low")
+    }
+    return {
+        "vdd_v": float(shmoo["vdd_v"]),
+        "target_percentile": probability,
+        "target": {"cr": target_cr, "pr": target_pr},
+        "sample_count": len(samples),
+        "affected_count": len(affected),
+        "grade_counts": grade_counts,
+        "frozen_target_coverage_before_pct": 100.0 * before_count / len(samples),
+        "frozen_target_coverage_after_pct": 100.0 * after_count / len(samples),
+        "affected_coverage_after_pct": (
+            100.0 * affected_after / len(affected) if affected else 100.0),
+        "devices": device_rows,
+        "read_limiting_chip_id": str(read_limit.get("chip_id", "")),
+        "write_limiting_chip_id": str(write_limit.get("chip_id", "")),
+        "method": ("Common batch shift sized by the limiting Low/Monitor CR and PR, "
+                   "using the current population P55 values as frozen references."),
+        "caution": ("A uniform wafer/batch shift preserves CR/PR rank ordering. If P55 is "
+                    "recalculated after the shift, relative grades do not improve; use this "
+                    "only as frozen-target sensitivity guidance, not a process recipe."),
     }
 
 
@@ -3704,8 +3794,8 @@ def _legacy_estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1400, height
     """Render upper-right-good drive balance plus PU/PG/PD tuning views."""
     samples = shmoo["samples"]
     panels = [("pull_up_ratio_beta", "cell_ratio_beta", "Read / Write Drive-Balance Shmoo",
-               "Pull-up Ratio = beta_PG / beta_PU = PR (higher is better)",
-               "Read cell ratio = beta_PD / beta_PG = CR (higher is better)")]
+               "Pull-up Ratio = MOSdrive(PG) / MOSdrive(PU) = PR (higher is better)",
+               "Read cell ratio = MOSdrive(PD) / MOSdrive(PG) = CR (higher is better)")]
     if shmoo.get("has_family_wat"):
         panels.extend([
             ("pu_idsat_ua", "pu_vt_v", "PU tuning — upper-left weakens write contention",
@@ -3893,8 +3983,8 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
             f'PR drive percentile: P{100.0 * float(item.get("pr_percentile", 0.0)):.0f}',
             f'RSNM performance percentile: P{100.0 * float(item.get("read_percentile", 0.0)):.0f}',
             f'Vtrip performance percentile: P{100.0 * float(item.get("write_percentile", 0.0)):.0f}',
-            f'CR = β_PD/β_PG: {float(item["cell_ratio_beta"]):.3f}',
-            f'PR = β_PG/β_PU: {float(item["pull_up_ratio_beta"]):.3f}',
+            f'CR = MOSdrive(PD)/MOSdrive(PG): {float(item["cell_ratio_beta"]):.3f}',
+            f'PR = MOSdrive(PG)/MOSdrive(PU): {float(item["pull_up_ratio_beta"]):.3f}',
             f'Read balance vs median: {read_delta:+.1f}% ({read_direction})',
             f'Write balance vs median: {write_delta:+.1f}% ({write_direction})',
         ]
@@ -3958,8 +4048,8 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
     ]
 
     parts += [
-        f'<text x="{left + plot_w / 2}" y="{height - 28}" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Pull-up Ratio  β_PG / β_PU = PR  (right = easier write)</text>',
-        f'<text x="34" y="{top + plot_h / 2}" transform="rotate(-90 34 {top + plot_h / 2})" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Read cell ratio  β_PD / β_PG = CR  (up = stronger read)</text>',
+        f'<text x="{left + plot_w / 2}" y="{height - 28}" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Pull-up Ratio  <tspan font-family="Times New Roman">MOS</tspan><tspan baseline-shift="sub" font-family="Times New Roman" font-style="italic" font-size="11">drive</tspan><tspan baseline-shift="baseline" font-size="17">(PG) / </tspan><tspan font-family="Times New Roman">MOS</tspan><tspan baseline-shift="sub" font-family="Times New Roman" font-style="italic" font-size="11">drive</tspan><tspan baseline-shift="baseline" font-size="17">(PU) = PR  (right = easier write)</tspan></text>',
+        f'<text x="34" y="{top + plot_h / 2}" transform="rotate(-90 34 {top + plot_h / 2})" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Read cell ratio  <tspan font-family="Times New Roman">MOS</tspan><tspan baseline-shift="sub" font-family="Times New Roman" font-style="italic" font-size="11">drive</tspan><tspan baseline-shift="baseline" font-size="17">(PD) / </tspan><tspan font-family="Times New Roman">MOS</tspan><tspan baseline-shift="sub" font-family="Times New Roman" font-style="italic" font-size="11">drive</tspan><tspan baseline-shift="baseline" font-size="17">(PG) = CR  (up = stronger read)</tspan></text>',
     ]
 
     # Reading guide on the right keeps formulas and status semantics outside
@@ -4084,8 +4174,10 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
     return "".join(parts)
 
 
-def _drive_advisor_html(shmoo: dict[str, object], index: int) -> tuple[str, list[dict[str, object]]]:
-    """Return one interactive same-VDD advisor section and its flat records."""
+def _drive_advisor_html(
+        shmoo: dict[str, object], index: int
+        ) -> tuple[str, list[dict[str, object]], list[dict[str, object]]]:
+    """Return cell and batch advisor views plus their flat export records."""
     advice = [build_drive_to_preferred_advice(
         shmoo, str(sample["chip_id"]), .55, str(sample.get("lot_wafer", "")))
         for sample in shmoo["samples"]]
@@ -4099,12 +4191,29 @@ def _drive_advisor_html(shmoo: dict[str, object], index: int) -> tuple[str, list
         f'P{100*float(item["current"]["score"]):.0f}</option>'
         for position, item in enumerate(advice))
     payload = json.dumps(advice, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    batch = build_batch_drive_to_preferred_advice(shmoo, .55)
+    mosdrive = 'MOS<sub>drive</sub>'
+    batch_devices = "".join(
+        f'<article class="advisor-device" data-family="{device["family"]}">'
+        f'<div class="advisor-device-top"><span class="advisor-device-name">{device["family"]}</span>'
+        f'<span class="advisor-action">{html.escape(str(device["action"]))}</span></div>'
+        f'<div class="advisor-change">{float(device["drive_change_pct"]):+.1f}% '
+        f'<span class="mosdrive">{mosdrive}</span></div><dl>'
+        f'<dt>Common multiplier</dt><dd>{float(device["drive_multiplier"]):.3f}×</dd>'
+        f'<dt>Median Vt</dt><dd>{("—" if device["median_vt_v"] is None else f"{float(device["median_vt_v"]):.4f} V")}</dd>'
+        f'<dt>Median Idsat @ fixed Vt</dt><dd>{("—" if device["median_idsat_current_ua"] is None else f"{float(device["median_idsat_current_ua"]):.2f} → {float(device["median_idsat_target_fixed_vt_ua"]):.2f} µA")}</dd>'
+        f'<dt>Limiting Cell</dt><dd>{html.escape(str(device["limiting_chip_id"] or "—"))}</dd>'
+        '</dl></article>'
+        for device in batch["devices"])
     section = f'''<section id="drive-advisor-{index}" class="drive-advisor" data-advisor-index="{index}">
-<div class="advisor-head"><div><p class="eyebrow">SAME-VDD RELATIVE SCREEN</p><h2>Drive-to-Preferred Advisor</h2><p class="note">Select a cell to estimate the smallest decoupled β change needed to reach a P55 guardband above the P50 Preferred boundary.</p></div><div class="advisor-select-wrap"><label for="advisor-select-{index}">Cell / Chip</label><select id="advisor-select-{index}" class="advisor-select">{options}</select></div></div>
+<div class="advisor-head"><div><p class="eyebrow">SAME-VDD RELATIVE SCREEN</p><h2>Drive-to-Preferred Advisor</h2><p class="note">Select a cell to estimate the smallest decoupled {mosdrive} change needed to reach a P55 guardband above the P50 Preferred boundary.</p></div><div class="advisor-select-wrap"><label for="advisor-select-{index}">Cell / Chip</label><select id="advisor-select-{index}" class="advisor-select">{options}</select></div></div>
 <div class="advisor-kpis"><div class="advisor-kpi"><span>Current grade</span><strong data-field="current-grade">—</strong><small data-field="current-score">—</small></div><div class="advisor-kpi"><span>Current balance</span><strong data-field="current-ratios">—</strong><small data-field="current-percentiles">—</small></div><div class="advisor-kpi"><span>P55 target</span><strong data-field="target-ratios">—</strong><small>Same-VDD population quantile</small></div><div class="advisor-kpi advisor-result"><span>Predicted grade</span><strong data-field="predicted-grade">—</strong><small data-field="predicted-score">—</small></div></div>
 <div class="advisor-device-grid" data-field="devices"></div>
 <p class="advisor-method" data-field="method"></p><p class="advisor-caution" data-field="caution"></p>
 <script type="application/json" class="advisor-data">{payload}</script>
+<div class="batch-advisor"><div class="batch-head"><div><p class="eyebrow">COMMON BATCH SENSITIVITY</p><h3>Low / Monitor Batch Adjustment</h3><p class="note">One common PD / PG / PU shift is sized by the limiting Low or Monitor Cell and compared with the frozen pre-adjustment P55 target.</p></div><div class="batch-count"><strong>{int(batch["affected_count"])}</strong><span>Low + Monitor<br>of {int(batch["sample_count"])} Cells</span></div></div>
+<div class="advisor-kpis batch-kpis"><div class="advisor-kpi"><span>Current distribution</span><strong>{int(batch["grade_counts"]["preferred"])} Preferred</strong><small>{int(batch["grade_counts"]["monitor"])} Monitor · {int(batch["grade_counts"]["low"])} Low</small></div><div class="advisor-kpi"><span>Frozen P55 target</span><strong>CR {float(batch["target"]["cr"]):.3f} · PR {float(batch["target"]["pr"]):.3f}</strong><small>Captured before batch shift</small></div><div class="advisor-kpi"><span>Coverage before</span><strong>{float(batch["frozen_target_coverage_before_pct"]):.1f}%</strong><small>All Cells versus frozen target</small></div><div class="advisor-kpi advisor-result"><span>Coverage after</span><strong>{float(batch["frozen_target_coverage_after_pct"]):.1f}%</strong><small>Low/Monitor coverage {float(batch["affected_coverage_after_pct"]):.1f}%</small></div></div>
+<div class="advisor-device-grid">{batch_devices}</div><p class="advisor-method">{html.escape(str(batch["method"]))}</p><p class="advisor-caution">{html.escape(str(batch["caution"]))}</p></div>
 </section>'''
     flat_rows: list[dict[str, object]] = []
     for item in advice:
@@ -4126,7 +4235,21 @@ def _drive_advisor_html(shmoo: dict[str, object], index: int) -> tuple[str, list
                 "idsat_current_ua": device["idsat_current_ua"],
                 "idsat_target_fixed_vt_ua": device["idsat_target_fixed_vt_ua"],
             })
-    return section, flat_rows
+    batch_rows = [{
+        "vdd_v": batch["vdd_v"], "target_percentile": batch["target_percentile"],
+        "sample_count": batch["sample_count"], "affected_count": batch["affected_count"],
+        "target_cr": batch["target"]["cr"], "target_pr": batch["target"]["pr"],
+        "coverage_before_pct": batch["frozen_target_coverage_before_pct"],
+        "coverage_after_pct": batch["frozen_target_coverage_after_pct"],
+        "affected_coverage_after_pct": batch["affected_coverage_after_pct"],
+        "family": device["family"], "drive_multiplier": device["drive_multiplier"],
+        "drive_change_pct": device["drive_change_pct"], "action": device["action"],
+        "median_vt_v": device["median_vt_v"],
+        "median_idsat_current_ua": device["median_idsat_current_ua"],
+        "median_idsat_target_fixed_vt_ua": device["median_idsat_target_fixed_vt_ua"],
+        "limiting_chip_id": device["limiting_chip_id"],
+    } for device in batch["devices"]]
+    return section, flat_rows, batch_rows
 
 
 def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
@@ -4168,6 +4291,7 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                             bg=None, backend="rlPyCairo", backendFmt="RGBA")
     shmoo_sections = []
     advisor_rows: list[dict[str, object]] = []
+    batch_advisor_rows: list[dict[str, object]] = []
     shmoo_fields = ["vdd_v", "lot_wafer", "chip_id", "read_score", "write_score",
                     "balanced_score", "best_region", "read_percentile", "write_percentile",
                     "cr_percentile", "pr_percentile", "performance_grade_score",
@@ -4202,12 +4326,13 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                 raise RuntimeError("Could not render Estimate Vmin CR/PR shmoo")
             renderPM.drawToFile(shmoo_drawing, str(image_dir / png_name), fmt="PNG",
                                 dpi=180, backend="rlPyCairo")
-            advisor_section, advisor_records = _drive_advisor_html(shmoo, index)
+            advisor_section, advisor_records, batch_records = _drive_advisor_html(shmoo, index)
             advisor_rows.extend(advisor_records)
+            batch_advisor_rows.extend(batch_records)
             shmoo_sections.append(
                 f'<section><h2>Model VDD {shmoo["vdd_v"]:.3f} V — Drive-Balance Shmoo</h2>'
                 f'<p class="note">Whole-wafer median center: CR={shmoo["target"]["cell_ratio_beta"]:.3f}; '
-                f'PR=βPG/βPU={shmoo["target"]["pull_up_ratio_beta"]:.3f}. '
+                f'PR=MOSdrive(PG)/MOSdrive(PU)={shmoo["target"]["pull_up_ratio_beta"]:.3f}. '
                 f'Best measured cell: {html.escape(str(shmoo["best"]["chip_id"]))} '
                 f'(Score={float(shmoo["best"]["balanced_score"]):.3f}). '
                 'Move the pointer over a measured cell to inspect its WAT and margin values. '
@@ -4236,6 +4361,18 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         writer = csv.DictWriter(stream, fieldnames=advisor_fields)
         writer.writeheader()
         writer.writerows(advisor_rows)
+    batch_advisor_fields = [
+        "vdd_v", "target_percentile", "sample_count", "affected_count",
+        "target_cr", "target_pr", "coverage_before_pct", "coverage_after_pct",
+        "affected_coverage_after_pct", "family", "drive_multiplier",
+        "drive_change_pct", "action", "median_vt_v", "median_idsat_current_ua",
+        "median_idsat_target_fixed_vt_ua", "limiting_chip_id",
+    ]
+    with (out / "estimate_vmin_batch_drive_advisor.csv").open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=batch_advisor_fields)
+        writer.writeheader()
+        writer.writerows(batch_advisor_rows)
     if not shmoo_only:
         with (out / "multi_chip_snm_summary_combined.csv").open(
                 "w", newline="", encoding="utf-8-sig") as stream:
@@ -4287,6 +4424,8 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 .advisor-change{{font-size:25px;font-weight:700;font-variant-numeric:tabular-nums}}
 .advisor-device dl{{display:grid;grid-template-columns:1fr auto;gap:7px 12px;margin:10px 0 0;font-variant-numeric:tabular-nums}}.advisor-device dt{{color:#6e6e73}}.advisor-device dd{{margin:0;text-align:right;font-weight:700}}
 .advisor-method{{margin:18px 0 4px;font-weight:700}}.advisor-caution{{margin:0;color:#9a6700}}
+.mosdrive{{white-space:nowrap;font-family:"Times New Roman",serif;font-style:normal}}.mosdrive sub{{font-size:.62em;line-height:0;vertical-align:-.35em;font-weight:inherit;font-style:italic}}
+.batch-advisor{{margin-top:28px;padding-top:26px;border-top:1px solid #e5e5ea}}.batch-head{{display:flex;align-items:flex-end;justify-content:space-between;gap:24px}}.batch-head h3{{margin:.1rem 0 .35rem;font-size:24px}}.batch-count{{display:flex;align-items:center;gap:12px;min-width:190px;padding:12px 16px;border-radius:14px;background:#f5f5f7}}.batch-count strong{{font-size:30px}}.batch-count span{{color:#6e6e73;font-size:13px;line-height:1.25}}
 #cell-tooltip{{position:fixed;z-index:9999;display:none;width:520px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow-x:hidden;overflow-y:auto;padding:15px 17px;border-radius:14px;background:#1d1d1f;color:#fff;box-shadow:0 10px 34px rgba(0,0,0,.26);font-size:13px;line-height:1.35;pointer-events:auto;overscroll-behavior:contain;scrollbar-width:thin}}
 .tooltip-title{{font-size:17px;font-weight:700;margin-bottom:6px}}
 .tooltip-meta{{display:grid;grid-template-columns:1fr;gap:2px;color:#c8c8cc;margin-bottom:11px}}
@@ -4305,13 +4444,13 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 .tooltip-device-label{{color:#aeb0b5}}
 .tooltip-device-reading{{display:flex;align-items:baseline;gap:8px;text-align:right}}
 .tooltip-device-delta{{color:#ffd60a;font-size:11px;font-weight:700}}
-@media(max-width:900px){{.advisor-head{{align-items:stretch;flex-direction:column}}.advisor-select-wrap{{min-width:0}}.advisor-kpis{{grid-template-columns:repeat(2,minmax(0,1fr))}}.advisor-device-grid{{grid-template-columns:1fr}}}}
+@media(max-width:900px){{.advisor-head,.batch-head{{align-items:stretch;flex-direction:column}}.advisor-select-wrap{{min-width:0}}.advisor-kpis{{grid-template-columns:repeat(2,minmax(0,1fr))}}.advisor-device-grid{{grid-template-columns:1fr}}}}
 @media(max-width:600px){{.tooltip-metrics,.advisor-kpis{{grid-template-columns:1fr}}}}
 </style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1>
 <p class="note">{html.escape(analysis["definition"])}</p>
-<p class="note">At each Model VDD, every cell is ranked by its CR percentile and PR percentile; the weaker drive-ratio percentile determines its wafer-relative grade. Green means both are at or above the median, yellow means the weaker ratio is P25–P50, and red means it is below P25. RSNM and BL Write Trip Margin percentiles are retained for correlation, while residual WSNM remains a separate diagnostic. X=βPG/βPU=PR (right improves write); Y=βPD/βPG=CR (up improves read). These colors are not absolute silicon Pass/Fail.</p>
+<p class="note">At each Model VDD, every cell is ranked by its CR percentile and PR percentile; the weaker drive-ratio percentile determines its wafer-relative grade. Green means both are at or above the median, yellow means the weaker ratio is P25–P50, and red means it is below P25. RSNM and BL Write Trip Margin percentiles are retained for correlation, while residual WSNM remains a separate diagnostic. X=<span class="mosdrive">MOS<sub>drive</sub></span>(PG)/<span class="mosdrive">MOS<sub>drive</sub></span>(PU)=PR (right improves write); Y=<span class="mosdrive">MOS<sub>drive</sub></span>(PD)/<span class="mosdrive">MOS<sub>drive</sub></span>(PG)=CR (up improves read). These colors are not absolute silicon Pass/Fail.</p>
 {sections}
-<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. {('Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. ' if not shmoo_only else '')}Per-cell Shmoo results: <code>estimate_vmin_cr_pr_shmoo.csv</code>. Advisor details: <code>estimate_vmin_drive_to_preferred_advisor.csv</code>.</p>
+<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. {('Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. ' if not shmoo_only else '')}Per-cell Shmoo results: <code>estimate_vmin_cr_pr_shmoo.csv</code>. Cell Advisor: <code>estimate_vmin_drive_to_preferred_advisor.csv</code>. Batch Advisor: <code>estimate_vmin_batch_drive_advisor.csv</code>.</p>
 </main><div id="cell-tooltip" role="tooltip"></div>
 <script>
 const cellTooltip=document.getElementById('cell-tooltip');
@@ -4413,6 +4552,7 @@ cellTooltip.addEventListener('mouseenter',()=>clearTimeout(cellTooltipHideTimer)
 cellTooltip.addEventListener('mouseleave',()=>{{cellTooltip.style.display='none';}});
 const fmt=(value,digits=3)=>Number(value).toFixed(digits);
 const pct=(value)=>'P'+Math.round(Number(value)*100);
+const makeMosdrive=()=>{{const span=document.createElement('span');span.className='mosdrive';span.append('MOS');const sub=document.createElement('sub');sub.textContent='drive';span.appendChild(sub);return span;}};
 document.querySelectorAll('.drive-advisor').forEach((card)=>{{
   const records=JSON.parse(card.querySelector('.advisor-data').textContent);
   const select=card.querySelector('.advisor-select');
@@ -4435,11 +4575,11 @@ document.querySelectorAll('.drive-advisor').forEach((card)=>{{
       const top=document.createElement('div');top.className='advisor-device-top';
       top.appendChild(makeTooltipNode('advisor-device-name',device.family));
       top.appendChild(makeTooltipNode('advisor-action',device.action));panel.appendChild(top);
-      const change=(Number(device.beta_change_pct)>=0?'+':'')+fmt(device.beta_change_pct,1)+'% β';
-      panel.appendChild(makeTooltipNode('advisor-change',change));
+      const change=makeTooltipNode('advisor-change',(Number(device.beta_change_pct)>=0?'+':'')+fmt(device.beta_change_pct,1)+'% ');
+      change.appendChild(makeMosdrive());panel.appendChild(change);
       const list=document.createElement('dl');
       const add=(label,value)=>{{list.appendChild(makeTooltipNode('',label));const dd=document.createElement('dd');dd.textContent=value;list.appendChild(dd);}};
-      add('Relative β',`${{fmt(device.beta_current_relative)}} → ${{fmt(device.beta_target_relative)}}`);
+      const driveLabel=document.createElement('dt');driveLabel.append('Relative ');driveLabel.appendChild(makeMosdrive());list.appendChild(driveLabel);const driveValue=document.createElement('dd');driveValue.textContent=`${{fmt(device.beta_current_relative)}} → ${{fmt(device.beta_target_relative)}}`;list.appendChild(driveValue);
       add('Current Vt',device.vt_v==null?'—':fmt(device.vt_v,4)+' V');
       add('Idsat @ fixed Vt',device.idsat_current_ua==null?'—':`${{fmt(device.idsat_current_ua,2)}} → ${{fmt(device.idsat_target_fixed_vt_ua,2)}} µA`);
       panel.appendChild(list);deviceGrid.appendChild(panel);
@@ -6913,10 +7053,10 @@ def launch_gui() -> None:
             text=f"Current  PR {current_pr:.3f} / CR {current_cr:.3f}",
             anchor=label_anchor, fill=TEXT, font=("Calibri", 10, "bold"))
         canvas.create_text((left + right) / 2, height - 18,
-                           text="Pull-up Ratio  PR = βPG / βPU  (right = easier write)",
+                           text="Pull-up Ratio  PR = MOSdrive(PG) / MOSdrive(PU)  (right = easier write)",
                            fill=TEXT, font=("Calibri", 10, "bold"))
         canvas.create_text(18, (top + bottom) / 2,
-                           text="CR = βPD / βPG  (up = stronger read)", angle=90,
+                           text="CR = MOSdrive(PD) / MOSdrive(PG)  (up = stronger read)", angle=90,
                            fill=TEXT, font=("Calibri", 10, "bold"))
         canvas.create_text(right, bottom + 34,
                            text="Green: both ≥ Median   Yellow: both ≥ Q1   Red: either < Q1",
@@ -6936,15 +7076,15 @@ def launch_gui() -> None:
             unit = "V" if key.endswith("vt") or key == "vdd" else "µA"
             training_display[key].set(f"{variable.get():.3f} {unit}" if unit == "V" else f"{variable.get():.0f} {unit}")
         training_summary.configure(
-            text=(f"CR = βPD / βPG = {data['cell_ratio']:.2f}    ·    "
-                  f"PR = βPG / βPU = {data['pull_up_ratio']:.2f}\n"
+            text=(f"CR = MOSdrive(PD) / MOSdrive(PG) = {data['cell_ratio']:.2f}    ·    "
+                  f"PR = MOSdrive(PG) / MOSdrive(PU) = {data['pull_up_ratio']:.2f}\n"
                   "Higher CR generally helps read stability; higher PR generally helps write-0 ability."),
             fg=SECONDARY)
         canvas = training_canvas
         canvas.delete("all")
         width = max(canvas.winfo_width(), 620)
         height = max(canvas.winfo_height(), 290)
-        canvas.create_text(28, 16, text="Effective WAT-calibrated drive β (relative)", anchor="w",
+        canvas.create_text(28, 16, text="Effective WAT-calibrated MOSdrive (relative)", anchor="w",
                            fill=TEXT, font=("Calibri", 12, "bold"))
         betas = [("PU", data["beta_pu"], RED), ("PG", data["beta_pg"], GREEN), ("PD", data["beta_pd"], BLUE)]
         max_beta = max(value for _, value, _ in betas) or 1.0
