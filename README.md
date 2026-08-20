@@ -13,6 +13,7 @@ The active workflow is focused on:
 - Manual grouped-PU/PG/PD RSNM-versus-VDD curve analysis and eye-closure estimation
 - Write Trip Margin versus VDD trend analysis and estimated write boundary
 - Interactive 6T Drive Monitor for PU/PG/PD Vt, Idsat, CR/PR and margin trends
+- Lot/Wafer grouped Read, Write and balanced-drive distribution analysis
 
 Hold SNM and Vmin comparison are not included in the active report.
 
@@ -73,7 +74,9 @@ New Multi-Cell summaries also retain each cell's family-average PU/PG/PD Vt and 
 
 Each Estimate Vmin Shmoo is followed by an interactive **Drive-to-Preferred Advisor**. Select a Cell/Chip to compare its CR/PR percentiles with a same-VDD P55 guardband. The first-pass recommendation holds PG as the shared denominator, strengthens PD only when CR is short, and weakens PU only when PR is short. It also reports fixed-Vt equivalent Idsat values and exports all rows to `estimate_vmin_drive_to_preferred_advisor.csv`. This is a relative sensitivity screen; Vt and Idsat correlation plus final process feasibility still require Device/PDK and measured-WT review.
 
-The Advisor also includes a **Low / Monitor Batch Adjustment**. It sizes one common PD/PG/PU MOSdrive multiplier from the limiting Low/Monitor cells and reports coverage against the frozen pre-adjustment P55 target in `estimate_vmin_batch_drive_advisor.csv`. Because a uniform shift preserves the population's rank order, recalculating the percentile target after the shift would leave relative grades unchanged; the batch result is sensitivity guidance, not a process recipe.
+The dedicated **Lot/Wafer Advisor** includes a **Low / Monitor Batch Adjustment**. It sizes one common PD/PG/PU MOSdrive multiplier from the limiting Low/Monitor cells and reports coverage against the frozen pre-adjustment P55 target in `lot_wafer_batch_drive_advisor.csv`. Because a uniform shift preserves the population's rank order, recalculating the percentile target after the shift would leave relative grades unchanged; the batch result is sensitivity guidance, not a process recipe.
+
+The dedicated **Lot/Wafer Advisor** tab accepts one or more generated `multi_chip_snm_summary.csv` files. Rows with an identical `lot_wafer` value are merged as one group at each Model VDD, even when they come from different selected files. It exports three complementary views: a CR–PR scatter using a stable color/marker and central-50% window for each Lot/Wafer, Tukey box plots for Read SNM, BL Write Trip Margin and `100 × min(CR percentile, PR percentile)` balanced drive score, and a labeled grouped bar chart showing the Preferred / Monitor / Low Cell count for every Lot/Wafer. The report also compares each group with the same frozen all-population P55 CR/PR target and exports `lot_wafer_distribution_statistics.csv`, `lot_wafer_cell_drive_scores.csv` and `lot_wafer_batch_drive_advisor.csv`. Model VDDs are never pooled into the same distribution chart.
 
 The Estimate Vmin import now accepts a single `multi_chip_snm_summary.csv`. Selecting one source file automatically enters **Shmoo-only mode** and outputs only the CR/PR Shmoo, Advisor, statistics, source backup and related CSV files, even if that file contains multiple VDD groups. Estimate Vmin trend images, eye-closure estimation and `multi_chip_snm_summary_combined.csv` are generated only when two or more source files with at least two total Model VDD points are selected.
 

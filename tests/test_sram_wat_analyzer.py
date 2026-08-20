@@ -11,16 +11,20 @@ from sram_wat_analyzer import (
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
     _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_combined_comparison_svg, estimate_vmin_curve_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_combined_files,
     analyze_write_trip_margin_curve,
+    analyze_lot_wafer_drive_advisor,
     build_batch_drive_to_preferred_advice, build_drive_to_preferred_advice,
     _drive_advisor_html,
     generic_28nm_assumption_rows,
     drive_monitor_metrics, drive_monitor_shmoo_reference,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
     read_iv_curve_excel, read_multi_chip_6t_excel, read_multi_chip_snm_summary, read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
+    lot_wafer_boxplot_svg, lot_wafer_drive_scatter_svg,
+    lot_wafer_grade_counts_svg,
     save_gui_state,
     validate_config, wat_electrical_snm_rows,
     write_iv_curve_excel_template, write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
-    write_estimate_vmin_outputs, write_trip_margin_curve_svg, write_write_trip_margin_outputs,
+    write_estimate_vmin_outputs, write_lot_wafer_drive_advisor_outputs,
+    write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
 
 
@@ -811,13 +815,67 @@ class AnalyzerTests(unittest.TestCase):
         self.assertAlmostEqual(batch["devices"][2]["drive_multiplier"], 1.0 / 1.44)
         self.assertAlmostEqual(batch["affected_coverage_after_pct"], 100.0)
         self.assertIn("preserves CR/PR rank ordering", batch["caution"])
-        section, rows, batch_rows = _drive_advisor_html(shmoo, 1)
+        section, rows = _drive_advisor_html(shmoo, 1)
         self.assertIn("Drive-to-Preferred Advisor", section)
         self.assertIn("P55 guardband", section)
-        self.assertIn("Low / Monitor Batch Adjustment", section)
+        self.assertNotIn("Low / Monitor Batch Adjustment", section)
         self.assertIn("MOS<sub>drive</sub>", section)
         self.assertEqual(len(rows), 15)
-        self.assertEqual(len(batch_rows), 3)
+
+    def test_lot_wafer_advisor_groups_names_and_exports_boxplots(self):
+        samples = []
+        for lot, ratios, base in (
+                ("LOT_A_W01", (1.0, 1.1, 1.2, 1.3), 50.0),
+                ("LOT_B_W02", (1.5, 1.6, 1.7, 1.8), 80.0)):
+            for index, ratio in enumerate(ratios, 1):
+                samples.append({
+                    "lot_wafer": lot, "chip_id": f"C{index:02d}",
+                    "rsnm_mv": base + index, "wsnm_mv": base*.7 + index,
+                    "write_margin_mv": base*.6 + index,
+                    "cell_ratio_beta": ratio, "pull_up_ratio_beta": ratio,
+                    "pu_vt_v": .38, "pu_idsat_ua": 50.0,
+                    "pg_vt_v": .36, "pg_idsat_ua": 80.0,
+                    "pd_vt_v": .35, "pd_idsat_ua": 110.0,
+                })
+        row = {"vdd_v": .68, "sample_count": len(samples), "samples": samples}
+        for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
+            winner = min(samples, key=lambda sample: sample[key])
+            row[key] = winner[key]
+            row[f"{key}_chip_id"] = winner["chip_id"]
+            row[f"{key}_lot_wafer"] = winner["lot_wafer"]
+        result = analyze_lot_wafer_drive_advisor([row])
+        self.assertEqual(result["lot_wafers"], ["LOT_A_W01", "LOT_B_W02"])
+        vdd = result["vdds"][0]
+        self.assertEqual(vdd["lot_count"], 2)
+        group_a = vdd["groups"][0]
+        self.assertEqual(group_a["sample_count"], 4)
+        self.assertAlmostEqual(group_a["metrics"]["rsnm_mv"]["median"], 52.5)
+        self.assertGreater(group_a["batch_advice"]["devices"][0]["drive_change_pct"], 0)
+        self.assertEqual(group_a["batch_advice"]["devices"][1]["drive_change_pct"], 0)
+        scatter = lot_wafer_drive_scatter_svg(vdd, result["styles"])
+        boxes = lot_wafer_boxplot_svg(vdd, result["styles"])
+        grades = lot_wafer_grade_counts_svg(vdd)
+        self.assertIn("LOT_A_W01", scatter)
+        self.assertIn("central 50%", scatter)
+        self.assertIn("Read SNM", boxes)
+        self.assertIn("Balanced Drive Score", boxes)
+        self.assertIn("Preferred, Monitor and Low Counts", grades)
+        self.assertIn("labels show Cell count", grades)
+        self.assertIn("LOT_A_W01", grades)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "multi_chip_snm_summary.csv"
+            source.write_text("QA source", encoding="utf-8")
+            report = write_lot_wafer_drive_advisor_outputs(
+                result, root / "advisor", [source])
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("Lot/Wafer Drive Advisor", text)
+            self.assertIn("Drive-to-Preferred Batch Sensitivity", text)
+            self.assertTrue((report.parent / "lot_wafer_distribution_statistics.csv").exists())
+            self.assertTrue((report.parent / "lot_wafer_cell_drive_scores.csv").exists())
+            self.assertTrue((report.parent / "lot_wafer_batch_drive_advisor.csv").exists())
+            self.assertTrue(any((report.parent / "images").glob("*_lot_wafer_boxplots.png")))
+            self.assertTrue(any((report.parent / "images").glob("*_lot_wafer_grade_counts.png")))
 
     def test_single_vdd_multi_cell_summary_outputs_shmoo_only(self):
         fieldnames = [
@@ -853,7 +911,7 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("Drive-to-Preferred Advisor", report_text)
             self.assertTrue((report.parent / "estimate_vmin_cr_pr_shmoo.csv").exists())
             self.assertTrue((report.parent / "estimate_vmin_drive_to_preferred_advisor.csv").exists())
-            self.assertTrue((report.parent / "estimate_vmin_batch_drive_advisor.csv").exists())
+            self.assertFalse((report.parent / "estimate_vmin_batch_drive_advisor.csv").exists())
             self.assertFalse((report.parent / "multi_chip_snm_summary_combined.csv").exists())
             self.assertFalse((report.parent / "images" / "05_estimate_vmin_stacked.png").exists())
             self.assertFalse((report.parent / "images" / "01_rsnm_mv_estimate_vmin.png").exists())

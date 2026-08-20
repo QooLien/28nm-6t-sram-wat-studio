@@ -3420,7 +3420,8 @@ def build_drive_to_preferred_advice(
 
 def build_batch_drive_to_preferred_advice(
         shmoo: dict[str, object],
-        target_percentile: float = .55) -> dict[str, object]:
+        target_percentile: float = .55,
+        lot_wafer: str | None = None) -> dict[str, object]:
     """Estimate one common drive shift for the Low/Monitor batch population.
 
     The P55 CR/PR targets are frozen from the current same-VDD population.
@@ -3432,20 +3433,27 @@ def build_batch_drive_to_preferred_advice(
     probability = float(target_percentile)
     if not .50 <= probability <= .95:
         raise ValueError("Batch Advisor target percentile must be between P50 and P95")
-    samples = list(shmoo.get("samples", []))
-    if not samples:
+    reference_samples = list(shmoo.get("samples", []))
+    if not reference_samples:
         raise ValueError("Batch Advisor requires at least one same-VDD cell")
-    cr_values = [float(item["cell_ratio_beta"]) for item in samples]
-    pr_values = [float(item["pull_up_ratio_beta"]) for item in samples]
+    samples = [item for item in reference_samples
+               if lot_wafer is None or str(item.get("lot_wafer")) == str(lot_wafer)]
+    if not samples:
+        raise ValueError(f"Lot/Wafer {lot_wafer} was not found in this VDD population")
+    cr_values = [float(item["cell_ratio_beta"]) for item in reference_samples]
+    pr_values = [float(item["pull_up_ratio_beta"]) for item in reference_samples]
     target_cr = _linear_quantile(cr_values, probability)
     target_pr = _linear_quantile(pr_values, probability)
     affected = [item for item in samples
                 if str(item.get("wafer_grade", "low")) in {"low", "monitor"}]
-    limiting = affected or samples
-    read_limit = min(limiting, key=lambda item: float(item["cell_ratio_beta"]))
-    write_limit = min(limiting, key=lambda item: float(item["pull_up_ratio_beta"]))
-    pd_multiplier = max(1.0, target_cr / float(read_limit["cell_ratio_beta"]))
-    pu_multiplier = min(1.0, float(write_limit["pull_up_ratio_beta"]) / target_pr)
+    read_limit = (min(affected, key=lambda item: float(item["cell_ratio_beta"]))
+                  if affected else None)
+    write_limit = (min(affected, key=lambda item: float(item["pull_up_ratio_beta"]))
+                   if affected else None)
+    pd_multiplier = (max(1.0, target_cr / float(read_limit["cell_ratio_beta"]))
+                     if read_limit else 1.0)
+    pu_multiplier = (min(1.0, float(write_limit["pull_up_ratio_beta"]) / target_pr)
+                     if write_limit else 1.0)
     pg_multiplier = 1.0
 
     def reaches_frozen_target(item: dict[str, object], adjusted: bool) -> bool:
@@ -3488,9 +3496,11 @@ def build_batch_drive_to_preferred_advice(
     }
     return {
         "vdd_v": float(shmoo["vdd_v"]),
+        "lot_wafer": str(lot_wafer or "ALL"),
         "target_percentile": probability,
         "target": {"cr": target_cr, "pr": target_pr},
         "sample_count": len(samples),
+        "reference_sample_count": len(reference_samples),
         "affected_count": len(affected),
         "grade_counts": grade_counts,
         "frozen_target_coverage_before_pct": 100.0 * before_count / len(samples),
@@ -3498,14 +3508,493 @@ def build_batch_drive_to_preferred_advice(
         "affected_coverage_after_pct": (
             100.0 * affected_after / len(affected) if affected else 100.0),
         "devices": device_rows,
-        "read_limiting_chip_id": str(read_limit.get("chip_id", "")),
-        "write_limiting_chip_id": str(write_limit.get("chip_id", "")),
+        "read_limiting_chip_id": str(read_limit.get("chip_id", "")) if read_limit else "",
+        "write_limiting_chip_id": str(write_limit.get("chip_id", "")) if write_limit else "",
         "method": ("Common batch shift sized by the limiting Low/Monitor CR and PR, "
                    "using the current population P55 values as frozen references."),
         "caution": ("A uniform wafer/batch shift preserves CR/PR rank ordering. If P55 is "
                     "recalculated after the shift, relative grades do not improve; use this "
                     "only as frozen-target sensitivity guidance, not a process recipe."),
     }
+
+
+_LOT_WAFER_ADVISOR_METRICS = (
+    ("rsnm_mv", "Read SNM", "mV", "#007AFF"),
+    ("write_margin_mv", "BL Write Trip Margin", "mV", "#FF9500"),
+    ("balanced_drive_pct", "Balanced Drive Score", "%", "#AF52DE"),
+)
+_LOT_WAFER_COLORS = ("#007AFF", "#FF9500", "#AF52DE", "#008F5D", "#D64D73")
+_LOT_WAFER_LIGHTS = ("#EAF3FF", "#FFF1DB", "#F3EAFE", "#E3F5ED", "#FBE9EF")
+_LOT_WAFER_MARKERS = ("circle", "square", "triangle", "diamond")
+
+
+def _tukey_box(values: Iterable[float]) -> dict[str, object]:
+    """Return quartiles, Tukey whiskers and outliers for one group."""
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise ValueError("Box-plot statistics require at least one value")
+    q1 = _linear_quantile(ordered, .25)
+    median = _linear_quantile(ordered, .50)
+    q3 = _linear_quantile(ordered, .75)
+    iqr = q3 - q1
+    lower_fence = q1 - 1.5 * iqr
+    upper_fence = q3 + 1.5 * iqr
+    inside = [value for value in ordered if lower_fence <= value <= upper_fence]
+    return {
+        "count": len(ordered), "minimum": ordered[0], "maximum": ordered[-1],
+        "q1": q1, "median": median, "q3": q3, "iqr": iqr,
+        "whisker_low": min(inside) if inside else ordered[0],
+        "whisker_high": max(inside) if inside else ordered[-1],
+        "mean": statlib.fmean(ordered),
+        "outliers": [value for value in ordered
+                     if value < lower_fence or value > upper_fence],
+        "values": ordered,
+    }
+
+
+def analyze_lot_wafer_drive_advisor(
+        summary_rows: list[dict[str, object]]) -> dict[str, object]:
+    """Compare Lot/Wafer read, write and balanced drive at each Model VDD.
+
+    Lot/Wafer names are the grouping key, even when matching names arrive from
+    different imported files.  Percentiles and the frozen P55 reference are
+    calculated across the complete same-VDD population; distributions are
+    then summarized separately for each Lot/Wafer group.
+    """
+    shmoos = _build_estimate_vmin_ratio_shmoos(summary_rows)
+    if not shmoos:
+        raise ValueError(
+            "Lot/Wafer Advisor requires CR, PR, RSNM and Write Margin columns")
+    all_lots = sorted({str(sample.get("lot_wafer", "Wafer"))
+                       for shmoo in shmoos for sample in shmoo["samples"]})
+    style_map = {
+        lot: {
+            "color": _LOT_WAFER_COLORS[index % len(_LOT_WAFER_COLORS)],
+            "light": _LOT_WAFER_LIGHTS[index % len(_LOT_WAFER_LIGHTS)],
+            "marker": _LOT_WAFER_MARKERS[index % len(_LOT_WAFER_MARKERS)],
+        }
+        for index, lot in enumerate(all_lots)
+    }
+    vdd_groups: list[dict[str, object]] = []
+    for shmoo in shmoos:
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for sample in shmoo["samples"]:
+            item = dict(sample)
+            item["balanced_drive_pct"] = 100.0 * float(item["wafer_grade_score"])
+            grouped.setdefault(str(item.get("lot_wafer", "Wafer")), []).append(item)
+        groups: list[dict[str, object]] = []
+        for lot in sorted(grouped):
+            samples = grouped[lot]
+            metrics = {
+                key: _tukey_box(float(sample[key]) for sample in samples)
+                for key, *_ in _LOT_WAFER_ADVISOR_METRICS
+            }
+            cr_values = [float(sample["cell_ratio_beta"]) for sample in samples]
+            pr_values = [float(sample["pull_up_ratio_beta"]) for sample in samples]
+            grade_counts = {
+                grade: sum(str(sample.get("wafer_grade")) == grade for sample in samples)
+                for grade in ("preferred", "monitor", "low")
+            }
+            groups.append({
+                "lot_wafer": lot, "sample_count": len(samples), "samples": samples,
+                "metrics": metrics, "grade_counts": grade_counts,
+                "median_cr": _linear_quantile(cr_values, .50),
+                "median_pr": _linear_quantile(pr_values, .50),
+                "q1_cr": _linear_quantile(cr_values, .25),
+                "q3_cr": _linear_quantile(cr_values, .75),
+                "q1_pr": _linear_quantile(pr_values, .25),
+                "q3_pr": _linear_quantile(pr_values, .75),
+                "batch_advice": build_batch_drive_to_preferred_advice(
+                    shmoo, .55, lot_wafer=lot),
+            })
+        vdd_groups.append({
+            "vdd_v": float(shmoo["vdd_v"]), "sample_count": len(shmoo["samples"]),
+            "lot_count": len(groups), "groups": groups, "shmoo": shmoo,
+            "target_cr": _linear_quantile(
+                (float(sample["cell_ratio_beta"]) for sample in shmoo["samples"]), .55),
+            "target_pr": _linear_quantile(
+                (float(sample["pull_up_ratio_beta"]) for sample in shmoo["samples"]), .55),
+        })
+    return {
+        "vdds": vdd_groups, "lot_wafers": all_lots, "styles": style_map,
+        "definition": (
+            "Groups use exact Lot/Wafer names. Read=RSNM; Write=BL Write Trip Margin; "
+            "Balanced Drive Score=100×min(CR percentile, PR percentile) within the "
+            "complete same-VDD population. Box plots use Tukey 1.5×IQR whiskers."),
+    }
+
+
+def _lot_marker_svg(kind: str, x: float, y: float, size: float,
+                    color: str, fill: str | None = None,
+                    opacity: float = 1.0) -> str:
+    """Draw one color-plus-shape marker so Lot/Wafer groups remain distinct."""
+    inside = fill or color
+    common = f'fill="{inside}" stroke="{color}" stroke-width="2" opacity="{opacity:.2f}"'
+    if kind == "square":
+        return (f'<rect x="{x-size:.1f}" y="{y-size:.1f}" width="{2*size:.1f}" '
+                f'height="{2*size:.1f}" {common}/>')
+    if kind == "triangle":
+        return (f'<path d="M{x:.1f} {y-size*1.18:.1f} L{x+size*1.08:.1f} '
+                f'{y+size:.1f} L{x-size*1.08:.1f} {y+size:.1f} Z" {common}/>')
+    if kind == "diamond":
+        return (f'<path d="M{x:.1f} {y-size*1.2:.1f} L{x+size:.1f} {y:.1f} '
+                f'L{x:.1f} {y+size*1.2:.1f} L{x-size:.1f} {y:.1f} Z" {common}/>')
+    return f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{size:.1f}" {common}/>'
+
+
+def lot_wafer_drive_scatter_svg(vdd_group: dict[str, object],
+                                 styles: dict[str, dict[str, str]],
+                                 width: int = 1600, height: int = 900) -> str:
+    """Render same-VDD PR/CR locations colored and shaped by Lot/Wafer."""
+    groups = list(vdd_group["groups"])
+    samples = [sample for group in groups for sample in group["samples"]]
+    left, top, right, bottom = 110, 145, 1190, 790
+    x_values = [float(sample["pull_up_ratio_beta"]) for sample in samples]
+    y_values = [float(sample["cell_ratio_beta"]) for sample in samples]
+
+    def padded_domain(values: list[float]) -> tuple[float, float]:
+        low, high = min(values), max(values)
+        span = high - low
+        padding = max(span * .10, max(abs(low), abs(high), 1.0) * .025)
+        return low - padding, high + padding
+
+    x_min, x_max = padded_domain(x_values)
+    y_min, y_max = padded_domain(y_values)
+    sx = lambda value: left + (float(value) - x_min) / (x_max - x_min) * (right-left)
+    sy = lambda value: bottom - (float(value) - y_min) / (y_max - y_min) * (bottom-top)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        f'<text x="56" y="54" fill="#1D1D1F" font-size="31" font-weight="700">Lot/Wafer CR–PR Drive Distribution</text>',
+        f'<text x="56" y="86" fill="#6E6E73" font-size="16">Model VDD {float(vdd_group["vdd_v"]):.3f} V · {len(samples)} Cells · {len(groups)} Lot/Wafer groups</text>',
+        '<text x="56" y="111" fill="#6E6E73" font-size="14">Color + marker identify Lot/Wafer; dashed boxes show each group’s central 50% CR/PR window.</text>',
+    ]
+    for fraction in (0, .25, .50, .75, 1):
+        x = left + fraction * (right-left)
+        y = bottom - fraction * (bottom-top)
+        xv = x_min + fraction * (x_max-x_min)
+        yv = y_min + fraction * (y_max-y_min)
+        parts += [
+            f'<path d="M{x:.1f} {top} V{bottom}" stroke="#E5E5EA" stroke-width="1"/>',
+            f'<path d="M{left} {y:.1f} H{right}" stroke="#E5E5EA" stroke-width="1"/>',
+            f'<text x="{x:.1f}" y="{bottom+27}" text-anchor="middle" fill="#6E6E73" font-size="13">{xv:.3f}</text>',
+            f'<text x="{left-14}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="13">{yv:.3f}</text>',
+        ]
+    parts += [f'<path d="M{left} {top} V{bottom} H{right}" fill="none" stroke="#1D1D1F" stroke-width="2"/>']
+    median_pr = _linear_quantile(x_values, .50)
+    median_cr = _linear_quantile(y_values, .50)
+    parts += [
+        f'<path d="M{sx(median_pr):.1f} {top} V{bottom}" stroke="#8E8E93" stroke-width="2" stroke-dasharray="6 6"/>',
+        f'<path d="M{left} {sy(median_cr):.1f} H{right}" stroke="#8E8E93" stroke-width="2" stroke-dasharray="6 6"/>',
+    ]
+    for group in groups:
+        lot = str(group["lot_wafer"])
+        style = styles[lot]
+        x1, x2 = sx(group["q1_pr"]), sx(group["q3_pr"])
+        y1, y2 = sy(group["q3_cr"]), sy(group["q1_cr"])
+        parts.append(
+            f'<rect x="{min(x1,x2):.1f}" y="{min(y1,y2):.1f}" '
+            f'width="{abs(x2-x1):.1f}" height="{abs(y2-y1):.1f}" '
+            f'fill="{style["light"]}" stroke="{style["color"]}" '
+            'stroke-opacity="0.65" stroke-width="2" stroke-dasharray="7 5"/>')
+        for sample in group["samples"]:
+            tooltip = html.escape(
+                f'{lot} · {sample["chip_id"]} · PR {float(sample["pull_up_ratio_beta"]):.3f} · '
+                f'CR {float(sample["cell_ratio_beta"]):.3f} · RSNM {float(sample["rsnm_mv"]):.1f} mV · '
+                f'Vtrip {float(sample["write_margin_mv"]):.1f} mV')
+            marker = _lot_marker_svg(
+                style["marker"], sx(sample["pull_up_ratio_beta"]),
+                sy(sample["cell_ratio_beta"]), 5.0, style["color"], opacity=.78)
+            parts.append(f'<g><title>{tooltip}</title>{marker}</g>')
+        parts.append(_lot_marker_svg(
+            style["marker"], sx(group["median_pr"]), sy(group["median_cr"]),
+            9.0, style["color"], fill="#FFFFFF"))
+    legend_x, legend_y = 1245, 164
+    parts += [
+        f'<text x="{legend_x}" y="{legend_y-25}" fill="#1D1D1F" font-size="19" font-weight="700">LOT / WAFER</text>',
+        f'<text x="{legend_x}" y="{legend_y}" fill="#6E6E73" font-size="13">Large open marker = group median</text>',
+    ]
+    for index, group in enumerate(groups):
+        lot = str(group["lot_wafer"]); style = styles[lot]; y = legend_y + 42 + index*48
+        parts += [
+            _lot_marker_svg(style["marker"], legend_x+10, y-5, 7, style["color"]),
+            f'<text x="{legend_x+30}" y="{y}" fill="#1D1D1F" font-size="15" font-weight="700">{html.escape(lot)}</text>',
+            f'<text x="{legend_x+30}" y="{y+19}" fill="#6E6E73" font-size="12">n={int(group["sample_count"])} · median PR {float(group["median_pr"]):.3f} · CR {float(group["median_cr"]):.3f}</text>',
+        ]
+    parts += [
+        f'<text x="{(left+right)/2:.1f}" y="{height-38}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Pull-up Ratio  PR = MOSdrive(PG) / MOSdrive(PU)  (right = easier write)</text>',
+        f'<text x="31" y="{(top+bottom)/2:.1f}" transform="rotate(-90 31 {(top+bottom)/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Cell Ratio  CR = MOSdrive(PD) / MOSdrive(PG)  (up = stronger read)</text>',
+        '</svg>',
+    ]
+    return "".join(parts)
+
+
+def lot_wafer_boxplot_svg(vdd_group: dict[str, object],
+                          styles: dict[str, dict[str, str]],
+                          width: int = 1600, height: int = 1120) -> str:
+    """Render grouped Tukey box plots for Read, Write and balanced drive."""
+    groups = list(vdd_group["groups"])
+    left, right = 125, width-70
+    panel_top, panel_height, panel_gap = 145, 245, 70
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="56" y="54" fill="#1D1D1F" font-size="31" font-weight="700">Lot/Wafer Read, Write and Balanced Drive Distributions</text>',
+        f'<text x="56" y="86" fill="#6E6E73" font-size="16">Model VDD {float(vdd_group["vdd_v"]):.3f} V · Tukey box plots (1.5×IQR whiskers) · same Lot/Wafer names are grouped</text>',
+    ]
+    slot = (right-left) / max(len(groups), 1)
+    for panel_index, (key, label, unit, _accent) in enumerate(_LOT_WAFER_ADVISOR_METRICS):
+        top = panel_top + panel_index*(panel_height+panel_gap)
+        bottom = top + panel_height
+        all_values = [value for group in groups for value in group["metrics"][key]["values"]]
+        low, high = min(all_values), max(all_values)
+        span = high-low
+        pad = max(span*.12, max(abs(low), abs(high), 1.0)*.025)
+        y_min, y_max = low-pad, high+pad
+        if key == "balanced_drive_pct":
+            y_min, y_max = max(0.0, y_min), min(100.0, y_max)
+            if y_max <= y_min:
+                y_min, y_max = 0.0, 100.0
+        sy = lambda value: bottom - (float(value)-y_min)/(y_max-y_min)*panel_height
+        parts += [
+            f'<text x="{left}" y="{top-20}" fill="#1D1D1F" font-size="19" font-weight="700">{label} ({unit})</text>',
+        ]
+        for fraction in (0, .25, .50, .75, 1):
+            y = bottom-fraction*panel_height
+            value = y_min+fraction*(y_max-y_min)
+            parts += [
+                f'<path d="M{left} {y:.1f} H{right}" stroke="#E5E5EA" stroke-width="1"/>',
+                f'<text x="{left-13}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="12">{value:.1f}</text>',
+            ]
+        parts.append(f'<path d="M{left} {top} V{bottom} H{right}" fill="none" stroke="#1D1D1F" stroke-width="2"/>')
+        for index, group in enumerate(groups):
+            lot = str(group["lot_wafer"]); style = styles[lot]
+            stats = group["metrics"][key]
+            x = left + slot*(index+.5); box_width = min(88.0, slot*.46)
+            q1_y, q3_y = sy(stats["q1"]), sy(stats["q3"])
+            low_y, high_y = sy(stats["whisker_low"]), sy(stats["whisker_high"])
+            median_y = sy(stats["median"])
+            parts += [
+                f'<path d="M{x:.1f} {high_y:.1f} V{q3_y:.1f} M{x:.1f} {q1_y:.1f} V{low_y:.1f}" stroke="{style["color"]}" stroke-width="2"/>',
+                f'<path d="M{x-box_width*.28:.1f} {high_y:.1f} H{x+box_width*.28:.1f} M{x-box_width*.28:.1f} {low_y:.1f} H{x+box_width*.28:.1f}" stroke="{style["color"]}" stroke-width="2"/>',
+                f'<rect x="{x-box_width/2:.1f}" y="{min(q1_y,q3_y):.1f}" width="{box_width:.1f}" height="{max(abs(q1_y-q3_y),2):.1f}" fill="{style["light"]}" stroke="{style["color"]}" stroke-width="2"/>',
+                f'<path d="M{x-box_width/2:.1f} {median_y:.1f} H{x+box_width/2:.1f}" stroke="#1D1D1F" stroke-width="3"/>',
+            ]
+            for outlier in stats["outliers"]:
+                parts.append(_lot_marker_svg(style["marker"], x, sy(outlier), 3.5, style["color"], fill="#FFFFFF"))
+            if panel_index == len(_LOT_WAFER_ADVISOR_METRICS)-1:
+                parts += [
+                    f'<text x="{x:.1f}" y="{bottom+27}" text-anchor="middle" fill="#1D1D1F" font-size="13" font-weight="700">{html.escape(lot)}</text>',
+                    f'<text x="{x:.1f}" y="{bottom+46}" text-anchor="middle" fill="#6E6E73" font-size="12">n={int(group["sample_count"])}</text>',
+                ]
+    parts += [
+        f'<text x="{width/2:.1f}" y="{height-28}" text-anchor="middle" fill="#6E6E73" font-size="13">Box = Q1–Q3 · center line = median · whiskers = last value within 1.5×IQR · open markers = outliers</text>',
+        '</svg>',
+    ]
+    return "".join(parts)
+
+
+def lot_wafer_grade_counts_svg(vdd_group: dict[str, object],
+                                width: int = 1600, height: int = 900) -> str:
+    """Render Preferred / Monitor / Low Cell counts for every Lot/Wafer."""
+    groups = list(vdd_group["groups"])
+    grades = (
+        ("preferred", "Preferred", "#34C759"),
+        ("monitor", "Monitor", "#FFB000"),
+        ("low", "Low", "#FF3B30"),
+    )
+    left, top, right, bottom = 115, 170, width-70, 735
+    maximum = max(
+        (int(group["grade_counts"][key]) for group in groups for key, *_ in grades),
+        default=0)
+    tick_step = max(1, math.ceil(max(maximum, 1) / 5))
+    axis_max = max(
+        tick_step, (math.ceil(max(maximum, 1) / tick_step) + 1) * tick_step)
+    sy = lambda value: bottom - float(value) / axis_max * (bottom-top)
+    slot = (right-left) / max(len(groups), 1)
+    bar_width = min(48.0, slot*.23)
+    gap = max(4.0, min(10.0, slot*.035))
+    cluster_width = 3*bar_width + 2*gap
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<text x="56" y="54" fill="#1D1D1F" font-size="31" font-weight="700">Lot/Wafer Preferred, Monitor and Low Counts</text>',
+        f'<text x="56" y="86" fill="#6E6E73" font-size="16">Model VDD {float(vdd_group["vdd_v"]):.3f} V · {int(vdd_group["sample_count"])} Cells · labels show Cell count</text>',
+        '<text x="56" y="111" fill="#6E6E73" font-size="14">Relative same-VDD grading; every Lot/Wafer is evaluated against the shared population thresholds.</text>',
+    ]
+    legend_x = right-385
+    for index, (_key, label, color) in enumerate(grades):
+        x = legend_x + index*135
+        parts += [
+            f'<rect x="{x}" y="128" width="18" height="18" rx="3" fill="{color}"/>',
+            f'<text x="{x+27}" y="143" fill="#1D1D1F" font-size="14" font-weight="700">{label}</text>',
+        ]
+    for tick in range(0, axis_max+1, tick_step):
+        y = sy(tick)
+        parts += [
+            f'<path d="M{left} {y:.1f} H{right}" stroke="#E5E5EA" stroke-width="1"/>',
+            f'<text x="{left-15}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="13">{tick}</text>',
+        ]
+    parts.append(
+        f'<path d="M{left} {top} V{bottom} H{right}" fill="none" stroke="#1D1D1F" stroke-width="2"/>')
+    for group_index, group in enumerate(groups):
+        center = left + slot*(group_index+.5)
+        start = center-cluster_width/2
+        for grade_index, (key, label, color) in enumerate(grades):
+            value = int(group["grade_counts"][key])
+            x = start + grade_index*(bar_width+gap)
+            y = sy(value)
+            bar_height = max(0.0, bottom-y)
+            if value:
+                parts.append(
+                    f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_width:.1f}" height="{bar_height:.1f}" rx="4" fill="{color}" stroke="{color}" stroke-width="1"/>')
+            parts.append(
+                f'<text x="{x+bar_width/2:.1f}" y="{y-10:.1f}" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{value}</text>')
+        lot = html.escape(str(group["lot_wafer"]))
+        parts += [
+            f'<text x="{center:.1f}" y="{bottom+34}" text-anchor="end" transform="rotate(-18 {center:.1f} {bottom+34})" fill="#1D1D1F" font-size="14" font-weight="700">{lot}</text>',
+            f'<text x="{center:.1f}" y="{bottom+76}" text-anchor="middle" fill="#6E6E73" font-size="12">n={int(group["sample_count"])}</text>',
+        ]
+    parts += [
+        f'<text x="31" y="{(top+bottom)/2:.1f}" transform="rotate(-90 31 {(top+bottom)/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Cell count</text>',
+        f'<text x="{(left+right)/2:.1f}" y="{height-32}" text-anchor="middle" fill="#6E6E73" font-size="13">Preferred = both CR and PR at/above P50 · Monitor = both at/above P25 · Low = remaining Cells</text>',
+        '</svg>',
+    ]
+    return "".join(parts)
+
+
+def write_lot_wafer_drive_advisor_outputs(
+        analysis: dict[str, object], out_dir: str | os.PathLike[str],
+        source_paths: Iterable[str | os.PathLike[str]]) -> Path:
+    """Export the dedicated Lot/Wafer Advisor report, charts and CSV data."""
+    out = Path(out_dir); images = out / "images"; images.mkdir(parents=True, exist_ok=True)
+    try:
+        from reportlab.graphics import renderPM
+        from svglib.svglib import svg2rlg
+    except ImportError as exc:
+        raise RuntimeError(
+            "PNG export packages are missing. Run: python -m pip install -r requirements.txt") from exc
+
+    statistics_rows: list[dict[str, object]] = []
+    cell_rows: list[dict[str, object]] = []
+    batch_rows: list[dict[str, object]] = []
+    report_sections: list[str] = []
+    styles = analysis["styles"]
+    for index, vdd_group in enumerate(analysis["vdds"], 1):
+        prefix = f'{index:02d}_vdd_{float(vdd_group["vdd_v"]):.3f}'
+        scatter_svg_name = f"{prefix}_lot_wafer_drive_scatter.svg"
+        scatter_png_name = scatter_svg_name.replace(".svg", ".png")
+        box_svg_name = f"{prefix}_lot_wafer_boxplots.svg"
+        box_png_name = box_svg_name.replace(".svg", ".png")
+        grade_svg_name = f"{prefix}_lot_wafer_grade_counts.svg"
+        grade_png_name = grade_svg_name.replace(".svg", ".png")
+        scatter_svg = lot_wafer_drive_scatter_svg(vdd_group, styles)
+        box_svg = lot_wafer_boxplot_svg(vdd_group, styles)
+        grade_svg = lot_wafer_grade_counts_svg(vdd_group)
+        for svg_name, png_name, content in (
+                (scatter_svg_name, scatter_png_name, scatter_svg),
+                (box_svg_name, box_png_name, box_svg),
+                (grade_svg_name, grade_png_name, grade_svg)):
+            svg_path = images / svg_name
+            svg_path.write_text(content, encoding="utf-8")
+            drawing = svg2rlg(str(svg_path))
+            if drawing is None:
+                raise RuntimeError(f"Could not render Lot/Wafer chart: {svg_name}")
+            renderPM.drawToFile(
+                drawing, str(images / png_name), fmt="PNG", dpi=180,
+                backend="rlPyCairo")
+
+        summary_body: list[str] = []
+        batch_body: list[str] = []
+        for group in vdd_group["groups"]:
+            lot = str(group["lot_wafer"])
+            grade = group["grade_counts"]
+            read_stats = group["metrics"]["rsnm_mv"]
+            write_stats = group["metrics"]["write_margin_mv"]
+            balance_stats = group["metrics"]["balanced_drive_pct"]
+            summary_body.append(
+                f'<tr><td>{html.escape(lot)}</td><td>{int(group["sample_count"])}</td>'
+                f'<td>{float(read_stats["median"]):.1f}</td><td>{float(read_stats["iqr"]):.1f}</td>'
+                f'<td>{float(write_stats["median"]):.1f}</td><td>{float(write_stats["iqr"]):.1f}</td>'
+                f'<td>{float(balance_stats["median"]):.1f}%</td>'
+                f'<td>{float(group["median_cr"]):.3f}</td><td>{float(group["median_pr"]):.3f}</td>'
+                f'<td>{int(grade["preferred"])} / {int(grade["monitor"])} / {int(grade["low"])}</td></tr>')
+            for key, label, unit, _color in _LOT_WAFER_ADVISOR_METRICS:
+                statistics_rows.append({
+                    "vdd_v": vdd_group["vdd_v"], "lot_wafer": lot,
+                    "sample_count": group["sample_count"], "metric": key,
+                    "metric_label": label, "unit": unit,
+                    **{field: group["metrics"][key][field]
+                       for field in ("minimum", "q1", "median", "q3", "maximum",
+                                     "whisker_low", "whisker_high", "mean", "iqr")},
+                    "outlier_count": len(group["metrics"][key]["outliers"]),
+                })
+            for sample in group["samples"]:
+                cell_rows.append({
+                    "vdd_v": vdd_group["vdd_v"], "lot_wafer": lot,
+                    "chip_id": sample["chip_id"], "rsnm_mv": sample["rsnm_mv"],
+                    "write_margin_mv": sample["write_margin_mv"],
+                    "balanced_drive_pct": sample["balanced_drive_pct"],
+                    "cell_ratio_beta": sample["cell_ratio_beta"],
+                    "pull_up_ratio_beta": sample["pull_up_ratio_beta"],
+                    "cr_percentile": sample["cr_percentile"],
+                    "pr_percentile": sample["pr_percentile"],
+                    "wafer_grade": sample["wafer_grade"],
+                })
+            batch = group["batch_advice"]
+            devices = {str(device["family"]): device for device in batch["devices"]}
+            batch_body.append(
+                f'<tr><td>{html.escape(lot)}</td><td>{int(batch["affected_count"])}</td>'
+                f'<td>{float(batch["target"]["cr"]):.3f}</td><td>{float(batch["target"]["pr"]):.3f}</td>'
+                f'<td>{float(devices["PD"]["drive_change_pct"]):+.1f}%</td>'
+                f'<td>{float(devices["PG"]["drive_change_pct"]):+.1f}%</td>'
+                f'<td>{float(devices["PU"]["drive_change_pct"]):+.1f}%</td>'
+                f'<td>{float(batch["frozen_target_coverage_before_pct"]):.1f}% → '
+                f'{float(batch["frozen_target_coverage_after_pct"]):.1f}%</td></tr>')
+            for device in batch["devices"]:
+                batch_rows.append({
+                    "vdd_v": vdd_group["vdd_v"], "lot_wafer": lot,
+                    "reference_sample_count": batch["reference_sample_count"],
+                    "sample_count": batch["sample_count"],
+                    "affected_count": batch["affected_count"],
+                    "target_percentile": batch["target_percentile"],
+                    "target_cr": batch["target"]["cr"], "target_pr": batch["target"]["pr"],
+                    "coverage_before_pct": batch["frozen_target_coverage_before_pct"],
+                    "coverage_after_pct": batch["frozen_target_coverage_after_pct"],
+                    "family": device["family"],
+                    "drive_multiplier": device["drive_multiplier"],
+                    "drive_change_pct": device["drive_change_pct"],
+                    "action": device["action"], "median_vt_v": device["median_vt_v"],
+                    "median_idsat_current_ua": device["median_idsat_current_ua"],
+                    "median_idsat_target_fixed_vt_ua": device["median_idsat_target_fixed_vt_ua"],
+                    "limiting_chip_id": device["limiting_chip_id"],
+                })
+        report_sections.append(f'''<section>
+<div class="section-head"><div><p class="eyebrow">MODEL VDD</p><h2>{float(vdd_group["vdd_v"]):.3f} V Lot/Wafer Comparison</h2></div><div class="count"><strong>{int(vdd_group["sample_count"])}</strong><span>Cells<br>{int(vdd_group["lot_count"])} groups</span></div></div>
+<div class="chart-grid"><figure><img src="images/{scatter_png_name}" alt="Lot Wafer CR PR scatter"><figcaption><a href="images/{scatter_svg_name}">SVG</a> · <a href="images/{scatter_png_name}">PNG</a></figcaption></figure><figure><img src="images/{box_png_name}" alt="Lot Wafer box plots"><figcaption><a href="images/{box_svg_name}">SVG</a> · <a href="images/{box_png_name}">PNG</a></figcaption></figure><figure><img src="images/{grade_png_name}" alt="Lot Wafer Preferred Monitor Low grade counts"><figcaption><a href="images/{grade_svg_name}">SVG</a> · <a href="images/{grade_png_name}">PNG</a></figcaption></figure></div>
+<h3>Lot/Wafer Distribution Summary</h3><div class="table-wrap"><table><thead><tr><th>Lot/Wafer</th><th>n</th><th>Read median</th><th>Read IQR</th><th>Write median</th><th>Write IQR</th><th>Balanced median</th><th>Median CR</th><th>Median PR</th><th>P / M / L</th></tr></thead><tbody>{''.join(summary_body)}</tbody></table></div>
+<h3>Drive-to-Preferred Batch Sensitivity</h3><p class="note">Each Lot/Wafer is compared with the same frozen P55 target from all Cells at this VDD. PG is held; PD addresses CR and PU addresses PR.</p><div class="table-wrap"><table><thead><tr><th>Lot/Wafer</th><th>Low + Monitor</th><th>P55 CR</th><th>P55 PR</th><th>PD MOS<sub>drive</sub></th><th>PG MOS<sub>drive</sub></th><th>PU MOS<sub>drive</sub></th><th>Frozen-target coverage</th></tr></thead><tbody>{''.join(batch_body)}</tbody></table></div>
+</section>''')
+
+    def write_csv(filename: str, rows: list[dict[str, object]]) -> None:
+        if not rows:
+            return
+        with (out / filename).open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader(); writer.writerows(rows)
+
+    write_csv("lot_wafer_distribution_statistics.csv", statistics_rows)
+    write_csv("lot_wafer_cell_drive_scores.csv", cell_rows)
+    write_csv("lot_wafer_batch_drive_advisor.csv", batch_rows)
+    backup_dir = out / "imported_multi_chip_summaries"; backup_dir.mkdir(exist_ok=True)
+    for index, raw_path in enumerate(source_paths, 1):
+        source = Path(raw_path)
+        shutil.copy2(source, backup_dir / f"{index:02d}_{source.name}")
+    report = out / "lot_wafer_drive_advisor.html"
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HV28 SRAM Lot/Wafer Drive Advisor</title><style>
+*{{box-sizing:border-box}}body{{margin:0;padding:clamp(12px,2vw,32px);background:#f5f5f7;color:#1d1d1f;font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif}}main{{max-width:1680px;margin:auto}}h1{{font-size:clamp(30px,4vw,48px);letter-spacing:-.025em;margin-bottom:8px}}section{{background:#fff;border-radius:18px;padding:clamp(18px,2vw,28px);margin:20px 0}}.note{{color:#6e6e73;line-height:1.5}}.eyebrow{{margin:0;color:#ff385c;font-size:12px;font-weight:700;letter-spacing:.08em}}.section-head{{display:flex;align-items:flex-end;justify-content:space-between;gap:18px}}.section-head h2{{margin:5px 0}}.count{{display:flex;align-items:center;gap:10px;padding:10px 15px;border-radius:14px;background:#f5f5f7}}.count strong{{font-size:28px}}.count span{{color:#6e6e73;font-size:12px}}.chart-grid{{display:grid;grid-template-columns:1fr;gap:18px;margin:20px 0}}figure{{margin:0}}img{{display:block;width:100%;height:auto;border:1px solid #e5e5ea;border-radius:14px}}figcaption{{padding-top:7px;text-align:right}}a{{color:#0066cc}}.table-wrap{{overflow-x:auto}}table{{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}}th,td{{padding:11px 12px;border-bottom:1px solid #e5e5ea;text-align:right;white-space:nowrap}}th:first-child,td:first-child{{text-align:left}}th{{color:#6e6e73;font-size:13px}}sub{{font-family:"Times New Roman",serif;font-style:italic}}@media(max-width:800px){{.section-head{{align-items:flex-start;flex-direction:column}}}}
+</style></head><body><main><h1>HV28 SRAM Lot/Wafer Drive Advisor</h1><p class="note">{html.escape(str(analysis["definition"]))} Same Lot/Wafer names are merged as one group, including rows imported from different files.</p>{''.join(report_sections)}<section><h2>Outputs</h2><p class="note"><code>lot_wafer_distribution_statistics.csv</code> · <code>lot_wafer_cell_drive_scores.csv</code> · <code>lot_wafer_batch_drive_advisor.csv</code> · source backups in <code>imported_multi_chip_summaries/</code>.</p><p class="note">Relative compact-model screening only. Uniform batch shifts preserve rank order if the percentile target is recalculated; use the frozen target for sensitivity comparison and confirm process actions with Device/PDK and measured WT.</p></section></main></body></html>''', encoding="utf-8")
+    return report
 
 
 def _estimate_zero_boundary(rows: list[dict[str, object]], key: str) -> dict[str, object] | None:
@@ -4176,8 +4665,8 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
 
 def _drive_advisor_html(
         shmoo: dict[str, object], index: int
-        ) -> tuple[str, list[dict[str, object]], list[dict[str, object]]]:
-    """Return cell and batch advisor views plus their flat export records."""
+        ) -> tuple[str, list[dict[str, object]]]:
+    """Return the interactive per-cell advisor and flat export records."""
     advice = [build_drive_to_preferred_advice(
         shmoo, str(sample["chip_id"]), .55, str(sample.get("lot_wafer", "")))
         for sample in shmoo["samples"]]
@@ -4191,29 +4680,13 @@ def _drive_advisor_html(
         f'P{100*float(item["current"]["score"]):.0f}</option>'
         for position, item in enumerate(advice))
     payload = json.dumps(advice, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    batch = build_batch_drive_to_preferred_advice(shmoo, .55)
     mosdrive = 'MOS<sub>drive</sub>'
-    batch_devices = "".join(
-        f'<article class="advisor-device" data-family="{device["family"]}">'
-        f'<div class="advisor-device-top"><span class="advisor-device-name">{device["family"]}</span>'
-        f'<span class="advisor-action">{html.escape(str(device["action"]))}</span></div>'
-        f'<div class="advisor-change">{float(device["drive_change_pct"]):+.1f}% '
-        f'<span class="mosdrive">{mosdrive}</span></div><dl>'
-        f'<dt>Common multiplier</dt><dd>{float(device["drive_multiplier"]):.3f}×</dd>'
-        f'<dt>Median Vt</dt><dd>{("—" if device["median_vt_v"] is None else f"{float(device["median_vt_v"]):.4f} V")}</dd>'
-        f'<dt>Median Idsat @ fixed Vt</dt><dd>{("—" if device["median_idsat_current_ua"] is None else f"{float(device["median_idsat_current_ua"]):.2f} → {float(device["median_idsat_target_fixed_vt_ua"]):.2f} µA")}</dd>'
-        f'<dt>Limiting Cell</dt><dd>{html.escape(str(device["limiting_chip_id"] or "—"))}</dd>'
-        '</dl></article>'
-        for device in batch["devices"])
     section = f'''<section id="drive-advisor-{index}" class="drive-advisor" data-advisor-index="{index}">
 <div class="advisor-head"><div><p class="eyebrow">SAME-VDD RELATIVE SCREEN</p><h2>Drive-to-Preferred Advisor</h2><p class="note">Select a cell to estimate the smallest decoupled {mosdrive} change needed to reach a P55 guardband above the P50 Preferred boundary.</p></div><div class="advisor-select-wrap"><label for="advisor-select-{index}">Cell / Chip</label><select id="advisor-select-{index}" class="advisor-select">{options}</select></div></div>
 <div class="advisor-kpis"><div class="advisor-kpi"><span>Current grade</span><strong data-field="current-grade">—</strong><small data-field="current-score">—</small></div><div class="advisor-kpi"><span>Current balance</span><strong data-field="current-ratios">—</strong><small data-field="current-percentiles">—</small></div><div class="advisor-kpi"><span>P55 target</span><strong data-field="target-ratios">—</strong><small>Same-VDD population quantile</small></div><div class="advisor-kpi advisor-result"><span>Predicted grade</span><strong data-field="predicted-grade">—</strong><small data-field="predicted-score">—</small></div></div>
 <div class="advisor-device-grid" data-field="devices"></div>
 <p class="advisor-method" data-field="method"></p><p class="advisor-caution" data-field="caution"></p>
 <script type="application/json" class="advisor-data">{payload}</script>
-<div class="batch-advisor"><div class="batch-head"><div><p class="eyebrow">COMMON BATCH SENSITIVITY</p><h3>Low / Monitor Batch Adjustment</h3><p class="note">One common PD / PG / PU shift is sized by the limiting Low or Monitor Cell and compared with the frozen pre-adjustment P55 target.</p></div><div class="batch-count"><strong>{int(batch["affected_count"])}</strong><span>Low + Monitor<br>of {int(batch["sample_count"])} Cells</span></div></div>
-<div class="advisor-kpis batch-kpis"><div class="advisor-kpi"><span>Current distribution</span><strong>{int(batch["grade_counts"]["preferred"])} Preferred</strong><small>{int(batch["grade_counts"]["monitor"])} Monitor · {int(batch["grade_counts"]["low"])} Low</small></div><div class="advisor-kpi"><span>Frozen P55 target</span><strong>CR {float(batch["target"]["cr"]):.3f} · PR {float(batch["target"]["pr"]):.3f}</strong><small>Captured before batch shift</small></div><div class="advisor-kpi"><span>Coverage before</span><strong>{float(batch["frozen_target_coverage_before_pct"]):.1f}%</strong><small>All Cells versus frozen target</small></div><div class="advisor-kpi advisor-result"><span>Coverage after</span><strong>{float(batch["frozen_target_coverage_after_pct"]):.1f}%</strong><small>Low/Monitor coverage {float(batch["affected_coverage_after_pct"]):.1f}%</small></div></div>
-<div class="advisor-device-grid">{batch_devices}</div><p class="advisor-method">{html.escape(str(batch["method"]))}</p><p class="advisor-caution">{html.escape(str(batch["caution"]))}</p></div>
 </section>'''
     flat_rows: list[dict[str, object]] = []
     for item in advice:
@@ -4235,21 +4708,7 @@ def _drive_advisor_html(
                 "idsat_current_ua": device["idsat_current_ua"],
                 "idsat_target_fixed_vt_ua": device["idsat_target_fixed_vt_ua"],
             })
-    batch_rows = [{
-        "vdd_v": batch["vdd_v"], "target_percentile": batch["target_percentile"],
-        "sample_count": batch["sample_count"], "affected_count": batch["affected_count"],
-        "target_cr": batch["target"]["cr"], "target_pr": batch["target"]["pr"],
-        "coverage_before_pct": batch["frozen_target_coverage_before_pct"],
-        "coverage_after_pct": batch["frozen_target_coverage_after_pct"],
-        "affected_coverage_after_pct": batch["affected_coverage_after_pct"],
-        "family": device["family"], "drive_multiplier": device["drive_multiplier"],
-        "drive_change_pct": device["drive_change_pct"], "action": device["action"],
-        "median_vt_v": device["median_vt_v"],
-        "median_idsat_current_ua": device["median_idsat_current_ua"],
-        "median_idsat_target_fixed_vt_ua": device["median_idsat_target_fixed_vt_ua"],
-        "limiting_chip_id": device["limiting_chip_id"],
-    } for device in batch["devices"]]
-    return section, flat_rows, batch_rows
+    return section, flat_rows
 
 
 def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
@@ -4291,7 +4750,6 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                             bg=None, backend="rlPyCairo", backendFmt="RGBA")
     shmoo_sections = []
     advisor_rows: list[dict[str, object]] = []
-    batch_advisor_rows: list[dict[str, object]] = []
     shmoo_fields = ["vdd_v", "lot_wafer", "chip_id", "read_score", "write_score",
                     "balanced_score", "best_region", "read_percentile", "write_percentile",
                     "cr_percentile", "pr_percentile", "performance_grade_score",
@@ -4326,9 +4784,8 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                 raise RuntimeError("Could not render Estimate Vmin CR/PR shmoo")
             renderPM.drawToFile(shmoo_drawing, str(image_dir / png_name), fmt="PNG",
                                 dpi=180, backend="rlPyCairo")
-            advisor_section, advisor_records, batch_records = _drive_advisor_html(shmoo, index)
+            advisor_section, advisor_records = _drive_advisor_html(shmoo, index)
             advisor_rows.extend(advisor_records)
-            batch_advisor_rows.extend(batch_records)
             shmoo_sections.append(
                 f'<section><h2>Model VDD {shmoo["vdd_v"]:.3f} V — Drive-Balance Shmoo</h2>'
                 f'<p class="note">Whole-wafer median center: CR={shmoo["target"]["cell_ratio_beta"]:.3f}; '
@@ -4361,18 +4818,6 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         writer = csv.DictWriter(stream, fieldnames=advisor_fields)
         writer.writeheader()
         writer.writerows(advisor_rows)
-    batch_advisor_fields = [
-        "vdd_v", "target_percentile", "sample_count", "affected_count",
-        "target_cr", "target_pr", "coverage_before_pct", "coverage_after_pct",
-        "affected_coverage_after_pct", "family", "drive_multiplier",
-        "drive_change_pct", "action", "median_vt_v", "median_idsat_current_ua",
-        "median_idsat_target_fixed_vt_ua", "limiting_chip_id",
-    ]
-    with (out / "estimate_vmin_batch_drive_advisor.csv").open(
-            "w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.DictWriter(stream, fieldnames=batch_advisor_fields)
-        writer.writeheader()
-        writer.writerows(batch_advisor_rows)
     if not shmoo_only:
         with (out / "multi_chip_snm_summary_combined.csv").open(
                 "w", newline="", encoding="utf-8-sig") as stream:
@@ -4425,7 +4870,6 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 .advisor-device dl{{display:grid;grid-template-columns:1fr auto;gap:7px 12px;margin:10px 0 0;font-variant-numeric:tabular-nums}}.advisor-device dt{{color:#6e6e73}}.advisor-device dd{{margin:0;text-align:right;font-weight:700}}
 .advisor-method{{margin:18px 0 4px;font-weight:700}}.advisor-caution{{margin:0;color:#9a6700}}
 .mosdrive{{white-space:nowrap;font-family:"Times New Roman",serif;font-style:normal}}.mosdrive sub{{font-size:.62em;line-height:0;vertical-align:-.35em;font-weight:inherit;font-style:italic}}
-.batch-advisor{{margin-top:28px;padding-top:26px;border-top:1px solid #e5e5ea}}.batch-head{{display:flex;align-items:flex-end;justify-content:space-between;gap:24px}}.batch-head h3{{margin:.1rem 0 .35rem;font-size:24px}}.batch-count{{display:flex;align-items:center;gap:12px;min-width:190px;padding:12px 16px;border-radius:14px;background:#f5f5f7}}.batch-count strong{{font-size:30px}}.batch-count span{{color:#6e6e73;font-size:13px;line-height:1.25}}
 #cell-tooltip{{position:fixed;z-index:9999;display:none;width:520px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow-x:hidden;overflow-y:auto;padding:15px 17px;border-radius:14px;background:#1d1d1f;color:#fff;box-shadow:0 10px 34px rgba(0,0,0,.26);font-size:13px;line-height:1.35;pointer-events:auto;overscroll-behavior:contain;scrollbar-width:thin}}
 .tooltip-title{{font-size:17px;font-weight:700;margin-bottom:6px}}
 .tooltip-meta{{display:grid;grid-template-columns:1fr;gap:2px;color:#c8c8cc;margin-bottom:11px}}
@@ -4444,13 +4888,13 @@ img,.interactive-shmoo svg{{display:block;width:100%;height:auto;border:1px soli
 .tooltip-device-label{{color:#aeb0b5}}
 .tooltip-device-reading{{display:flex;align-items:baseline;gap:8px;text-align:right}}
 .tooltip-device-delta{{color:#ffd60a;font-size:11px;font-weight:700}}
-@media(max-width:900px){{.advisor-head,.batch-head{{align-items:stretch;flex-direction:column}}.advisor-select-wrap{{min-width:0}}.advisor-kpis{{grid-template-columns:repeat(2,minmax(0,1fr))}}.advisor-device-grid{{grid-template-columns:1fr}}}}
+@media(max-width:900px){{.advisor-head{{align-items:stretch;flex-direction:column}}.advisor-select-wrap{{min-width:0}}.advisor-kpis{{grid-template-columns:repeat(2,minmax(0,1fr))}}.advisor-device-grid{{grid-template-columns:1fr}}}}
 @media(max-width:600px){{.tooltip-metrics,.advisor-kpis{{grid-template-columns:1fr}}}}
 </style></head><body><main><h1>HV28 SRAM Estimate Vmin Curve</h1>
 <p class="note">{html.escape(analysis["definition"])}</p>
 <p class="note">At each Model VDD, every cell is ranked by its CR percentile and PR percentile; the weaker drive-ratio percentile determines its wafer-relative grade. Green means both are at or above the median, yellow means the weaker ratio is P25–P50, and red means it is below P25. RSNM and BL Write Trip Margin percentiles are retained for correlation, while residual WSNM remains a separate diagnostic. X=<span class="mosdrive">MOS<sub>drive</sub></span>(PG)/<span class="mosdrive">MOS<sub>drive</sub></span>(PU)=PR (right improves write); Y=<span class="mosdrive">MOS<sub>drive</sub></span>(PD)/<span class="mosdrive">MOS<sub>drive</sub></span>(PG)=CR (up improves read). These colors are not absolute silicon Pass/Fail.</p>
 {sections}
-<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. {('Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. ' if not shmoo_only else '')}Per-cell Shmoo results: <code>estimate_vmin_cr_pr_shmoo.csv</code>. Cell Advisor: <code>estimate_vmin_drive_to_preferred_advisor.csv</code>. Batch Advisor: <code>estimate_vmin_batch_drive_advisor.csv</code>.</p>
+<p class="note">Source summary backups: <code>imported_multi_chip_summaries/</code>. {('Combined conservative points: <code>multi_chip_snm_summary_combined.csv</code>. ' if not shmoo_only else '')}Per-cell Shmoo results: <code>estimate_vmin_cr_pr_shmoo.csv</code>. Cell Advisor: <code>estimate_vmin_drive_to_preferred_advisor.csv</code>. Lot/Wafer batch comparison is available from the dedicated <b>Lot/Wafer Advisor</b> tab.</p>
 </main><div id="cell-tooltip" role="tooltip"></div>
 <script>
 const cellTooltip=document.getElementById('cell-tooltip');
@@ -6902,10 +7346,12 @@ def launch_gui() -> None:
     notebook.pack(fill="both", expand=True)
     bitcell_tab = ttk.Frame(notebook, style="Root.TFrame")
     curve_tab = ttk.Frame(notebook, style="Root.TFrame")
+    advisor_tab = ttk.Frame(notebook, style="Root.TFrame")
     write_margin_tab = ttk.Frame(notebook, style="Root.TFrame")
     training_tab = ttk.Frame(notebook, style="Root.TFrame")
     notebook.add(bitcell_tab, text="6T Bitcell Analysis")
     notebook.add(curve_tab, text="Estimate Vmin Curve")
+    notebook.add(advisor_tab, text="Lot/Wafer Advisor")
     notebook.add(training_tab, text="6T Drive Monitor")
 
     # Interactive educational view.  The controls intentionally use the same
@@ -8068,6 +8514,173 @@ def launch_gui() -> None:
         command=execute_combined_file_comparison)
     curve_compare_button.pack(fill="x", pady=(7, 0))
 
+    # Dedicated Lot/Wafer Advisor. This keeps batch recommendations and
+    # group-distribution work separate from the Estimate Vmin workflow.
+    advisor_tab.columnconfigure(0, weight=4)
+    advisor_tab.columnconfigure(1, weight=9)
+    advisor_tab.rowconfigure(0, weight=1)
+    advisor_input_card = ttk.Frame(advisor_tab, style="Card.TFrame", padding=20)
+    advisor_chart_card = ttk.Frame(advisor_tab, style="Card.TFrame", padding=20)
+    advisor_input_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+    advisor_chart_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    advisor_chart_card.columnconfigure(0, weight=1)
+    advisor_chart_card.rowconfigure(2, weight=1)
+
+    ttk.Label(advisor_input_card, text="Lot/Wafer Drive Advisor",
+              style="Section.TLabel").pack(anchor="w")
+    ttk.Label(
+        advisor_input_card,
+        text=("Import one or more multi_chip_snm_summary.csv files. Rows with the "
+              "same Lot/Wafer name are treated as one group at each Model VDD."),
+        style="Meta.TLabel", wraplength=430).pack(anchor="w", pady=(3, 14))
+    advisor_explanation = tk.Frame(advisor_input_card, bg="#F5F9FF", padx=14, pady=12)
+    advisor_explanation.pack(fill="x", pady=(0, 14))
+    tk.Label(advisor_explanation, text="Distribution comparison", bg="#F5F9FF",
+             fg=TEXT, font=("Calibri", 11, "bold"), anchor="w").pack(fill="x")
+    tk.Label(
+        advisor_explanation,
+        text=("Box plots compare Read SNM, BL Write Trip Margin and Balanced Drive "
+              "Score. The CR–PR map uses one color and marker per Lot/Wafer to expose "
+              "group concentration, shift and outliers."),
+        bg="#F5F9FF", fg=SECONDARY, font=("Calibri", 10), justify="left",
+        wraplength=400, anchor="w").pack(fill="x", pady=(4, 0))
+    advisor_selected_paths: list[str] = []
+    saved_advisor_paths = saved_state.get("lot_wafer_advisor_paths", [])
+    if isinstance(saved_advisor_paths, list):
+        advisor_selected_paths.extend(
+            str(item) for item in saved_advisor_paths if Path(str(item)).is_file())
+    advisor_file_text = tk.StringVar(value="No Multi-Cell summary selected")
+    if advisor_selected_paths:
+        advisor_file_text.set(
+            f"{len(advisor_selected_paths)} previously selected summary file(s)\n" +
+            "\n".join(Path(item).name for item in advisor_selected_paths[:6]))
+    tk.Label(advisor_input_card, textvariable=advisor_file_text, bg=CARD, fg=SECONDARY,
+             font=("Calibri", 10), anchor="w", justify="left", wraplength=430).pack(
+                 fill="x", pady=(0, 10))
+    advisor_status = tk.StringVar(value="Ready for Lot/Wafer distribution analysis")
+    advisor_status_label = tk.Label(
+        advisor_input_card, textvariable=advisor_status, bg=CARD, fg=SECONDARY,
+        font=("Calibri", 9), anchor="w", justify="left", wraplength=430)
+    advisor_status_label.pack(fill="x", pady=(3, 6))
+    advisor_progress = ttk.Progressbar(
+        advisor_input_card, mode="indeterminate", style="Apple.Horizontal.TProgressbar")
+    advisor_progress.pack(fill="x", pady=(0, 9))
+
+    ttk.Label(advisor_chart_card, text="Lot/Wafer CR–PR Distribution Preview",
+              style="ChartTitle.TLabel").grid(row=0, column=0, sticky="w")
+    advisor_summary = tk.StringVar(
+        value="Import summary files to compare same-VDD Lot/Wafer distributions.")
+    tk.Label(advisor_chart_card, textvariable=advisor_summary, bg=CARD, fg=SECONDARY,
+             font=("Calibri", 10), anchor="w", justify="left").grid(
+                 row=1, column=0, sticky="ew", pady=(3, 7))
+    advisor_canvas = tk.Canvas(
+        advisor_chart_card, bg=CARD, highlightthickness=0, bd=0,
+        width=850, height=590)
+    advisor_canvas.grid(row=2, column=0, sticky="nsew")
+    advisor_canvas.create_text(
+        425, 285, text="Lot/Wafer drive distribution will appear here",
+        fill=SECONDARY, font=("Calibri", 13))
+    advisor_result_queue: queue.Queue = queue.Queue()
+    advisor_report_path: Path | None = None
+    advisor_chart_image = None
+
+    def import_advisor_summaries() -> None:
+        selected = filedialog.askopenfilenames(
+            title="Import Multi-Cell Summary CSV for Lot/Wafer Advisor",
+            initialdir=values["out"].get(),
+            filetypes=[("Multi-Cell summary CSV", "*.csv"), ("All files", "*.*")])
+        if not selected:
+            return
+        advisor_selected_paths[:] = [str(Path(item).resolve()) for item in selected]
+        advisor_file_text.set(
+            f"{len(advisor_selected_paths)} summary file(s) selected\n" +
+            "\n".join(Path(item).name for item in advisor_selected_paths[:6]))
+        advisor_status.set("Ready to compare Lot/Wafer distributions")
+        advisor_status_label.configure(fg=SECONDARY)
+
+    def advisor_worker(summary_paths: list[str], out_path: Path) -> None:
+        try:
+            source_rows = read_multi_chip_snm_summary(summary_paths)
+            result = analyze_lot_wafer_drive_advisor(source_rows)
+            run_dir = create_run_output_dir(
+                out_path, "Lot_Wafer", "lot_wafer_drive_advisor")
+            report = write_lot_wafer_drive_advisor_outputs(
+                result, run_dir, summary_paths)
+            advisor_result_queue.put((True, result, report))
+        except Exception as exc:
+            advisor_result_queue.put((False, None, exc))
+
+    def poll_advisor_result() -> None:
+        nonlocal advisor_report_path, advisor_chart_image
+        try:
+            ok, result, payload = advisor_result_queue.get_nowait()
+        except queue.Empty:
+            root.after(80, poll_advisor_result)
+            return
+        advisor_progress.stop()
+        advisor_analyze_button.state(["!disabled"])
+        if ok:
+            advisor_report_path = Path(payload)
+            total_cells = sum(int(item["sample_count"]) for item in result["vdds"])
+            advisor_summary.set(
+                f'{len(result["lot_wafers"])} Lot/Wafer group(s) · '
+                f'{len(result["vdds"])} Model VDD point(s) · {total_cells} same-VDD Cell records')
+            advisor_status.set(f"Complete - saved to {advisor_report_path.parent}")
+            advisor_status_label.configure(fg=GREEN)
+            advisor_open_button.state(["!disabled"])
+            preview_paths = sorted((advisor_report_path.parent / "images").glob(
+                "*_lot_wafer_drive_scatter.png"))
+            if preview_paths:
+                image = tk.PhotoImage(file=str(preview_paths[0]))
+                divisor = max(1, math.ceil(image.width()/900), math.ceil(image.height()/620))
+                advisor_chart_image = image.subsample(divisor, divisor)
+                advisor_canvas.delete("all")
+                advisor_canvas.create_image(
+                    max(advisor_canvas.winfo_width(), 850)/2,
+                    max(advisor_canvas.winfo_height(), 590)/2,
+                    image=advisor_chart_image, anchor="center")
+        else:
+            advisor_status.set("Lot/Wafer Advisor could not be completed")
+            advisor_status_label.configure(fg=RED)
+            messagebox.showerror("Lot/Wafer Advisor", str(payload))
+
+    def execute_advisor_analysis() -> None:
+        if not advisor_selected_paths:
+            advisor_status.set("Select at least one Multi-Cell summary CSV file")
+            advisor_status_label.configure(fg=RED)
+            messagebox.showerror(
+                "Lot/Wafer Advisor", "Select at least one multi_chip_snm_summary.csv file.")
+            return
+        advisor_status.set("Grouping Lot/Wafer and calculating Read / Write distributions...")
+        advisor_status_label.configure(fg=BLUE)
+        advisor_analyze_button.state(["disabled"])
+        advisor_open_button.state(["disabled"])
+        advisor_progress.start(10)
+        threading.Thread(
+            target=advisor_worker,
+            args=(list(advisor_selected_paths), Path(values["out"].get())),
+            daemon=True).start()
+        root.after(80, poll_advisor_result)
+
+    def open_advisor_report() -> None:
+        if advisor_report_path and advisor_report_path.exists():
+            webbrowser.open(advisor_report_path.resolve().as_uri())
+
+    advisor_actions = ttk.Frame(advisor_input_card, style="Card.TFrame")
+    advisor_actions.pack(side="bottom", fill="x", pady=(8, 0))
+    ttk.Button(
+        advisor_actions, text="Import Multi-Cell Summary CSV...", style="Quiet.TButton",
+        command=import_advisor_summaries).pack(fill="x", pady=(0, 7))
+    advisor_analyze_button = ttk.Button(
+        advisor_actions, text="Analyze Lot/Wafer Advisor", style="Accent.TButton",
+        command=execute_advisor_analysis)
+    advisor_analyze_button.pack(fill="x")
+    advisor_open_button = ttk.Button(
+        advisor_actions, text="Open HTML Result", style="Quiet.TButton",
+        command=open_advisor_report)
+    advisor_open_button.pack(fill="x", pady=(7, 0))
+    advisor_open_button.state(["disabled"])
+
     # Independent write-trip analysis. It intentionally reuses the same manual
     # VDD/WAT rows so Read and Write trends are compared from identical inputs.
     write_margin_tab.columnconfigure(0, weight=4)
@@ -8220,6 +8833,7 @@ def launch_gui() -> None:
             "training": {key: variable.get() for key, variable in training_values.items()},
             "estimate_vmin_summary_paths": list(selected_summary_paths),
             "estimate_vmin_comparison_paths": list(comparison_summary_paths),
+            "lot_wafer_advisor_paths": list(advisor_selected_paths),
         }
         try:
             save_gui_state(state)
