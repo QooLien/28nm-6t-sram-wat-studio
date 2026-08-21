@@ -526,12 +526,22 @@ class AnalyzerTests(unittest.TestCase):
             from openpyxl import load_workbook
             workbook = load_workbook(template)
             workbook["6T Multi-Cell"]["D2"] = -44.0  # Signed PMOS WAT current
+            workbook["6T Multi-Cell"]["A3"] = "DEMO28_TT_W02"
             workbook.save(template)
             chips = read_multi_chip_6t_excel(template)
             self.assertEqual([item.chip_id for item in chips], ["CHIP_01", "CHIP_02"])
+            self.assertEqual([item.lot_wafer for item in chips],
+                             ["DEMO28_TT_W01", "DEMO28_TT_W02"])
             self.assertEqual(chips[0].raw_idsat_ua["pul"], -44.0)
             analysis = analyze_multi_chip_wafer(chips, Config(grid_points=101), fit_points=201)
             self.assertEqual(len(analysis["rows"]), 2)
+            self.assertEqual(analysis["lot_wafers"],
+                             ["DEMO28_TT_W01", "DEMO28_TT_W02"])
+            self.assertEqual([row["lot_wafer"] for row in analysis["rows"]],
+                             ["DEMO28_TT_W01", "DEMO28_TT_W02"])
+            self.assertEqual(
+                [sample["lot_wafer"] for sample in analysis["relative_shmoo"]["samples"]],
+                ["DEMO28_TT_W01", "DEMO28_TT_W02"])
             self.assertGreater(analysis["worst_rsnm"]["rsnm_mv"], 0)
             self.assertGreater(analysis["worst_wsnm"]["wsnm_mv"], 0)
             self.assertEqual(analysis["median_cell"]["chip_id"], "MEDIAN_CELL")
@@ -551,6 +561,11 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue((report.parent /
                              "multi_cell_wafer_distribution_statistics.csv").exists())
             self.assertTrue((report.parent / "imported_6t_vt_idsat_data.xlsx").exists())
+            with (report.parent / "multi_chip_snm_summary.csv").open(
+                    newline="", encoding="utf-8-sig") as stream:
+                summary_rows = list(csv.DictReader(stream))
+            self.assertEqual([row["lot_wafer"] for row in summary_rows],
+                             ["DEMO28_TT_W01", "DEMO28_TT_W02"])
             self.assertIn("Minimum RSNM source 6T WAT values",
                           (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
             self.assertIn(">-44.00</text>",
@@ -870,12 +885,15 @@ class AnalyzerTests(unittest.TestCase):
                 result, root / "advisor", [source])
             text = report.read_text(encoding="utf-8")
             self.assertIn("Lot/Wafer Drive Advisor", text)
+            self.assertIn("All-Cell Preferred / Monitor / Low Shmoo", text)
             self.assertIn("Drive-to-Preferred Batch Sensitivity", text)
             self.assertTrue((report.parent / "lot_wafer_distribution_statistics.csv").exists())
             self.assertTrue((report.parent / "lot_wafer_cell_drive_scores.csv").exists())
             self.assertTrue((report.parent / "lot_wafer_batch_drive_advisor.csv").exists())
             self.assertTrue(any((report.parent / "images").glob("*_lot_wafer_boxplots.png")))
             self.assertTrue(any((report.parent / "images").glob("*_lot_wafer_grade_counts.png")))
+            self.assertTrue(any((report.parent / "images").glob(
+                "*_all_cell_drive_balance_shmoo.png")))
 
     def test_single_vdd_multi_cell_summary_outputs_shmoo_only(self):
         fieldnames = [
@@ -1008,8 +1026,8 @@ class AnalyzerTests(unittest.TestCase):
         svg = multi_chip_vtc_svg(analysis, "read")
         self.assertIn(">Upper minimum</text>", svg)
         self.assertIn(">Lower minimum</text>", svg)
-        self.assertIn(f'>{upper["upper_rsnm_mv"]:.1f} mV · CHIP_A</text>', svg)
-        self.assertIn(f'>{lower["lower_rsnm_mv"]:.1f} mV · CHIP_B</text>', svg)
+        self.assertIn(f'>{upper["upper_rsnm_mv"]:.1f} mV · SYNC / CHIP_A</text>', svg)
+        self.assertIn(f'>{lower["lower_rsnm_mv"]:.1f} mV · SYNC / CHIP_B</text>', svg)
         self.assertNotIn("Upper minimum 204.0 mV", svg)
 
     def test_rsnm_vdd_row_matches_main_symmetric_6t_analysis(self):

@@ -2624,7 +2624,8 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
                         grid_points=common_fit_points)
     rows = []
     for item in chips:
-        rows.append({"chip_id": item.chip_id, "raw_idsat_ua": item.raw_idsat_ua or {}, **_multi_cell_metrics(
+        rows.append({"lot_wafer": item.lot_wafer, "chip_id": item.chip_id,
+                     "raw_idsat_ua": item.raw_idsat_ua or {}, **_multi_cell_metrics(
             item.cell, point_cfg, vdd, point_cfg.grid_points)})
     valid_read = [row for row in rows if row["rsnm_mv"] is not None]
     valid_write = [row for row in rows if row["wsnm_mv"] is not None]
@@ -2644,7 +2645,7 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
     for row in rows:
         source_cell = row["cell"]
         sample = {
-            "lot_wafer": chips[0].lot_wafer,
+            "lot_wafer": row["lot_wafer"],
             "chip_id": row["chip_id"],
             "rsnm_mv": row["rsnm_mv"],
             "wsnm_mv": row["wsnm_mv"],
@@ -2661,7 +2662,11 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
     relative_shmoo = _build_estimate_vmin_ratio_shmoos([
         {"vdd_v": vdd, "samples": shmoo_samples}
     ])[0]
-    return {"lot_wafer": chips[0].lot_wafer, "vdd_v": vdd, "rows": rows,
+    lot_wafers = sorted({item.lot_wafer for item in chips})
+    lot_wafer_display = (lot_wafers[0] if len(lot_wafers) == 1
+                         else f'{len(lot_wafers)} Lot/Wafer groups')
+    return {"lot_wafer": lot_wafer_display, "lot_wafers": lot_wafers,
+            "vdd_v": vdd, "rows": rows,
             "worst_rsnm": worst_read, "worst_rsnm_upper": worst_upper,
             "worst_rsnm_lower": worst_lower, "worst_wsnm": worst_write,
             "worst_write_margin": worst_write_margin, "median_cell": median,
@@ -3888,10 +3893,14 @@ def write_lot_wafer_drive_advisor_outputs(
         box_png_name = box_svg_name.replace(".svg", ".png")
         grade_svg_name = f"{prefix}_lot_wafer_grade_counts.svg"
         grade_png_name = grade_svg_name.replace(".svg", ".png")
+        shmoo_svg_name = f"{prefix}_all_cell_drive_balance_shmoo.svg"
+        shmoo_png_name = shmoo_svg_name.replace(".svg", ".png")
         scatter_svg = lot_wafer_drive_scatter_svg(vdd_group, styles)
         box_svg = lot_wafer_boxplot_svg(vdd_group, styles)
         grade_svg = lot_wafer_grade_counts_svg(vdd_group)
+        shmoo_svg = estimate_vmin_ratio_shmoo_svg(vdd_group["shmoo"])
         for svg_name, png_name, content in (
+                (shmoo_svg_name, shmoo_png_name, shmoo_svg),
                 (scatter_svg_name, scatter_png_name, scatter_svg),
                 (box_svg_name, box_png_name, box_svg),
                 (grade_svg_name, grade_png_name, grade_svg)):
@@ -3971,7 +3980,8 @@ def write_lot_wafer_drive_advisor_outputs(
                 })
         report_sections.append(f'''<section>
 <div class="section-head"><div><p class="eyebrow">MODEL VDD</p><h2>{float(vdd_group["vdd_v"]):.3f} V Lot/Wafer Comparison</h2></div><div class="count"><strong>{int(vdd_group["sample_count"])}</strong><span>Cells<br>{int(vdd_group["lot_count"])} groups</span></div></div>
-<div class="chart-grid"><figure><img src="images/{scatter_png_name}" alt="Lot Wafer CR PR scatter"><figcaption><a href="images/{scatter_svg_name}">SVG</a> · <a href="images/{scatter_png_name}">PNG</a></figcaption></figure><figure><img src="images/{box_png_name}" alt="Lot Wafer box plots"><figcaption><a href="images/{box_svg_name}">SVG</a> · <a href="images/{box_png_name}">PNG</a></figcaption></figure><figure><img src="images/{grade_png_name}" alt="Lot Wafer Preferred Monitor Low grade counts"><figcaption><a href="images/{grade_svg_name}">SVG</a> · <a href="images/{grade_png_name}">PNG</a></figcaption></figure></div>
+<h3>All-Cell Preferred / Monitor / Low Shmoo</h3><p class="note">All Cells at this Model VDD share one dynamic CR/PR reference population. Preferred requires both CR and PR at or above P50; Monitor requires the weaker metric at P25–P50; Low means the weaker metric is below P25. The background regions inherit the grade of the nearest measured Cell and are relative screening, not silicon Pass/Fail.</p>
+<div class="chart-grid"><figure><img src="images/{shmoo_png_name}" alt="All Cell Preferred Monitor Low drive balance shmoo"><figcaption><a href="images/{shmoo_svg_name}">SVG</a> · <a href="images/{shmoo_png_name}">PNG</a></figcaption></figure><figure><img src="images/{scatter_png_name}" alt="Lot Wafer CR PR scatter"><figcaption><a href="images/{scatter_svg_name}">SVG</a> · <a href="images/{scatter_png_name}">PNG</a></figcaption></figure><figure><img src="images/{box_png_name}" alt="Lot Wafer box plots"><figcaption><a href="images/{box_svg_name}">SVG</a> · <a href="images/{box_png_name}">PNG</a></figcaption></figure><figure><img src="images/{grade_png_name}" alt="Lot Wafer Preferred Monitor Low grade counts"><figcaption><a href="images/{grade_svg_name}">SVG</a> · <a href="images/{grade_png_name}">PNG</a></figcaption></figure></div>
 <h3>Lot/Wafer Distribution Summary</h3><div class="table-wrap"><table><thead><tr><th>Lot/Wafer</th><th>n</th><th>Read median</th><th>Read IQR</th><th>Write median</th><th>Write IQR</th><th>Balanced median</th><th>Median CR</th><th>Median PR</th><th>P / M / L</th></tr></thead><tbody>{''.join(summary_body)}</tbody></table></div>
 <h3>Drive-to-Preferred Batch Sensitivity</h3><p class="note">Each Lot/Wafer is compared with the same frozen P55 target from all Cells at this VDD. PG is held; PD addresses CR and PU addresses PR.</p><div class="table-wrap"><table><thead><tr><th>Lot/Wafer</th><th>Low + Monitor</th><th>P55 CR</th><th>P55 PR</th><th>PD MOS<sub>drive</sub></th><th>PG MOS<sub>drive</sub></th><th>PU MOS<sub>drive</sub></th><th>Frozen-target coverage</th></tr></thead><tbody>{''.join(batch_body)}</tbody></table></div>
 </section>''')
@@ -6467,6 +6477,15 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     metric = "RSNM" if mode == "read" else "WSNM"
     upper_worst = analysis.get("worst_rsnm_upper") if mode == "read" else None
     lower_worst = analysis.get("worst_rsnm_lower") if mode == "read" else None
+    def same_cell(left_row: dict, right_row: dict) -> bool:
+        return (str(left_row.get("lot_wafer", "")) ==
+                str(right_row.get("lot_wafer", "")) and
+                str(left_row.get("chip_id", "")) ==
+                str(right_row.get("chip_id", "")))
+
+    def cell_label(row: dict) -> str:
+        return f'{row.get("lot_wafer", "Wafer")} / {row.get("chip_id", "Unknown")}'
+
     def xy(x: float, y: float) -> tuple[float, float]:
         return left + x / axis * plot_w, top + (1 - y / axis) * plot_h
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Arial,sans-serif">',
@@ -6491,12 +6510,12 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
             # Upper and lower wafer minima can belong to different chips.
             # Highlight both complete VTC pairs so each drawn square remains
             # associated with physically valid curves from the same chip.
-            is_upper_limit = row["chip_id"] == upper_worst["chip_id"]
-            is_lower_limit = row["chip_id"] == lower_worst["chip_id"]
+            is_upper_limit = same_cell(row, upper_worst)
+            is_lower_limit = same_cell(row, lower_worst)
             is_limit = is_upper_limit or is_lower_limit
         else:
             is_upper_limit = is_lower_limit = False
-            is_limit = row["chip_id"] == worst["chip_id"]
+            is_limit = same_cell(row, worst)
         width_px, opacity = (4.5, 1.0) if is_limit else (1.3, .18)
         direct_points = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in direct)
         mirror_points = " ".join(f'{xy(x,y)[0]:.1f},{xy(x,y)[1]:.1f}' for x, y in mirrored)
@@ -6516,12 +6535,12 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
         upper_square = state_square(upper_worst, "upper_left")
         lower_square = state_square(lower_worst, "lower_right")
         square_specs = [
-            ("Upper minimum", upper_worst["chip_id"], upper_square),
-            ("Lower minimum", lower_worst["chip_id"], lower_square),
+            ("Upper minimum", cell_label(upper_worst), upper_square),
+            ("Lower minimum", cell_label(lower_worst), lower_square),
         ]
     else:
         square = worst["write"].get("write_square")
-        square_specs = [("WSNM", worst["chip_id"], square)] if square else []
+        square_specs = [("WSNM", cell_label(worst), square)] if square else []
     for state_label, chip_id, square in square_specs:
         if square.get("side_v", 0) <= 0:
             continue
@@ -6533,12 +6552,12 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     value = worst["rsnm_mv"] if mode == "read" else worst["wsnm_mv"]
     if mode == "read":
         summary_rows = [
-            ("Cell minimum", f'{value:.1f} mV · {worst["chip_id"]}', "#FF3B30"),
-            ("Upper minimum", f'{upper_worst["upper_rsnm_mv"]:.1f} mV · {upper_worst["chip_id"]}', "#FF9500"),
-            ("Lower minimum", f'{lower_worst["lower_rsnm_mv"]:.1f} mV · {lower_worst["chip_id"]}', "#FF3B30"),
+            ("Cell minimum", f'{value:.1f} mV · {cell_label(worst)}', "#FF3B30"),
+            ("Upper minimum", f'{upper_worst["upper_rsnm_mv"]:.1f} mV · {cell_label(upper_worst)}', "#FF9500"),
+            ("Lower minimum", f'{lower_worst["lower_rsnm_mv"]:.1f} mV · {cell_label(lower_worst)}', "#FF3B30"),
         ]
     else:
-        summary_rows = [("Wafer WSNM", f'{value:.1f} mV · {worst["chip_id"]}', "#FF9500")]
+        summary_rows = [("Wafer WSNM", f'{value:.1f} mV · {cell_label(worst)}', "#FF9500")]
     card_text = [f'<text x="{card_x+24}" y="{card_y+36}" fill="#1D1D1F" font-size="20" font-weight="700">Wafer margin summary</text>']
     for index, (label, detail, color) in enumerate(summary_rows):
         y = card_y + 75 + index * 43
@@ -6559,7 +6578,7 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     card_text += [
         f'<path d="M{card_x+24} {table_top-18} H{card_x+card_w-24}" stroke="#D2D2D7"/>',
         f'<text x="{card_x+24}" y="{table_top}" fill="#1D1D1F" font-size="15" font-weight="700">Minimum {metric} source 6T WAT values</text>',
-        f'<text x="{card_x+24}" y="{table_top+20}" fill="#6E6E73" font-size="13">{html.escape(worst["chip_id"])} · Vt (V) / Idsat (uA)</text>',
+        f'<text x="{card_x+24}" y="{table_top+20}" fill="#6E6E73" font-size="13">{html.escape(cell_label(worst))} · Vt (V) / Idsat (uA)</text>',
         f'<text x="{card_x+28}" y="{table_top+45}" fill="#6E6E73" font-size="13" font-weight="700">MOS</text>',
         f'<text x="{card_x+145}" y="{table_top+45}" fill="#6E6E73" font-size="13" font-weight="700">Vt (V)</text>',
         f'<text x="{card_x+270}" y="{table_top+45}" fill="#6E6E73" font-size="13" font-weight="700">Idsat (uA)</text>',
@@ -6640,7 +6659,13 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         return (float(getattr(getattr(cell, f"{family}1"), attribute)) +
                 float(getattr(getattr(cell, f"{family}2"), attribute))) / 2.0
 
-    export_rows = [{"lot_wafer": analysis["lot_wafer"], "chip_id": row["chip_id"],
+    def same_output_cell(left_row: dict, right_row: dict) -> bool:
+        return (str(left_row.get("lot_wafer", "")) ==
+                str(right_row.get("lot_wafer", "")) and
+                str(left_row.get("chip_id", "")) ==
+                str(right_row.get("chip_id", "")))
+
+    export_rows = [{"lot_wafer": row["lot_wafer"], "chip_id": row["chip_id"],
                     "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
                     "upper_rsnm_mv": row["upper_rsnm_mv"], "lower_rsnm_mv": row["lower_rsnm_mv"],
                     "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
@@ -6652,11 +6677,11 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                     "pg_idsat_ua": family_average(row, "pg", "ids"),
                     "pd_vt_v": family_average(row, "pd", "vt"),
                     "pd_idsat_ua": family_average(row, "pd", "ids"),
-                    "is_worst_rsnm": row["chip_id"] == analysis["worst_rsnm"]["chip_id"],
-                    "is_worst_rsnm_upper": row["chip_id"] == analysis["worst_rsnm_upper"]["chip_id"],
-                    "is_worst_rsnm_lower": row["chip_id"] == analysis["worst_rsnm_lower"]["chip_id"],
-                    "is_worst_wsnm": row["chip_id"] == analysis["worst_wsnm"]["chip_id"],
-                    "is_worst_write_margin": row["chip_id"] == analysis["worst_write_margin"]["chip_id"]}
+                    "is_worst_rsnm": same_output_cell(row, analysis["worst_rsnm"]),
+                    "is_worst_rsnm_upper": same_output_cell(row, analysis["worst_rsnm_upper"]),
+                    "is_worst_rsnm_lower": same_output_cell(row, analysis["worst_rsnm_lower"]),
+                    "is_worst_wsnm": same_output_cell(row, analysis["worst_wsnm"]),
+                    "is_worst_write_margin": same_output_cell(row, analysis["worst_write_margin"])}
                    for row in analysis["rows"]]
     with open(out / "multi_chip_snm_summary.csv", "w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(export_rows[0])); writer.writeheader(); writer.writerows(export_rows)
@@ -6665,16 +6690,16 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         with open(out / f"median_target_{name}_shmoo.csv", "w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(shmoo["rows"][0]))
             writer.writeheader(); writer.writerows(shmoo["rows"])
-    relative_by_chip = {str(sample["chip_id"]): sample
+    relative_by_chip = {(str(sample["lot_wafer"]), str(sample["chip_id"])): sample
                         for sample in relative_shmoo["samples"]}
     body = "".join(
-        f'<tr><td>{html.escape(row["chip_id"])}</td><td>{row["upper_rsnm_mv"]:.2f}</td>'
+        f'<tr><td>{html.escape(row["lot_wafer"])} / {html.escape(row["chip_id"])}</td><td>{row["upper_rsnm_mv"]:.2f}</td>'
         f'<td>{row["lower_rsnm_mv"]:.2f}</td><td>{row["rsnm_mv"]:.2f}</td>'
         f'<td>{row["write_margin_mv"]:.2f}</td><td>{row["cell_ratio_beta"]:.3f}</td>'
         f'<td>{row["pull_up_ratio_beta"]:.3f}</td>'
-        f'<td>{100.0 * float(relative_by_chip[row["chip_id"]]["cr_percentile"]):.1f}</td>'
-        f'<td>{100.0 * float(relative_by_chip[row["chip_id"]]["pr_percentile"]):.1f}</td>'
-        f'<td>{html.escape(str(relative_by_chip[row["chip_id"]]["wafer_grade"]).upper())}</td></tr>'
+        f'<td>{100.0 * float(relative_by_chip[(row["lot_wafer"], row["chip_id"])]["cr_percentile"]):.1f}</td>'
+        f'<td>{100.0 * float(relative_by_chip[(row["lot_wafer"], row["chip_id"])]["pr_percentile"]):.1f}</td>'
+        f'<td>{html.escape(str(relative_by_chip[(row["lot_wafer"], row["chip_id"])]["wafer_grade"]).upper())}</td></tr>'
         for row in analysis["rows"])
     median = analysis["median_cell"]
 
