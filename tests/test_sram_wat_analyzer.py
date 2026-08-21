@@ -589,11 +589,36 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual(result["curves"]["rsnm_mv"]["rows"][0]["chip_id"], "C02")
             self.assertAlmostEqual(result["curves"]["write_margin_mv"]["eye_closure"]["estimated_vdd_v"], .40)
 
-    def test_estimate_vmin_summary_rejects_excel_with_clear_message(self):
+    def test_estimate_vmin_accepts_raw_multi_cell_excel(self):
+        from openpyxl import load_workbook
+
+        with tempfile.TemporaryDirectory() as td:
+            path = write_multi_chip_6t_excel_template(
+                Path(td) / "multi_vdd.xlsx", chip_count=2)
+            workbook = load_workbook(path)
+            sheet = workbook["6T Multi-Cell"]
+            sheet.cell(row=1, column=15, value="Model VDD")
+            sheet.cell(row=2, column=15, value=.68)
+            sheet.cell(row=3, column=15, value=.90)
+            sheet.cell(row=3, column=1, value="DEMO28_TT_W02")
+            workbook.save(path)
+            workbook.close()
+            rows = read_multi_chip_snm_summary(
+                [path], default_model_vdd_v=.75,
+                config=Config(grid_points=101))
+            self.assertEqual([row["vdd_v"] for row in rows], [.68, .90])
+            self.assertEqual([row["samples"][0]["lot_wafer"] for row in rows],
+                             ["DEMO28_TT_W01", "DEMO28_TT_W02"])
+            for row in rows:
+                self.assertGreater(row["rsnm_mv"], 0)
+                self.assertGreater(row["write_margin_mv"], 0)
+                self.assertIn("cell_ratio_beta", row["samples"][0])
+
+    def test_estimate_vmin_rejects_invalid_excel_with_clear_message(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "wrong_input.xlsx"
             path.write_bytes(b"PK\x03\x04\x98 binary Excel data")
-            with self.assertRaisesRegex(ValueError, "select multi_chip_snm_summary.csv"):
+            with self.assertRaisesRegex(ValueError, "could not be read as a 6T Multi-Cell Excel"):
                 read_multi_chip_snm_summary([path])
 
     def test_estimate_vmin_marks_largest_rsnm_slope_and_renders_stacked_view(self):

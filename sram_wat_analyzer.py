@@ -1932,7 +1932,8 @@ def write_iv_curve_excel_template(path: str | os.PathLike[str]) -> Path:
 
 
 def read_multi_chip_6t_excel(path: str | os.PathLike[str],
-                             default_model_vdd_v: float = .90) -> list[WaferChipWat]:
+                             default_model_vdd_v: float = .90,
+                             require_common_vdd: bool = True) -> list[WaferChipWat]:
     """Read a unit-free wide-form wafer multi-cell 6T workbook.
 
     One row represents one measured cell/chip.  The required electrical inputs
@@ -2001,7 +2002,7 @@ def read_multi_chip_6t_excel(path: str | os.PathLike[str],
         if not parsed:
             raise ValueError("Multi-chip Excel contains no chip rows")
         vdds = {round(item.model_vdd_v, 12) for item in parsed}
-        if len(vdds) != 1:
+        if require_common_vdd and len(vdds) != 1:
             raise ValueError("Multi-chip VTC overlay requires one common Model VDD for all chip rows")
         return parsed
     finally:
@@ -3077,23 +3078,63 @@ _ESTIMATE_VMIN_METRICS = (
 )
 
 
-def read_multi_chip_snm_summary(paths: Iterable[str | os.PathLike[str]]) -> list[dict[str, object]]:
-    """Read one or more Multi-Cell ``multi_chip_snm_summary.csv`` outputs.
+def read_multi_chip_snm_summary(
+        paths: Iterable[str | os.PathLike[str]],
+        default_model_vdd_v: float = .90,
+        config: Config | None = None) -> list[dict[str, object]]:
+    """Read Multi-Cell summary CSV or raw 6T Multi-Cell Excel inputs.
 
-    Each source row represents one measured cell.  Values are grouped by Model
-    VDD and reduced conservatively to the minimum cell margin at that VDD.
-    Multiple wafer outputs at the same VDD may be supplied; the resulting
-    point is then the lowest value across all selected wafers.
+    CSV rows already contain modeled margins.  Excel rows contain the six-MOS
+    Vt/Idsat inputs and are evaluated through the same Multi-Cell 6T model
+    before joining the common summary path.  Values are grouped by Model VDD
+    and reduced conservatively to the minimum Cell margin at that VDD.
     """
     grouped: dict[float, list[dict[str, object]]] = {}
     for raw_path in paths:
         path = Path(raw_path)
         if not path.is_file():
             raise FileNotFoundError(f"Multi-Cell summary was not found: {path}")
-        if path.suffix.lower() != ".csv":
+        suffix = path.suffix.lower()
+        if suffix in {".xlsx", ".xlsm"}:
+            try:
+                chips = read_multi_chip_6t_excel(
+                    path, default_model_vdd_v, require_common_vdd=False)
+            except (ValueError, RuntimeError):
+                raise
+            except Exception as exc:
+                raise ValueError(
+                    f"{path.name} could not be read as a 6T Multi-Cell Excel "
+                    "workbook. Check that it is a valid .xlsx/.xlsm file and "
+                    "contains the required Lot/Wafer, Chip ID and six-MOS "
+                    "Vt/Idsat columns.") from exc
+            chips_by_vdd: dict[float, list[WaferChipWat]] = {}
+            for chip in chips:
+                chips_by_vdd.setdefault(float(chip.model_vdd_v), []).append(chip)
+            for vdd, vdd_chips in chips_by_vdd.items():
+                model_config = replace(
+                    config or Config(), nominal_vdd=vdd, wat_vdd=vdd)
+                analysis = analyze_multi_chip_wafer(vdd_chips, model_config)
+                for raw_sample in analysis["relative_shmoo"]["samples"]:
+                    sample = {
+                        key: value for key, value in raw_sample.items()
+                        if key in {
+                            "lot_wafer", "chip_id", "rsnm_mv", "wsnm_mv",
+                            "write_margin_mv", "cell_ratio_beta",
+                            "pull_up_ratio_beta", "pu_vt_v", "pu_idsat_ua",
+                            "pg_vt_v", "pg_idsat_ua", "pd_vt_v",
+                            "pd_idsat_ua",
+                        }
+                    }
+                    grouped.setdefault(vdd, []).append(sample)
+            continue
+        if suffix == ".xls":
             raise ValueError(
-                f"{path.name} is not a CSV summary. In Estimate Vmin Curve, select "
-                "multi_chip_snm_summary.csv files, not the original Excel (.xlsx) input files.")
+                f"{path.name} uses the legacy .xls format. Save it as .xlsx, "
+                "then import it again.")
+        if suffix != ".csv":
+            raise ValueError(
+                f"{path.name} is not a supported Multi-Cell input. Select a generated "
+                "multi_chip_snm_summary.csv or a 6T Multi-Cell Excel workbook (.xlsx/.xlsm).")
         try:
             with path.open(newline="", encoding="utf-8-sig") as source:
                 reader = csv.DictReader(source)
@@ -7996,7 +8037,7 @@ def launch_gui() -> None:
 
     ttk.Label(curve_input_card, text="Multi-Cell Estimate Vmin", style="Section.TLabel").pack(anchor="w")
     ttk.Label(curve_input_card,
-              text="Select multi_chip_snm_summary.csv files exported by 6T Bitcell Analysis. One selected file runs Shmoo-only analysis. Select two or more files with at least two total VDD points to also generate Estimate Vmin curves.",
+              text="Select generated multi_chip_snm_summary.csv files or raw 6T Multi-Cell Excel workbooks (.xlsx/.xlsm). Excel Vt/Idsat rows are modeled automatically. One selected file runs Shmoo-only analysis; select two or more input files with at least two total VDD points to generate Estimate Vmin curves.",
               style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(2, 12))
     selected_summary_paths: list[str] = []
     selected_summary_text = tk.StringVar(value="No Multi-Cell summary selected")
@@ -8342,18 +8383,26 @@ def launch_gui() -> None:
     comparison_result_queue: queue.Queue = queue.Queue()
 
     def import_multi_cell_summaries() -> None:
-        selected = filedialog.askopenfilenames(title="Import Multi-Cell SNM Summary CSV", initialdir=values["out"].get(), filetypes=[("Multi-Cell summary CSV", "*.csv"), ("All files", "*.*")])
+        selected = filedialog.askopenfilenames(
+            title="Import Multi-Cell CSV or Excel",
+            initialdir=values["out"].get(),
+            filetypes=[("Multi-Cell CSV / Excel", "*.csv *.xlsx *.xlsm"),
+                       ("CSV summary", "*.csv"),
+                       ("Excel workbook", "*.xlsx *.xlsm"),
+                       ("All files", "*.*")])
         if not selected: return
         selected_summary_paths[:] = list(selected)
-        selected_summary_text.set(f"{len(selected_summary_paths)} summary file(s) selected\n" + "\n".join(Path(item).name for item in selected_summary_paths[:5]))
-        curve_status.set("Ready to estimate Vmin curves from imported Multi-Cell summaries")
+        selected_summary_text.set(f"{len(selected_summary_paths)} Multi-Cell input file(s) selected\n" + "\n".join(Path(item).name for item in selected_summary_paths[:5]))
+        curve_status.set("Ready to analyze imported Multi-Cell CSV / Excel data")
         curve_status_label.configure(fg=SECONDARY)
 
-    def curve_worker(summary_paths: list[str], out_path: Path, wafer_id: str) -> None:
+    def curve_worker(summary_paths: list[str], out_path: Path, wafer_id: str,
+                     model_config: Config) -> None:
         try:
+            source_rows = read_multi_chip_snm_summary(
+                summary_paths, model_config.nominal_vdd, model_config)
             analysis = analyze_estimate_vmin_curves(
-                read_multi_chip_snm_summary(summary_paths),
-                force_shmoo_only=len(summary_paths) == 1)
+                source_rows, force_shmoo_only=len(summary_paths) == 1)
             run_dir = create_run_output_dir(out_path, wafer_id, "estimate_vmin_curve")
             report = write_estimate_vmin_outputs(analysis, run_dir, summary_paths)
             curve_result_queue.put((True, analysis, report))
@@ -8473,9 +8522,17 @@ def launch_gui() -> None:
 
     def execute_curve_analysis() -> None:
         if not selected_summary_paths:
-            curve_status.set("Select at least one Multi-Cell summary CSV file")
+            curve_status.set("Select at least one Multi-Cell CSV or Excel file")
             curve_status_label.configure(fg=RED)
-            messagebox.showerror("Estimate Vmin Curve", "Select at least one Multi-Cell summary CSV file.")
+            messagebox.showerror(
+                "Estimate Vmin Curve", "Select at least one Multi-Cell CSV or Excel file.")
+            return
+        try:
+            _cell, model_config, _targets = collect_inputs()
+        except Exception as exc:
+            curve_status.set("Check the Model Settings used for Excel analysis")
+            curve_status_label.configure(fg=RED)
+            messagebox.showerror("Estimate Vmin Curve", str(exc))
             return
         curve_status.set("Combining minimum RSNM / WSNM / Write Margin by Model VDD...")
         curve_status_label.configure(fg=BLUE)
@@ -8487,7 +8544,8 @@ def launch_gui() -> None:
         wafer_id = values["corner"].get().strip() or "Multi_Cell"
         output_path = Path(values["out"].get())
         threading.Thread(target=curve_worker,
-                         args=(list(selected_summary_paths), output_path, wafer_id), daemon=True).start()
+                         args=(list(selected_summary_paths), output_path, wafer_id,
+                               model_config), daemon=True).start()
         root.after(80, poll_curve_result)
 
     def open_curve_report() -> None:
@@ -8511,7 +8569,7 @@ def launch_gui() -> None:
 
     curve_action_row = ttk.Frame(curve_input_card, style="Card.TFrame")
     curve_action_row.pack(side="bottom", fill="x", pady=(8, 0))
-    ttk.Button(curve_action_row, text="Import Multi-Cell Summary CSV...", style="Quiet.TButton",
+    ttk.Button(curve_action_row, text="Import Multi-Cell CSV / Excel...", style="Quiet.TButton",
                command=import_multi_cell_summaries).pack(fill="x", pady=(0, 7))
     curve_analyze_button = ttk.Button(curve_action_row, text="Analyze Estimate Vmin Curves",
                                       style="Accent.TButton", command=execute_curve_analysis)
