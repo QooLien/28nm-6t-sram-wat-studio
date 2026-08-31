@@ -17,12 +17,15 @@ from sram_wat_analyzer import (
     generic_28nm_assumption_rows,
     drive_monitor_metrics, drive_monitor_shmoo_reference,
     create_run_output_dir, load_gui_state, model_vdd_butterfly_svg, multi_chip_vtc_svg, open_output_directory,
-    read_iv_curve_excel, read_multi_chip_6t_excel, read_multi_chip_snm_summary, read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
+    read_iv_curve_excel, read_multi_chip_6t_excel, read_multi_chip_6t_excel_vdd_sheets,
+    read_multi_chip_snm_summary, read_wat_csv, read_wat_excel, rsnm_vcc_curve_svg,
     lot_wafer_boxplot_svg, lot_wafer_drive_scatter_svg,
     lot_wafer_grade_counts_svg,
     save_gui_state,
     validate_config, wat_electrical_snm_rows,
-    write_iv_curve_excel_template, write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs, write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
+    process_multi_vdd_6t_excel, write_iv_curve_excel_template,
+    write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs,
+    write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
     write_estimate_vmin_outputs, write_lot_wafer_drive_advisor_outputs,
     write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
@@ -560,7 +563,8 @@ class AnalyzerTests(unittest.TestCase):
                              "multi_cell_wafer_relative_grades.csv").exists())
             self.assertTrue((report.parent /
                              "multi_cell_wafer_distribution_statistics.csv").exists())
-            self.assertTrue((report.parent / "imported_6t_vt_idsat_data.xlsx").exists())
+            self.assertTrue((report.parent /
+                             "imported_6t_vt_idsat_data_0.900V.xlsx").exists())
             with (report.parent / "multi_chip_snm_summary.csv").open(
                     newline="", encoding="utf-8-sig") as stream:
                 summary_rows = list(csv.DictReader(stream))
@@ -613,6 +617,52 @@ class AnalyzerTests(unittest.TestCase):
                 self.assertGreater(row["rsnm_mv"], 0)
                 self.assertGreater(row["write_margin_mv"], 0)
                 self.assertIn("cell_ratio_beta", row["samples"][0])
+
+    def test_multi_vdd_excel_sheets_run_per_vdd_then_estimate_curves(self):
+        from openpyxl import load_workbook
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = write_multi_chip_6t_excel_template(
+                root / "multi_vdd_sheets.xlsx", chip_count=1)
+            workbook = load_workbook(path)
+            first = workbook["6T Multi-Cell"]
+            first.title = "0.80V"
+            second = workbook.copy_worksheet(first)
+            second.title = "0.90v"
+            # Sheet-name VDD must override a stale/copied Model VDD column.
+            first.cell(row=1, column=15, value="Model VDD")
+            first.cell(row=2, column=15, value=.50)
+            second.cell(row=1, column=15, value="Model VDD")
+            second.cell(row=2, column=15, value=.50)
+            second.cell(row=2, column=4, value=48.0)
+            workbook.save(path)
+            workbook.close()
+
+            groups = read_multi_chip_6t_excel_vdd_sheets(path)
+            self.assertEqual([group["vdd_v"] for group in groups], [.80, .90])
+            self.assertEqual([group["sheet_names"] for group in groups],
+                             [["0.80V"], ["0.90v"]])
+            self.assertEqual([group["chips"][0].model_vdd_v for group in groups],
+                             [.80, .90])
+
+            result = process_multi_vdd_6t_excel(
+                path, Config(grid_points=101), root / "output", groups)
+            analysis = result["analysis"]
+            self.assertEqual(analysis["mode"], "estimate_vmin")
+            self.assertEqual([row["vdd_v"] for row in analysis["rows"]], [.80, .90])
+            self.assertEqual(analysis["per_vdd_output_count"], 2)
+            run_dir = result["run_dir"]
+            for vdd in (.80, .90):
+                folder = run_dir / "multi_cell_by_vdd" / f"Model_VDD_{vdd:.3f}V"
+                self.assertTrue((folder / "multi_cell_wafer_report.html").exists())
+                self.assertTrue((folder / f"imported_6t_vt_idsat_data_{vdd:.3f}V.xlsx").exists())
+                self.assertTrue((folder / "multi_chip_snm_summary.csv").exists())
+            estimate_dir = run_dir / "estimate_vmin"
+            self.assertTrue((estimate_dir / "estimate_vmin_report.html").exists())
+            self.assertTrue((estimate_dir / "multi_chip_snm_summary_combined.csv").exists())
+            self.assertTrue((estimate_dir / "images" /
+                             "05_estimate_vmin_stacked.png").exists())
 
     def test_estimate_vmin_rejects_invalid_excel_with_clear_message(self):
         with tempfile.TemporaryDirectory() as td:
@@ -793,9 +843,10 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("Best measured cell", svg)
         self.assertIn("#FFC447", svg)
         self.assertIn("P50/P50 relative boundary", svg)
-        self.assertIn('font-family="Times New Roman">MOS</tspan>', svg)
-        self.assertIn('baseline-shift="sub"', svg)
-        self.assertIn("drive</tspan>", svg)
+        self.assertIn("MOSdrive: PG / PU", svg)
+        self.assertIn("MOSdrive: PD / PG", svg)
+        self.assertIn("Write drive — Pull-up Ratio (PR)", svg)
+        self.assertIn("Read drive — Cell Ratio (CR)", svg)
         self.assertIn("right = easier write", svg)
         self.assertNotIn("1/PR", svg)
         self.assertIn("#DDF3E2", svg)
@@ -897,6 +948,8 @@ class AnalyzerTests(unittest.TestCase):
         grades = lot_wafer_grade_counts_svg(vdd)
         self.assertIn("LOT_A_W01", scatter)
         self.assertIn("central 50%", scatter)
+        self.assertIn("Write drive — Pull-up Ratio (PR)", scatter)
+        self.assertIn("Read drive — Cell Ratio (CR)", scatter)
         self.assertIn("Read SNM", boxes)
         self.assertIn("Balanced Drive Score", boxes)
         self.assertIn("Preferred, Monitor and Low Counts", grades)

@@ -1931,16 +1931,112 @@ def write_iv_curve_excel_template(path: str | os.PathLike[str]) -> Path:
     return destination
 
 
+def _model_vdd_from_sheet_name(sheet_name: object) -> float | None:
+    """Return a Model VDD encoded by names such as ``0.90V`` or ``VDD_0.90V``."""
+    match = re.fullmatch(
+        r"\s*(?:(?:model\s*)?vdd[\s_-]*)?([0-9]+(?:\.[0-9]+)?)\s*v?\s*",
+        str(sheet_name), flags=re.IGNORECASE)
+    if not match:
+        return None
+    vdd = float(match.group(1))
+    if not 0 < vdd <= SNM_PLOT_AXIS_MAX_V:
+        raise ValueError(
+            f'Worksheet "{sheet_name}" Model VDD must be within 0–{SNM_PLOT_AXIS_MAX_V:.2f} V')
+    return vdd
+
+
+def _read_multi_chip_6t_sheet(sheet, default_model_vdd_v: float,
+                              sheet_model_vdd_v: float | None = None) -> list[WaferChipWat]:
+    """Parse one wide-form 6T Multi-Cell worksheet."""
+    rows = list(sheet.iter_rows(values_only=True))
+    if len(rows) < 2:
+        raise ValueError(
+            f'Multi-chip Excel worksheet "{sheet.title}" needs a header and at least one chip row')
+    headers, header_units = _excel_header_map(list(rows[0]))
+    lot_key = _first_header(headers, "lotwafer", "lot", "wafer", "waferid")
+    chip_key = _first_header(headers, "chipid", "chip", "dieid", "site", "siteid")
+    vdd_key = _first_header(headers, "modelvdd", "vdd", "supplyvoltage")
+    vdd_unit_key = _first_header(headers, "modelvddunit", "vddunit")
+    if not chip_key:
+        raise ValueError(
+            f'Multi-chip Excel worksheet "{sheet.title}" requires a Chip ID column')
+    devices: dict[str, tuple[str, str]] = {}
+    for device in ("pul", "pur", "pgl", "pgr", "pdl", "pdr"):
+        vt_key = _first_header(headers, f"{device}vt", f"{device}vth")
+        ids_key = _first_header(headers, f"{device}idsat", f"{device}isat", f"{device}ids")
+        if not vt_key or not ids_key:
+            raise ValueError(
+                f'Worksheet "{sheet.title}" needs {device.upper()} Vt and Idsat columns')
+        devices[device] = (vt_key, ids_key)
+    parsed: list[WaferChipWat] = []
+    for number, row_tuple in enumerate(rows[1:], 2):
+        row = list(row_tuple)
+        if not any(value is not None and str(value).strip() for value in row):
+            continue
+        lot = str(_cell(row, headers, lot_key) or "Wafer").strip()
+        chip = str(_cell(row, headers, chip_key) or "").strip()
+        if not chip:
+            raise ValueError(
+                f'Worksheet "{sheet.title}" row {number}: Chip ID is blank')
+        if sheet_model_vdd_v is not None:
+            # In the multi-VDD workflow the worksheet name is authoritative,
+            # even when an older copied sheet still contains a Model VDD column.
+            vdd = sheet_model_vdd_v
+        else:
+            raw_vdd = _cell(row, headers, vdd_key)
+            vdd = default_model_vdd_v if raw_vdd is None or str(raw_vdd).strip() == "" else _excel_number(
+                raw_vdd, _cell(row, headers, vdd_unit_key) or header_units.get(vdd_key or "", "V"),
+                _VOLTAGE_UNITS, "V", f"Multi-chip row {number} Model VDD")
+        mos: dict[str, MosWat] = {}
+        raw_idsat_ua: dict[str, float] = {}
+        for device, (vt_key, ids_key) in devices.items():
+            vt = _excel_number(_cell(row, headers, vt_key),
+                               _cell(row, headers, f"{vt_key}unit") or header_units.get(vt_key, "V"),
+                               _VOLTAGE_UNITS, "V", f"Multi-chip row {number} {device.upper()} Vt")
+            ids = _excel_number(_cell(row, headers, ids_key),
+                                _cell(row, headers, f"{ids_key}unit") or header_units.get(ids_key, "uA"),
+                                _CURRENT_TO_UA, "uA", f"Multi-chip row {number} {device.upper()} Idsat")
+            raw_idsat_ua[device] = ids
+            mos[device] = MosWat(abs(_positive(vt, f"{device.upper()} Vt")),
+                                 abs(_positive(ids, f"{device.upper()} Idsat")))
+        parsed.append(WaferChipWat(lot, chip, vdd, SixTWatCell(f"{lot}_{chip}",
+            mos["pul"], mos["pur"], mos["pgl"], mos["pgr"], mos["pdl"], mos["pdr"]), raw_idsat_ua))
+    if not parsed:
+        raise ValueError(f'Worksheet "{sheet.title}" contains no chip rows')
+    return parsed
+
+
+def read_multi_chip_6t_excel_vdd_sheets(
+        path: str | os.PathLike[str], default_model_vdd_v: float = .90,
+        allow_no_vdd_sheets: bool = False) -> list[dict[str, object]]:
+    """Read every worksheet whose name encodes its Model VDD."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("Multi-chip Excel import requires openpyxl. Run: python -m pip install -r requirements.txt") from exc
+    workbook = load_workbook(path, data_only=True, read_only=True)
+    try:
+        grouped: dict[float, dict[str, object]] = {}
+        for sheet in workbook.worksheets:
+            vdd = _model_vdd_from_sheet_name(sheet.title)
+            if vdd is None:
+                continue
+            entry = grouped.setdefault(vdd, {"vdd_v": vdd, "sheet_names": [], "chips": []})
+            entry["sheet_names"].append(sheet.title)
+            entry["chips"].extend(_read_multi_chip_6t_sheet(
+                sheet, default_model_vdd_v, sheet_model_vdd_v=vdd))
+        if not grouped and not allow_no_vdd_sheets:
+            raise ValueError(
+                "No Model VDD worksheet was found. Name data sheets like 0.90V, 0.80V, or VDD_0.70V.")
+        return [grouped[vdd] for vdd in sorted(grouped)]
+    finally:
+        workbook.close()
+
+
 def read_multi_chip_6t_excel(path: str | os.PathLike[str],
                              default_model_vdd_v: float = .90,
                              require_common_vdd: bool = True) -> list[WaferChipWat]:
-    """Read a unit-free wide-form wafer multi-cell 6T workbook.
-
-    One row represents one measured cell/chip.  The required electrical inputs
-    are PUL/PUR/PGL/PGR/PDL/PDR Vt and Idsat, expressed directly in V and uA.
-    Lot/Wafer and Chip ID remain metadata; Model VDD is optional and otherwise
-    uses the VDD selected in the GUI.
-    """
+    """Read one conventional wide-form wafer Multi-Cell worksheet."""
     try:
         from openpyxl import load_workbook
     except ImportError as exc:
@@ -1949,58 +2045,11 @@ def read_multi_chip_6t_excel(path: str | os.PathLike[str],
     try:
         if "6T Multi-Cell" in workbook.sheetnames:
             sheet = workbook["6T Multi-Cell"]
-        elif "6T Multi-Chip" in workbook.sheetnames:  # compatibility with earlier templates
+        elif "6T Multi-Chip" in workbook.sheetnames:
             sheet = workbook["6T Multi-Chip"]
         else:
             sheet = workbook.active
-        rows = list(sheet.iter_rows(values_only=True))
-        if len(rows) < 2:
-            raise ValueError("Multi-chip Excel needs a header and at least one chip row")
-        headers, header_units = _excel_header_map(list(rows[0]))
-        lot_key = _first_header(headers, "lotwafer", "lot", "wafer", "waferid")
-        chip_key = _first_header(headers, "chipid", "chip", "dieid", "site", "siteid")
-        vdd_key = _first_header(headers, "modelvdd", "vdd", "supplyvoltage")
-        vdd_unit_key = _first_header(headers, "modelvddunit", "vddunit")
-        if not chip_key:
-            raise ValueError("Multi-chip Excel requires a Chip ID column")
-        devices: dict[str, tuple[str, str]] = {}
-        for device in ("pul", "pur", "pgl", "pgr", "pdl", "pdr"):
-            vt_key = _first_header(headers, f"{device}vt", f"{device}vth")
-            ids_key = _first_header(headers, f"{device}idsat", f"{device}isat", f"{device}ids")
-            if not vt_key or not ids_key:
-                raise ValueError(f"Multi-chip Excel needs {device.upper()} Vt and Idsat columns")
-            devices[device] = (vt_key, ids_key)
-        parsed: list[WaferChipWat] = []
-        for number, row_tuple in enumerate(rows[1:], 2):
-            row = list(row_tuple)
-            if not any(value is not None and str(value).strip() for value in row):
-                continue
-            lot = str(_cell(row, headers, lot_key) or "Wafer").strip()
-            chip = str(_cell(row, headers, chip_key) or "").strip()
-            if not chip:
-                raise ValueError(f"Multi-chip Excel row {number}: Chip ID is blank")
-            raw_vdd = _cell(row, headers, vdd_key)
-            vdd = default_model_vdd_v if raw_vdd is None or str(raw_vdd).strip() == "" else _excel_number(
-                raw_vdd, _cell(row, headers, vdd_unit_key) or header_units.get(vdd_key or "", "V"),
-                _VOLTAGE_UNITS, "V", f"Multi-chip row {number} Model VDD")
-            mos: dict[str, MosWat] = {}
-            raw_idsat_ua: dict[str, float] = {}
-            for device, (vt_key, ids_key) in devices.items():
-                vt = _excel_number(_cell(row, headers, vt_key),
-                                   _cell(row, headers, f"{vt_key}unit") or header_units.get(vt_key, "V"),
-                                   _VOLTAGE_UNITS, "V", f"Multi-chip row {number} {device.upper()} Vt")
-                ids = _excel_number(_cell(row, headers, ids_key),
-                                    _cell(row, headers, f"{ids_key}unit") or header_units.get(ids_key, "uA"),
-                                    _CURRENT_TO_UA, "uA", f"Multi-chip row {number} {device.upper()} Idsat")
-                # WAT may report PMOS Idsat as a negative signed current.
-                # Keep that sign for the output record while using its
-                # magnitude to calibrate the compact drive model.
-                raw_idsat_ua[device] = ids
-                mos[device] = MosWat(abs(_positive(vt, f"{device.upper()} Vt")), abs(_positive(ids, f"{device.upper()} Idsat")))
-            parsed.append(WaferChipWat(lot, chip, vdd, SixTWatCell(f"{lot}_{chip}",
-                mos["pul"], mos["pur"], mos["pgl"], mos["pgr"], mos["pdl"], mos["pdr"]), raw_idsat_ua))
-        if not parsed:
-            raise ValueError("Multi-chip Excel contains no chip rows")
+        parsed = _read_multi_chip_6t_sheet(sheet, default_model_vdd_v)
         vdds = {round(item.model_vdd_v, 12) for item in parsed}
         if require_common_vdd and len(vdds) != 1:
             raise ValueError("Multi-chip VTC overlay requires one common Model VDD for all chip rows")
@@ -3077,6 +3126,50 @@ _ESTIMATE_VMIN_METRICS = (
     ("write_margin_mv", "Write Margin", "BL Write Margin", "#34C759"),
 )
 
+_ESTIMATE_VMIN_SAMPLE_FIELDS = {
+    "lot_wafer", "chip_id", "rsnm_mv", "wsnm_mv", "write_margin_mv",
+    "cell_ratio_beta", "pull_up_ratio_beta", "pu_vt_v", "pu_idsat_ua",
+    "pg_vt_v", "pg_idsat_ua", "pd_vt_v", "pd_idsat_ua",
+}
+
+
+def _estimate_samples_from_multi_chip_analysis(analysis: dict) -> list[dict[str, object]]:
+    return [
+        {key: value for key, value in raw_sample.items()
+         if key in _ESTIMATE_VMIN_SAMPLE_FIELDS}
+        for raw_sample in analysis["relative_shmoo"]["samples"]
+    ]
+
+
+def _estimate_rows_from_grouped_samples(
+        grouped: dict[float, list[dict[str, object]]]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for vdd in sorted(grouped):
+        samples = grouped[vdd]
+        row: dict[str, object] = {
+            "vdd_v": vdd, "sample_count": len(samples), "samples": samples,
+            "lot_wafers": sorted({str(item["lot_wafer"]) for item in samples}),
+        }
+        for key, *_ in _ESTIMATE_VMIN_METRICS:
+            winner = min(samples, key=lambda item: float(item[key]))
+            row[key] = float(winner[key])
+            row[f"{key}_chip_id"] = str(winner["chip_id"])
+            row[f"{key}_lot_wafer"] = str(winner["lot_wafer"])
+        rows.append(row)
+    return rows
+
+
+def estimate_rows_from_multi_chip_analyses(
+        analyses: Iterable[dict]) -> list[dict[str, object]]:
+    """Convert completed per-VDD Multi-Cell analyses into Vmin input rows."""
+    grouped: dict[float, list[dict[str, object]]] = {}
+    for analysis in analyses:
+        grouped.setdefault(float(analysis["vdd_v"]), []).extend(
+            _estimate_samples_from_multi_chip_analysis(analysis))
+    if not grouped:
+        raise ValueError("No completed Multi-Cell VDD analysis was supplied")
+    return _estimate_rows_from_grouped_samples(grouped)
+
 
 def read_multi_chip_snm_summary(
         paths: Iterable[str | os.PathLike[str]],
@@ -3097,8 +3190,18 @@ def read_multi_chip_snm_summary(
         suffix = path.suffix.lower()
         if suffix in {".xlsx", ".xlsm"}:
             try:
-                chips = read_multi_chip_6t_excel(
-                    path, default_model_vdd_v, require_common_vdd=False)
+                vdd_sheets = read_multi_chip_6t_excel_vdd_sheets(
+                    path, default_model_vdd_v, allow_no_vdd_sheets=True)
+                if vdd_sheets:
+                    chip_groups = [(float(item["vdd_v"]), list(item["chips"]))
+                                   for item in vdd_sheets]
+                else:
+                    chips = read_multi_chip_6t_excel(
+                        path, default_model_vdd_v, require_common_vdd=False)
+                    chips_by_vdd: dict[float, list[WaferChipWat]] = {}
+                    for chip in chips:
+                        chips_by_vdd.setdefault(float(chip.model_vdd_v), []).append(chip)
+                    chip_groups = sorted(chips_by_vdd.items())
             except (ValueError, RuntimeError):
                 raise
             except Exception as exc:
@@ -3107,24 +3210,11 @@ def read_multi_chip_snm_summary(
                     "workbook. Check that it is a valid .xlsx/.xlsm file and "
                     "contains the required Lot/Wafer, Chip ID and six-MOS "
                     "Vt/Idsat columns.") from exc
-            chips_by_vdd: dict[float, list[WaferChipWat]] = {}
-            for chip in chips:
-                chips_by_vdd.setdefault(float(chip.model_vdd_v), []).append(chip)
-            for vdd, vdd_chips in chips_by_vdd.items():
+            for vdd, vdd_chips in chip_groups:
                 model_config = replace(
                     config or Config(), nominal_vdd=vdd, wat_vdd=vdd)
                 analysis = analyze_multi_chip_wafer(vdd_chips, model_config)
-                for raw_sample in analysis["relative_shmoo"]["samples"]:
-                    sample = {
-                        key: value for key, value in raw_sample.items()
-                        if key in {
-                            "lot_wafer", "chip_id", "rsnm_mv", "wsnm_mv",
-                            "write_margin_mv", "cell_ratio_beta",
-                            "pull_up_ratio_beta", "pu_vt_v", "pu_idsat_ua",
-                            "pg_vt_v", "pg_idsat_ua", "pd_vt_v",
-                            "pd_idsat_ua",
-                        }
-                    }
+                for sample in _estimate_samples_from_multi_chip_analysis(analysis):
                     grouped.setdefault(vdd, []).append(sample)
             continue
         if suffix == ".xls":
@@ -3173,19 +3263,7 @@ def read_multi_chip_snm_summary(
                 "multi_chip_snm_summary.csv file instead of an Excel or binary file.") from exc
     if not grouped:
         raise ValueError("The selected Multi-Cell summary contains no usable Model VDD data")
-    rows: list[dict[str, object]] = []
-    for vdd in sorted(grouped):
-        samples = grouped[vdd]
-        row: dict[str, object] = {"vdd_v": vdd, "sample_count": len(samples),
-                                  "samples": samples,
-                                  "lot_wafers": sorted({str(item["lot_wafer"]) for item in samples})}
-        for key, *_ in _ESTIMATE_VMIN_METRICS:
-            winner = min(samples, key=lambda item: float(item[key]))
-            row[key] = float(winner[key])
-            row[f"{key}_chip_id"] = str(winner["chip_id"])
-            row[f"{key}_lot_wafer"] = str(winner["lot_wafer"])
-        rows.append(row)
-    return rows
+    return _estimate_rows_from_grouped_samples(grouped)
 
 
 def _linear_quantile(values: Iterable[float], probability: float) -> float:
@@ -3768,8 +3846,10 @@ def lot_wafer_drive_scatter_svg(vdd_group: dict[str, object],
             f'<text x="{legend_x+30}" y="{y+19}" fill="#6E6E73" font-size="12">n={int(group["sample_count"])} · median PR {float(group["median_pr"]):.3f} · CR {float(group["median_cr"]):.3f}</text>',
         ]
     parts += [
-        f'<text x="{(left+right)/2:.1f}" y="{height-38}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Pull-up Ratio  PR = MOSdrive(PG) / MOSdrive(PU)  (right = easier write)</text>',
-        f'<text x="31" y="{(top+bottom)/2:.1f}" transform="rotate(-90 31 {(top+bottom)/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Cell Ratio  CR = MOSdrive(PD) / MOSdrive(PG)  (up = stronger read)</text>',
+        f'<text x="{(left+right)/2:.1f}" y="{height-55}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Write drive — Pull-up Ratio (PR)</text>',
+        f'<text x="{(left+right)/2:.1f}" y="{height-29}" text-anchor="middle" fill="#6E6E73" font-size="14">MOSdrive(PG) / MOSdrive(PU) · right = easier write</text>',
+        f'<text x="27" y="{(top+bottom)/2:.1f}" transform="rotate(-90 27 {(top+bottom)/2:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Read drive — Cell Ratio (CR)</text>',
+        f'<text x="52" y="{(top+bottom)/2:.1f}" transform="rotate(-90 52 {(top+bottom)/2:.1f})" text-anchor="middle" fill="#6E6E73" font-size="14">MOSdrive(PD) / MOSdrive(PG) · up = stronger read</text>',
         '</svg>',
     ]
     return "".join(parts)
@@ -4588,8 +4668,10 @@ def estimate_vmin_ratio_shmoo_svg(shmoo: dict, width: int = 1600,
     ]
 
     parts += [
-        f'<text x="{left + plot_w / 2}" y="{height - 28}" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Pull-up Ratio  <tspan font-family="Times New Roman">MOS</tspan><tspan baseline-shift="sub" font-family="Times New Roman" font-style="italic" font-size="11">drive</tspan><tspan baseline-shift="baseline" font-size="17">(PG) / </tspan><tspan font-family="Times New Roman">MOS</tspan><tspan baseline-shift="sub" font-family="Times New Roman" font-style="italic" font-size="11">drive</tspan><tspan baseline-shift="baseline" font-size="17">(PU) = PR  (right = easier write)</tspan></text>',
-        f'<text x="34" y="{top + plot_h / 2}" transform="rotate(-90 34 {top + plot_h / 2})" text-anchor="middle" fill="#111111" font-size="17" font-weight="700">Read cell ratio  <tspan font-family="Times New Roman">MOS</tspan><tspan baseline-shift="sub" font-family="Times New Roman" font-style="italic" font-size="11">drive</tspan><tspan baseline-shift="baseline" font-size="17">(PD) / </tspan><tspan font-family="Times New Roman">MOS</tspan><tspan baseline-shift="sub" font-family="Times New Roman" font-style="italic" font-size="11">drive</tspan><tspan baseline-shift="baseline" font-size="17">(PG) = CR  (up = stronger read)</tspan></text>',
+        f'<text x="{left + plot_w / 2}" y="{height - 54}" text-anchor="middle" fill="#111111" font-size="18" font-weight="700">Write drive — Pull-up Ratio (PR)</text>',
+        f'<text x="{left + plot_w / 2}" y="{height - 27}" text-anchor="middle" fill="#535D66" font-size="14">MOSdrive: PG / PU · right = easier write</text>',
+        f'<text x="22" y="{top + plot_h / 2}" transform="rotate(-90 22 {top + plot_h / 2})" text-anchor="middle" fill="#111111" font-size="18" font-weight="700">Read drive — Cell Ratio (CR)</text>',
+        f'<text x="55" y="{top + plot_h / 2}" transform="rotate(-90 55 {top + plot_h / 2})" text-anchor="middle" fill="#535D66" font-size="14">MOSdrive: PD / PG · up = stronger read</text>',
     ]
 
     # Reading guide on the right keeps formulas and status semantics outside
@@ -4767,8 +4849,10 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
     """Write all imported Multi-Cell estimate curves and an HTML selector report."""
     out = Path(out_dir); image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
     source_paths = list(source_paths)
+    # The analysis mode is authoritative.  A single multi-sheet workbook may
+    # contain several Model VDD populations and must still produce Vmin curves.
     shmoo_only = (analysis.get("mode") == "shmoo_only" or
-                   len(analysis.get("rows", [])) == 1 or len(source_paths) == 1)
+                   len(analysis.get("rows", [])) == 1)
     try:
         from reportlab.graphics import renderPM
         from svglib.svglib import svg2rlg
@@ -6643,7 +6727,7 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                              input_excel_path: str | os.PathLike[str] | None = None) -> Path:
     """Export batch wafer VTC overlays, per-chip margin table and HTML summary."""
     out = Path(out_dir); image_dir = out / "images"; image_dir.mkdir(parents=True, exist_ok=True)
-    backup_name = "imported_6t_vt_idsat_data.xlsx"
+    backup_name = f'imported_6t_vt_idsat_data_{float(analysis["vdd_v"]):.3f}V.xlsx'
     if input_excel_path is not None:
         source = Path(input_excel_path)
         if not source.is_file():
@@ -6771,6 +6855,54 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         for metric, values in relative_shmoo["distributions"].items())
     report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Wafer Multi-Cell Analysis</title><style>body{{font-family:Calibri,Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1400px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px;margin:18px 0}}img{{width:100%;height:auto}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child{{text-align:left}}.note{{color:#6e6e73}}.warn{{color:#c2410c;font-weight:bold}}</style></head><body><main><h1>HV28 SRAM Wafer Multi-Cell Analysis</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · {len(analysis["rows"])} measured cells · Model VDD={analysis["vdd_v"]:.3f} V</p>{backup_note}<section><h2>Conservative wafer reference</h2><p><b>Minimum cell RSNM:</b> {analysis["worst_rsnm"]["rsnm_mv"]:.2f} mV ({html.escape(analysis["worst_rsnm"]["chip_id"])})<br><b>Minimum Write Margin:</b> {analysis["worst_write_margin"]["write_margin_mv"]:.2f} mV ({html.escape(analysis["worst_write_margin"]["chip_id"])})<br><b>Minimum WSNM:</b> {analysis["worst_wsnm"]["wsnm_mv"]:.2f} mV ({html.escape(analysis["worst_wsnm"]["chip_id"])})</p></section><section><h2>Wafer-relative quartile Shmoo</h2><p>At this fixed VDD, Read drive is ranked from CR and Write drive from PR. The lower drive percentile controls the grade: <b>Preferred</b> ≥ P50, <b>Monitor</b> P25–P50, and <b>Low</b> &lt; P25. RSNM and BL Write Margin percentiles are retained separately for correlation. This is an intra-wafer screening reference, not absolute silicon Pass/Fail.</p><p><b>Preferred:</b> {grade_counts["preferred"]} · <b>Monitor:</b> {grade_counts["monitor"]} · <b>Low:</b> {grade_counts["low"]}</p><img src="images/{shmoo_png_name}" alt="Wafer-relative CR PR quartile shmoo"><h3>Robust distribution statistics</h3><table><tr><th>Metric</th><th>P5</th><th>Q1</th><th>Median</th><th>Q3</th><th>P95</th><th>MAD</th></tr>{statistics_rows}</table><p class="note">Detailed outputs: <code>multi_cell_wafer_relative_grades.csv</code> and <code>multi_cell_wafer_distribution_statistics.csv</code>.</p></section><section><h2>Synthetic median reference cell</h2><p>The median cell is built from the per-device median Vt and Idsat values. It is a statistical reference and may not be a physically measured cell.</p><table><tr><th>RSNM</th><th>Write Margin</th><th>Cell Ratio (CR)</th><th>Pull-up Ratio (PR)</th></tr><tr><td>{median["rsnm_mv"]:.2f} mV</td><td>{median["write_margin_mv"]:.2f} mV</td><td>{median["cell_ratio_beta"]:.3f}</td><td>{median["pull_up_ratio_beta"]:.3f}</td></tr></table></section><section><h2>Worst-to-median adjustment screening</h2><p class="note">Each shmoo moves both devices of one family, one parameter at a time, from the worst cell toward its physical-MOS median in 10% steps. It is a direction-finding compact-model screening, not a simultaneous process correction.</p><h3>Read target: median RSNM = {read_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_rsnm"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(read_shmoo)}</table><h3>Write target: median Write Margin = {write_shmoo["target_value_mv"]:.2f} mV; worst cell = {html.escape(analysis["worst_write_margin"]["chip_id"])}</h3><table><tr><th>Family</th><th>Parameter</th><th>Move toward median</th><th>RSNM</th><th>Write Margin</th><th>Ratios after move</th></tr>{recommendation_rows(write_shmoo)}</table><p class="note">Detailed sweep data: <code>median_target_read_shmoo.csv</code> and <code>median_target_write_shmoo.csv</code>.</p></section><section><h2>Read VTC / Mirror VTC</h2><p>Upper and Lower squares are each taken from their own state-limiting cell. Their direct/mirrored VTC pair is highlighted together; the two states are not combined into one artificial cell. The overlay card lists the complete six-MOS Vt/Idsat set for the cell that owns the minimum RSNM.</p><img src="images/01_multi_chip_read_vtc.png"></section><section><h2>Write W=1 / W=0 VTC</h2><p>The overlay card lists the complete six-MOS Vt/Idsat set for the cell that owns the minimum WSNM.</p><img src="images/02_multi_chip_write_vtc.png"></section><section><h2>Per-cell margins and wafer-relative grade</h2><table><tr><th>Cell / Chip ID</th><th>Upper RSNM</th><th>Lower RSNM</th><th>RSNM</th><th>Write Margin</th><th>CR</th><th>PR</th><th>CR pct.</th><th>PR pct.</th><th>Grade</th></tr>{body}</table></section></main></body></html>''', encoding="utf-8")
     return report
+
+
+def process_multi_vdd_6t_excel(
+        source_path: str | os.PathLike[str], cfg: Config,
+        output_base: str | os.PathLike[str],
+        vdd_groups: list[dict[str, object]] | None = None) -> dict[str, object]:
+    """Run per-sheet Multi-Cell analysis, then aggregate all VDDs into Vmin curves."""
+    source = Path(source_path)
+    groups = (vdd_groups if vdd_groups is not None else
+              read_multi_chip_6t_excel_vdd_sheets(source, cfg.nominal_vdd))
+    analyses: list[dict] = []
+    lot_wafers: set[str] = set()
+    for group in groups:
+        vdd = float(group["vdd_v"])
+        chips = list(group["chips"])
+        lot_wafers.update(chip.lot_wafer for chip in chips)
+        model_config = replace(cfg, nominal_vdd=vdd, wat_vdd=vdd)
+        analysis = analyze_multi_chip_wafer(chips, model_config)
+        analysis["source_sheet_names"] = list(group["sheet_names"])
+        analyses.append(analysis)
+
+    wafer_label = (next(iter(lot_wafers)) if len(lot_wafers) == 1
+                   else f"{len(lot_wafers)}_Lot_Wafer_groups")
+    run_dir = create_run_output_dir(
+        output_base, wafer_label, "multi_vdd_excel_estimate_vmin")
+    per_vdd_root = run_dir / "multi_cell_by_vdd"
+    per_vdd_root.mkdir(parents=True, exist_ok=True)
+    per_vdd_reports: list[Path] = []
+    for analysis in analyses:
+        vdd = float(analysis["vdd_v"])
+        vdd_dir = per_vdd_root / f"Model_VDD_{vdd:.3f}V"
+        vdd_dir.mkdir(parents=True, exist_ok=False)
+        per_vdd_reports.append(
+            write_multi_chip_outputs(analysis, vdd_dir, source))
+
+    source_rows = estimate_rows_from_multi_chip_analyses(analyses)
+    estimate_analysis = analyze_estimate_vmin_curves(source_rows)
+    estimate_analysis["multi_vdd_excel"] = True
+    estimate_analysis["per_vdd_output_count"] = len(analyses)
+    estimate_analysis["source_sheets"] = [
+        name for analysis in analyses for name in analysis["source_sheet_names"]]
+    estimate_dir = run_dir / "estimate_vmin"
+    report = write_estimate_vmin_outputs(
+        estimate_analysis, estimate_dir, [source])
+    return {
+        "analysis": estimate_analysis, "report": report,
+        "run_dir": run_dir, "per_vdd_reports": per_vdd_reports,
+    }
 
 
 def write_outputs(result: dict, out_dir: str | os.PathLike[str]) -> Path:
@@ -7753,7 +7885,9 @@ def launch_gui() -> None:
                            for key, _label, _unit in assumption_specs}
             cfg = Config(nominal_vdd=chips[0].model_vdd_v, wat_vdd=chips[0].model_vdd_v, **assumptions)
             analysis = analyze_multi_chip_wafer(chips, cfg)
-            run_dir = create_run_output_dir(values["out"].get(), chips[0].lot_wafer, "multi_cell_wafer")
+            run_dir = create_run_output_dir(
+                values["out"].get(), chips[0].lot_wafer,
+                f'multi_cell_wafer_{chips[0].model_vdd_v:.3f}V')
             report = write_multi_chip_outputs(analysis, run_dir, selected)
             values["corner"].set(chips[0].lot_wafer)
             status.set(f"Wafer multi-cell complete: {len(chips)} cells; minimum RSNM={analysis['worst_rsnm']['rsnm_mv']:.1f} mV, WSNM={analysis['worst_wsnm']['wsnm_mv']:.1f} mV")
@@ -8037,7 +8171,7 @@ def launch_gui() -> None:
 
     ttk.Label(curve_input_card, text="Multi-Cell Estimate Vmin", style="Section.TLabel").pack(anchor="w")
     ttk.Label(curve_input_card,
-              text="Select generated multi_chip_snm_summary.csv files or raw 6T Multi-Cell Excel workbooks (.xlsx/.xlsm). Excel Vt/Idsat rows are modeled automatically. One selected file runs Shmoo-only analysis; select two or more input files with at least two total VDD points to generate Estimate Vmin curves.",
+              text="Select generated multi_chip_snm_summary.csv files or raw 6T Multi-Cell Excel workbooks (.xlsx/.xlsm). For one-step multi-VDD analysis, name Excel sheets by Model VDD (for example 0.90V, 0.80V). Each sheet receives a full Multi-Cell output folder before all VDDs are combined into W/R Estimate Vmin curves.",
               style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(2, 12))
     selected_summary_paths: list[str] = []
     selected_summary_text = tk.StringVar(value="No Multi-Cell summary selected")
@@ -8399,6 +8533,16 @@ def launch_gui() -> None:
     def curve_worker(summary_paths: list[str], out_path: Path, wafer_id: str,
                      model_config: Config) -> None:
         try:
+            if len(summary_paths) == 1 and Path(summary_paths[0]).suffix.lower() in {".xlsx", ".xlsm"}:
+                vdd_groups = read_multi_chip_6t_excel_vdd_sheets(
+                    summary_paths[0], model_config.nominal_vdd,
+                    allow_no_vdd_sheets=True)
+                if vdd_groups:
+                    result = process_multi_vdd_6t_excel(
+                        summary_paths[0], model_config, out_path, vdd_groups)
+                    curve_result_queue.put(
+                        (True, result["analysis"], result["report"]))
+                    return
             source_rows = read_multi_chip_snm_summary(
                 summary_paths, model_config.nominal_vdd, model_config)
             analysis = analyze_estimate_vmin_curves(
@@ -8504,8 +8648,15 @@ def launch_gui() -> None:
                     summary = f'{curve["label"]} eye-closure VDD not bracketed by imported points'
                     curve_summary_label.configure(fg=SECONDARY)
             curve_summary.set(summary)
-            curve_status.set(
-                f"Complete - {len(analysis['rows'])} VDD point(s); saved to {Path(payload).parent}")
+            if analysis.get("multi_vdd_excel"):
+                curve_status.set(
+                    f"Complete - {len(analysis['rows'])} VDD point(s); "
+                    f"{analysis['per_vdd_output_count']} per-VDD Multi-Cell folder(s); "
+                    f"saved to {Path(payload).parent.parent}")
+            else:
+                curve_status.set(
+                    f"Complete - {len(analysis['rows'])} VDD point(s); "
+                    f"saved to {Path(payload).parent}")
             curve_status_label.configure(fg=GREEN)
             curve_open_button.state(["!disabled"])
             if analysis.get("mode") == "shmoo_only":
