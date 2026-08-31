@@ -1,4 +1,5 @@
 import csv
+import re
 import tempfile
 import unittest
 from datetime import datetime
@@ -745,13 +746,17 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn('<text x="56" y="46" fill="#1D1D1F" font-size="34"', svg)
             self.assertEqual(svg.count('y="156.0" fill="#1D1D1F" font-size="20"'), 2)
             self.assertEqual(svg.count('>Model VDD (V)</text>'), 2)
-            self.assertIn('opacity=".42"', svg)
-            self.assertIn('>50.0 mV</text>', svg)
+            self.assertIn('class="multi-lot-data-label-bg"', svg)
+            self.assertIn('fill="#F2F7FF"', svg)
+            self.assertRegex(
+                svg, r'class="multi-lot-data-label"[^>]+text-anchor="middle"')
+            self.assertNotRegex(
+                svg, r'class="multi-lot-data-label"[^>]+text-anchor="(?:start|end)"')
+            self.assertIn('>LOT_A_W01 · 0.50 V · 50.0 mV</text>', svg)
             self.assertNotIn('>R 50.0', svg)
             self.assertNotIn('>W 70.0', svg)
             self.assertNotIn('>BL 25.0', svg)
-            self.assertIn('stroke="#8E8E93" stroke-width="1.4" stroke-dasharray="5 5"', svg)
-            self.assertEqual(svg.count('class="measured-vdd-guide"'), 4)
+            self.assertNotIn('class="measured-vdd-guide"', svg)
             self.assertEqual(svg.count('>0.50 V</text>'), 2)
             self.assertIn('stroke-dasharray="8 5"', svg)
             transparent = estimate_vmin_combined_comparison_svg(
@@ -759,6 +764,74 @@ class AnalyzerTests(unittest.TestCase):
             self.assertNotIn('<rect width="100%" height="100%" fill="#FFFFFF"/>',
                              transparent)
             self.assertIn('fill="none" stroke="#D8DDE3"', transparent)
+
+    def test_comparison_reads_one_multi_vdd_output_folder(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "20260831_multi_vdd_excel_estimate_vmin"
+            fields = ["lot_wafer", "chip_id", "model_vdd_v", "rsnm_mv",
+                      "wsnm_mv", "write_margin_mv"]
+            for vdd, rsnm, wsnm, margin in (
+                    (.60, 72.0, 65.0, 31.0), (.80, 126.0, 112.0, 74.0)):
+                folder = (run_dir / "multi_cell_by_vdd" /
+                          f"Model_VDD_{vdd:.3f}V")
+                folder.mkdir(parents=True)
+                summary = folder / "multi_chip_snm_summary.csv"
+                with summary.open("w", newline="", encoding="utf-8-sig") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerow({
+                        "lot_wafer": "LOT_A_W01", "chip_id": "C01",
+                        "model_vdd_v": vdd, "rsnm_mv": rsnm,
+                        "wsnm_mv": wsnm, "write_margin_mv": margin})
+
+            datasets = read_estimate_vmin_combined_files([run_dir])
+            self.assertEqual(len(datasets), 1)
+            self.assertEqual(datasets[0]["lot_wafer"], "LOT_A_W01")
+            self.assertEqual([row["vdd_v"] for row in datasets[0]["rows"]],
+                             [.60, .80])
+            self.assertEqual(len(datasets[0]["sources"]), 2)
+            svg = estimate_vmin_combined_comparison_svg(datasets)
+            self.assertIn("Read / Write SNM", svg)
+            self.assertIn("BL Write Margin", svg)
+            self.assertIn(">0.60 V</text>", svg)
+            self.assertIn(">0.80 V</text>", svg)
+            self.assertIn("X range 0.600–0.800 V", svg)
+            # Lowest and highest measured VDD occupy the two X-axis bounds;
+            # the chart no longer reserves an empty 0 V to first-point region.
+            self.assertIn('class="vertical-vdd-label" data-vdd="0.6000" x="92.0"', svg)
+            self.assertIn('class="vertical-vdd-label" data-vdd="0.8000" x="736.0"', svg)
+
+    def test_multi_curve_labels_only_each_source_lowest_vdd(self):
+        def rows(offset: float) -> list[dict[str, object]]:
+            return [{"vdd_v": vdd, "sample_count": 8,
+                     "rsnm_mv": value + offset,
+                     "wsnm_mv": value + offset - 10,
+                     "write_margin_mv": value / 2 + offset}
+                    for vdd, value in ((.40, 40.0), (.60, 80.0), (.80, 120.0))]
+
+        datasets = [
+            {"lot_wafer": "LOT_A_W01", "rows": rows(0),
+             "color": "#007AFF", "sources": ["A"]},
+            {"lot_wafer": "LOT_B_W02", "rows": rows(10),
+             "color": "#AF52DE", "sources": ["B"]},
+        ]
+        svg = estimate_vmin_combined_comparison_svg(datasets)
+        self.assertIn("LOT_A_W01 · 0.40 V · 40.0 mV", svg)
+        self.assertNotIn("LOT_A_W01 · 0.60 V", svg)
+        self.assertNotIn("LOT_B_W02 · 0.60 V", svg)
+        self.assertNotIn("LOT_A_W01 · 0.80 V", svg)
+        self.assertNotIn("LOT_B_W02 · 0.80 V", svg)
+        # 2 sources × one lowest VDD × (Read + Write + BL margin).
+        self.assertEqual(svg.count('class="multi-lot-data-label"'), 6)
+        # Each panel's endpoint columns use vertically separated background boxes.
+        background_rows = re.findall(
+            r'class="multi-lot-data-label-bg" x="([0-9.]+)" y="([0-9.]+)"', svg)
+        self.assertEqual(len(background_rows), 6)
+        for x_value in {float(item[0]) for item in background_rows}:
+            ys = sorted(float(item[1]) for item in background_rows
+                        if abs(float(item[0]) - x_value) < .05)
+            self.assertTrue(all(second - first >= 19.9
+                                for first, second in zip(ys, ys[1:])))
 
     def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):
         rows = []
