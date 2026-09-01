@@ -2704,7 +2704,8 @@ def _median_target_shmoo(worst: dict[str, object], median: dict[str, object],
 
 
 def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
-                             fit_points: int | None = None) -> dict:
+                             fit_points: int | None = None,
+                             include_shmoo: bool = True) -> dict:
     """Evaluate all chip rows and retain every Read/Write VTC for wafer overlay."""
     if not chips:
         raise ValueError("At least one chip is required")
@@ -2732,6 +2733,19 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
                       key=lambda row: row["upper_rsnm_mv"])
     worst_lower = min((row for row in rows if row["lower_rsnm_mv"] is not None),
                       key=lambda row: row["lower_rsnm_mv"])
+    lot_wafers = sorted({item.lot_wafer for item in chips})
+    lot_wafer_display = (lot_wafers[0] if len(lot_wafers) == 1
+                         else f'{len(lot_wafers)} Lot/Wafer groups')
+    result = {"lot_wafer": lot_wafer_display, "lot_wafers": lot_wafers,
+              "vdd_v": vdd, "rows": rows,
+              "worst_rsnm": worst_read, "worst_rsnm_upper": worst_upper,
+              "worst_rsnm_lower": worst_lower, "worst_wsnm": worst_write,
+              "worst_write_margin": worst_write_margin,
+              "shmoo_enabled": bool(include_shmoo),
+              "fit_points": point_cfg.grid_points}
+    if not include_shmoo:
+        return result
+
     median_cell = _median_multi_cell(chips)
     median = {"chip_id": "MEDIAN_CELL", **_multi_cell_metrics(
         median_cell, point_cfg, vdd, point_cfg.grid_points)}
@@ -2739,10 +2753,8 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
     for row in rows:
         source_cell = row["cell"]
         sample = {
-            "lot_wafer": row["lot_wafer"],
-            "chip_id": row["chip_id"],
-            "rsnm_mv": row["rsnm_mv"],
-            "wsnm_mv": row["wsnm_mv"],
+            "lot_wafer": row["lot_wafer"], "chip_id": row["chip_id"],
+            "rsnm_mv": row["rsnm_mv"], "wsnm_mv": row["wsnm_mv"],
             "write_margin_mv": row["write_margin_mv"],
             "cell_ratio_beta": row["cell_ratio_beta"],
             "pull_up_ratio_beta": row["pull_up_ratio_beta"],
@@ -2753,27 +2765,20 @@ def analyze_multi_chip_wafer(chips: list[WaferChipWat], cfg: Config,
             sample[f"{family}_vt_v"] = (float(left_mos.vt) + float(right_mos.vt)) / 2.0
             sample[f"{family}_idsat_ua"] = (float(left_mos.ids) + float(right_mos.ids)) / 2.0
         shmoo_samples.append(sample)
-    relative_shmoo = _build_estimate_vmin_ratio_shmoos([
-        {"vdd_v": vdd, "samples": shmoo_samples}
-    ])[0]
-    lot_wafers = sorted({item.lot_wafer for item in chips})
-    lot_wafer_display = (lot_wafers[0] if len(lot_wafers) == 1
-                         else f'{len(lot_wafers)} Lot/Wafer groups')
-    return {"lot_wafer": lot_wafer_display, "lot_wafers": lot_wafers,
-            "vdd_v": vdd, "rows": rows,
-            "worst_rsnm": worst_read, "worst_rsnm_upper": worst_upper,
-            "worst_rsnm_lower": worst_lower, "worst_wsnm": worst_write,
-            "worst_write_margin": worst_write_margin, "median_cell": median,
-            "dominant_read_driver": _dominant_snm_degradation_parameter(
-                worst_read["cell"], median_cell, "read"),
-            "dominant_write_driver": _dominant_snm_degradation_parameter(
-                worst_write["cell"], median_cell, "write"),
-            "median_target_read_shmoo": _median_target_shmoo(
-                worst_read, median, point_cfg, vdd, "rsnm_mv"),
-            "median_target_write_shmoo": _median_target_shmoo(
-                worst_write_margin, median, point_cfg, vdd, "write_margin_mv"),
-            "relative_shmoo": relative_shmoo,
-            "fit_points": point_cfg.grid_points}
+    result.update({
+        "median_cell": median,
+        "dominant_read_driver": _dominant_snm_degradation_parameter(
+            worst_read["cell"], median_cell, "read"),
+        "dominant_write_driver": _dominant_snm_degradation_parameter(
+            worst_write["cell"], median_cell, "write"),
+        "median_target_read_shmoo": _median_target_shmoo(
+            worst_read, median, point_cfg, vdd, "rsnm_mv"),
+        "median_target_write_shmoo": _median_target_shmoo(
+            worst_write_margin, median, point_cfg, vdd, "write_margin_mv"),
+        "relative_shmoo": _build_estimate_vmin_ratio_shmoos([
+            {"vdd_v": vdd, "samples": shmoo_samples}])[0],
+    })
+    return result
 
 
 def analyze_three_mos(cell: ThreeTWatCell, cfg: Config,
@@ -3178,10 +3183,16 @@ _ESTIMATE_VMIN_SAMPLE_FIELDS = {
 
 
 def _estimate_samples_from_multi_chip_analysis(analysis: dict) -> list[dict[str, object]]:
+    source_samples = analysis.get("relative_shmoo", {}).get("samples")
+    if source_samples is None:
+        # Fast mode deliberately omits relative-Shmoo construction. Reuse the
+        # common summary exporter so Estimate Vmin still receives the same
+        # per-cell margins, CR/PR and family-average WAT values.
+        source_samples = _multi_chip_summary_export_rows(analysis)
     return [
         {key: value for key, value in raw_sample.items()
          if key in _ESTIMATE_VMIN_SAMPLE_FIELDS}
-        for raw_sample in analysis["relative_shmoo"]["samples"]
+        for raw_sample in source_samples
     ]
 
 
@@ -3218,7 +3229,8 @@ def estimate_rows_from_multi_chip_analyses(
 def read_multi_chip_snm_summary(
         paths: Iterable[str | os.PathLike[str]],
         default_model_vdd_v: float = .90,
-        config: Config | None = None) -> list[dict[str, object]]:
+        config: Config | None = None,
+        include_shmoo: bool = True) -> list[dict[str, object]]:
     """Read Multi-Cell summary CSV or raw 6T Multi-Cell Excel inputs.
 
     CSV rows already contain modeled margins.  Excel rows contain the six-MOS
@@ -3257,7 +3269,8 @@ def read_multi_chip_snm_summary(
             for vdd, vdd_chips in chip_groups:
                 model_config = replace(
                     config or Config(), nominal_vdd=vdd, wat_vdd=vdd)
-                analysis = analyze_multi_chip_wafer(vdd_chips, model_config)
+                analysis = analyze_multi_chip_wafer(
+                    vdd_chips, model_config, include_shmoo=include_shmoo)
                 for sample in _estimate_samples_from_multi_chip_analysis(analysis):
                     grouped.setdefault(vdd, []).append(sample)
             continue
@@ -4213,7 +4226,8 @@ def _estimate_zero_boundary(rows: list[dict[str, object]], key: str) -> dict[str
 
 
 def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]],
-                                 force_shmoo_only: bool = False) -> dict:
+                                 force_shmoo_only: bool = False,
+                                 include_shmoo: bool = True) -> dict:
     """Build RSNM, WSNM and Write-Margin VDD trends from Multi-Cell summaries."""
     if not summary_rows:
         raise ValueError("At least one Multi-Cell VDD summary point is required")
@@ -4233,10 +4247,15 @@ def analyze_estimate_vmin_curves(summary_rows: list[dict[str, object]],
         curves[key] = {"key": key, "short_label": short_label, "label": label,
                        "color": color, "rows": rows,
                        "eye_closure": _estimate_zero_boundary(curve_source_rows, key)}
-    shmoo_only = bool(force_shmoo_only) or len(ordered) == 1
+    shmoo_only = bool(include_shmoo) and (
+        bool(force_shmoo_only) or len(ordered) == 1)
+    mode = ("shmoo_only" if shmoo_only else
+            "single_vdd" if len(ordered) == 1 else "estimate_vmin")
     return {"rows": ordered, "curves": curves,
-            "ratio_shmoos": _build_estimate_vmin_ratio_shmoos(ordered),
-            "mode": "shmoo_only" if shmoo_only else "estimate_vmin",
+            "ratio_shmoos": (_build_estimate_vmin_ratio_shmoos(ordered)
+                              if include_shmoo else []),
+            "shmoo_enabled": bool(include_shmoo),
+            "mode": mode,
             "definition": (
                 "Single-file or single-VDD input: only same-VDD CR/PR Shmoo screening is produced."
                 if shmoo_only else
@@ -4841,10 +4860,18 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
     """Render one imported Multi-Cell conservative margin versus VDD curve."""
     rows, color, label = curve["rows"], curve["color"], curve["label"]
     left, top, plot_w, plot_h = 110, 105, 1050, 470
+    measured_vdds = sorted({float(row["vdd_v"]) for row in rows})
+    if len(measured_vdds) < 2:
+        vdd_min = measured_vdds[0] - .01 if measured_vdds else 0.0
+        vdd_max = measured_vdds[0] + .01 if measured_vdds else .02
+    else:
+        vdd_min, vdd_max = measured_vdds[0], measured_vdds[-1]
+    vdd_span = vdd_max - vdd_min
     maximum = max((row["margin_mv"] for row in rows), default=50.0)
     y_max = max(50.0, math.ceil(maximum / 50.0) * 50.0)
     def xy(vdd: float, value: float) -> tuple[float, float]:
-        return left + vdd / SNM_PLOT_AXIS_MAX_V * plot_w, top + (1 - value / y_max) * plot_h
+        return (left + (vdd - vdd_min) / vdd_span * plot_w,
+                top + (1 - value / y_max) * plot_h)
     baseline_y = top + plot_h
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
@@ -4852,12 +4879,12 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
         f'<text x="52" y="54" fill="#1D1D1F" font-size="38" font-weight="700">Estimated {label} versus Model VDD</text>',
         f'<path d="M52 79 h38" stroke="{color}" stroke-width="4"/><text x="101" y="85" fill="#3A3A3C" font-size="16">Minimum cell value from imported Multi-Cell summaries</text>',
     ]
-    for step in range(7):
-        voltage = step * .2; x, _ = xy(voltage, 0)
-        parts += [f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#E5E5EA"/>',
-                  f'<text x="{x:.1f}" y="{baseline_y+27}" text-anchor="middle" fill="#6E6E73" font-size="14">{voltage:.1f}</text>']
     for step in range(6):
-        value = y_max * step / 5; _, y = xy(0, value)
+        voltage = vdd_min + vdd_span * step / 5; x, _ = xy(voltage, 0)
+        parts.append(
+            f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#E5E5EA"/>')
+    for step in range(6):
+        value = y_max * step / 5; _, y = xy(vdd_min, value)
         parts += [f'<path d="M{left} {y:.1f} H{left+plot_w}" stroke="#E5E5EA"/>',
                   f'<text x="{left-12}" y="{y+5:.1f}" text-anchor="end" fill="#6E6E73" font-size="14">{value:.0f}</text>']
     points = [xy(row["vdd_v"], row["margin_mv"]) for row in rows]
@@ -4895,7 +4922,8 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
                   f'<text x="{slope_left + slope_width / 2:.1f}" y="{top+83}" text-anchor="middle" fill="#C13515" font-size="14" font-weight="700">{slope_text}</text>']
     closure = curve.get("eye_closure")
     if closure:
-        x, closure_y = xy(float(closure["estimated_vdd_v"]), 0)
+        closure_vdd = float(closure["estimated_vdd_v"])
+        x, closure_y = xy(closure_vdd, 0)
         estimate_kind = "Extrapolated" if closure.get("extrapolated") else "Estimated"
         dash = "4 5" if closure.get("extrapolated") else "8 6"
         closure_text = f'{estimate_kind} eye-closure VDD {closure["estimated_vdd_v"]:.4f} V'
@@ -4903,10 +4931,16 @@ def estimate_vmin_curve_svg(curve: dict, width: int = 1280, height: int = 780) -
         closure_anchor = "end" if x > left + plot_w * .70 else "start"
         closure_label_x = x - 12 if closure_anchor == "end" else x + 12
         closure_left = closure_label_x - closure_width if closure_anchor == "end" else closure_label_x
-        parts += [f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#FF9500" stroke-width="3" stroke-dasharray="{dash}"/>',
-                  f'<rect x="{closure_left - 6:.1f}" y="{top + 8}" width="{closure_width + 12:.1f}" height="28" rx="6" fill="#FFF4DE" stroke="#F1D399"/>',
+        closure_inside = vdd_min <= closure_vdd <= vdd_max
+        if closure_inside:
+            parts.append(
+                f'<path d="M{x:.1f} {top} V{baseline_y}" stroke="#FF9500" '
+                f'stroke-width="3" stroke-dasharray="{dash}"/>')
+        else:
+            closure_left = left + 8
+        parts += [f'<rect x="{closure_left - 6:.1f}" y="{top + 8}" width="{closure_width + 12:.1f}" height="28" rx="6" fill="#FFF4DE" stroke="#F1D399"/>',
                   f'<text x="{closure_left + closure_width / 2:.1f}" y="{top+28}" text-anchor="middle" fill="#C56A00" font-size="16" font-weight="700">{closure_text}</text>']
-        if closure.get("extrapolated"):
+        if closure.get("extrapolated") and closure_inside:
             first_x, first_y = points[0]
             slope_note = f'Two-lowest-VDD slope: {closure["slope_mv_per_v"]:.2f} mV/V'
             slope_note_width = len(slope_note) * 7.6 + 16
@@ -4982,6 +5016,7 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
     # contain several Model VDD populations and must still produce Vmin curves.
     shmoo_only = (analysis.get("mode") == "shmoo_only" or
                    len(analysis.get("rows", [])) == 1)
+    shmoo_enabled = bool(analysis.get("shmoo_enabled", True))
     try:
         from reportlab.graphics import renderPM
         from svglib.svglib import svg2rlg
@@ -5082,7 +5117,7 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         writer = csv.DictWriter(stream, fieldnames=advisor_fields)
         writer.writeheader()
         writer.writerows(advisor_rows)
-    if not shmoo_only:
+    if not shmoo_only or not shmoo_enabled:
         with (out / "multi_chip_snm_summary_combined.csv").open(
                 "w", newline="", encoding="utf-8-sig") as stream:
             fields = ["vdd_v", "sample_count"] + [
@@ -5095,15 +5130,25 @@ def write_estimate_vmin_outputs(analysis: dict, out_dir: str | os.PathLike[str],
     backup_dir = out / "imported_multi_chip_summaries"; backup_dir.mkdir(exist_ok=True)
     for index, source in enumerate(source_paths, 1):
         source_path = Path(source); shutil.copy2(source_path, backup_dir / f"{index:02d}_{source_path.name}")
-    if shmoo_only:
+    if shmoo_only and shmoo_enabled:
         vdd_list = ", ".join(f'{float(row["vdd_v"]):.3f} V' for row in analysis["rows"])
         sections = (f'<section class="shmoo-only-notice"><h2>Shmoo-only mode</h2>'
                     f'<p>Analyzed Model VDD: {vdd_list}. This run was started from one source file '
                     'or contains only one VDD, so Estimate Vmin trends and eye-closure extrapolation '
                     'are omitted. Only same-VDD Shmoo screening and the Drive-to-Preferred Advisor are output.</p></section>'
                     + "".join(shmoo_sections))
+    elif shmoo_only:
+        vdd_list = ", ".join(
+            f'{float(row["vdd_v"]):.3f} V' for row in analysis["rows"])
+        sections = (f'<section class="shmoo-only-notice"><h2>Single-VDD fast mode</h2>'
+                    f'<p>Analyzed Model VDD: {vdd_list}. Shmoo was disabled and '
+                    'one voltage cannot form an Estimate Vmin trend. The imported '
+                    'minimum SNM and BL Write Margin remain in the CSV outputs.</p></section>')
     else:
-        sections = '<section id="stacked-trends"><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows) + "".join(shmoo_sections)
+        shmoo_notice = ("" if shmoo_enabled else
+                         '<section><h2>Fast curve mode</h2><p class="note">'
+                         'Shmoo and Drive Advisor were disabled for this run.</p></section>')
+        sections = shmoo_notice + '<section id="stacked-trends"><h2>Stacked VDD trends</h2><img src="images/05_estimate_vmin_stacked.png" alt="Stacked Estimate Vmin curves"><p class="note">PNG exports: <a href="images/05_estimate_vmin_stacked.png">white background</a> · <a href="images/05_estimate_vmin_stacked_transparent.png">transparent background</a></p></section>' + "".join(f'<section><h2>{analysis["curves"][key]["label"]}</h2><img src="images/{image}" alt="{key} Estimate Vmin curve"></section>' for key, image in image_rows) + "".join(shmoo_sections)
     report = out / "estimate_vmin_report.html"
     report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HV28 SRAM Estimate Vmin Curve</title>
 <style>
@@ -5379,7 +5424,8 @@ def write_write_trip_margin_outputs(analysis: dict,
     return report
 
 
-def _legacy_estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 1120) -> str:
+def _legacy_estimate_vmin_vertical_stacked_svg(
+        analysis: dict, width: int = 1280, height: int = 1120) -> str:
     """Aligned VDD trend panels, each retaining its own mV scale."""
     left, right, top, bottom = 125, 65, 92, 58
     panel_gap = 22
@@ -5417,6 +5463,25 @@ def _legacy_estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height:
 
 def estimate_vmin_stacked_svg(analysis: dict, width: int = 1280, height: int = 620,
                               transparent_background: bool = False) -> str:
+    """Render the same compact Multi-VDD format used by folder comparison."""
+    rows = [{"vdd_v": float(row["vdd_v"]),
+             "sample_count": int(row.get("sample_count", 1)),
+             **{key: float(row[key]) for key, *_ in _ESTIMATE_VMIN_METRICS}}
+            for row in analysis["rows"]]
+    lot_names = sorted({str(row.get(f"{key}_lot_wafer", "")).strip()
+                        for row in analysis["rows"]
+                        for key, *_ in _ESTIMATE_VMIN_METRICS
+                        if str(row.get(f"{key}_lot_wafer", "")).strip()})
+    label = lot_names[0] if len(lot_names) == 1 else "Multi-Cell conservative minimum"
+    dataset = {"lot_wafer": label, "rows": rows,
+               "color": "#007AFF", "sources": ["Estimate Vmin import"]}
+    return estimate_vmin_combined_comparison_svg(
+        [dataset], width, height, transparent_background)
+
+
+def _legacy_estimate_vmin_stacked_svg(analysis: dict, width: int = 1280,
+                                      height: int = 620,
+                                      transparent_background: bool = False) -> str:
     """Render SNM and BL write margin as two aligned side-by-side panels."""
     groups = (
         ("Read / Write SNM", ("rsnm_mv", "wsnm_mv"), "SNM (mV)"),
@@ -6852,6 +6917,44 @@ def multi_chip_vtc_svg(analysis: dict, mode: str, width: int = 1180, height: int
     return "".join(parts)
 
 
+def _multi_chip_summary_export_rows(analysis: dict) -> list[dict[str, object]]:
+    """Build the common per-Cell CSV rows for full and fast Multi-VDD runs."""
+    def family_average(row: dict, family: str, attribute: str) -> float:
+        cell = row["cell"]
+        return (float(getattr(getattr(cell, f"{family}1"), attribute)) +
+                float(getattr(getattr(cell, f"{family}2"), attribute))) / 2.0
+
+    def same_output_cell(left_row: dict, right_row: dict) -> bool:
+        return (str(left_row.get("lot_wafer", "")) ==
+                str(right_row.get("lot_wafer", "")) and
+                str(left_row.get("chip_id", "")) ==
+                str(right_row.get("chip_id", "")))
+
+    return [{"lot_wafer": row["lot_wafer"], "chip_id": row["chip_id"],
+             "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
+             "upper_rsnm_mv": row["upper_rsnm_mv"],
+             "lower_rsnm_mv": row["lower_rsnm_mv"],
+             "wsnm_mv": row["wsnm_mv"],
+             "write_margin_mv": row["write_margin_mv"],
+             "cell_ratio_beta": row["cell_ratio_beta"],
+             "pull_up_ratio_beta": row["pull_up_ratio_beta"],
+             "pu_vt_v": family_average(row, "pu", "vt"),
+             "pu_idsat_ua": family_average(row, "pu", "ids"),
+             "pg_vt_v": family_average(row, "pg", "vt"),
+             "pg_idsat_ua": family_average(row, "pg", "ids"),
+             "pd_vt_v": family_average(row, "pd", "vt"),
+             "pd_idsat_ua": family_average(row, "pd", "ids"),
+             "is_worst_rsnm": same_output_cell(row, analysis["worst_rsnm"]),
+             "is_worst_rsnm_upper": same_output_cell(
+                 row, analysis["worst_rsnm_upper"]),
+             "is_worst_rsnm_lower": same_output_cell(
+                 row, analysis["worst_rsnm_lower"]),
+             "is_worst_wsnm": same_output_cell(row, analysis["worst_wsnm"]),
+             "is_worst_write_margin": same_output_cell(
+                 row, analysis["worst_write_margin"])}
+            for row in analysis["rows"]]
+
+
 def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
                              input_excel_path: str | os.PathLike[str] | None = None) -> Path:
     """Export batch wafer VTC overlays, per-chip margin table and HTML summary."""
@@ -6865,6 +6968,22 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         # as a run-local audit backup.  The analysis always reads Vt in V and
         # Idsat in uA from its accepted 6T Multi-Cell sheet.
         shutil.copy2(source, out / backup_name)
+    export_rows = _multi_chip_summary_export_rows(analysis)
+    with open(out / "multi_chip_snm_summary.csv", "w", newline="",
+              encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(export_rows[0]))
+        writer.writeheader(); writer.writerows(export_rows)
+    if not analysis.get("shmoo_enabled", True):
+        body = "".join(
+            f'<tr><td>{html.escape(str(row["lot_wafer"]))}</td>'
+            f'<td>{html.escape(str(row["chip_id"]))}</td>'
+            f'<td>{float(row["rsnm_mv"]):.2f}</td>'
+            f'<td>{float(row["wsnm_mv"]):.2f}</td>'
+            f'<td>{float(row["write_margin_mv"]):.2f}</td></tr>'
+            for row in export_rows)
+        report = out / "multi_cell_wafer_report.html"
+        report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><title>HV28 SRAM Multi-Cell Summary</title><style>body{{font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f;margin:32px}}main{{max-width:1200px;margin:auto}}section{{background:#fff;border-radius:16px;padding:24px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #e5e5ea;text-align:right}}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){{text-align:left}}.note{{color:#6e6e73}}</style></head><body><main><h1>Multi-Cell VDD Summary</h1><p>Lot/Wafer: {html.escape(str(analysis["lot_wafer"]))} · Model VDD {float(analysis["vdd_v"]):.3f} V</p><section><h2>Fast curve mode</h2><p class="note">Shmoo and Drive Advisor were disabled. The per-Cell SNM and BL Write Margin results remain available in <code>multi_chip_snm_summary.csv</code>.</p><table><thead><tr><th>Lot/Wafer</th><th>Chip ID</th><th>RSNM (mV)</th><th>WSNM (mV)</th><th>BL Vtrip (mV)</th></tr></thead><tbody>{body}</tbody></table></section></main></body></html>''', encoding="utf-8")
+        return report
     try:
         from reportlab.graphics import renderPM
         from svglib.svglib import svg2rlg
@@ -6908,37 +7027,6 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
         writer.writeheader()
         for metric, statistics in relative_shmoo["distributions"].items():
             writer.writerow({"metric": metric, **statistics})
-    def family_average(row: dict, family: str, attribute: str) -> float:
-        cell = row["cell"]
-        return (float(getattr(getattr(cell, f"{family}1"), attribute)) +
-                float(getattr(getattr(cell, f"{family}2"), attribute))) / 2.0
-
-    def same_output_cell(left_row: dict, right_row: dict) -> bool:
-        return (str(left_row.get("lot_wafer", "")) ==
-                str(right_row.get("lot_wafer", "")) and
-                str(left_row.get("chip_id", "")) ==
-                str(right_row.get("chip_id", "")))
-
-    export_rows = [{"lot_wafer": row["lot_wafer"], "chip_id": row["chip_id"],
-                    "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
-                    "upper_rsnm_mv": row["upper_rsnm_mv"], "lower_rsnm_mv": row["lower_rsnm_mv"],
-                    "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
-                    "cell_ratio_beta": row["cell_ratio_beta"],
-                    "pull_up_ratio_beta": row["pull_up_ratio_beta"],
-                    "pu_vt_v": family_average(row, "pu", "vt"),
-                    "pu_idsat_ua": family_average(row, "pu", "ids"),
-                    "pg_vt_v": family_average(row, "pg", "vt"),
-                    "pg_idsat_ua": family_average(row, "pg", "ids"),
-                    "pd_vt_v": family_average(row, "pd", "vt"),
-                    "pd_idsat_ua": family_average(row, "pd", "ids"),
-                    "is_worst_rsnm": same_output_cell(row, analysis["worst_rsnm"]),
-                    "is_worst_rsnm_upper": same_output_cell(row, analysis["worst_rsnm_upper"]),
-                    "is_worst_rsnm_lower": same_output_cell(row, analysis["worst_rsnm_lower"]),
-                    "is_worst_wsnm": same_output_cell(row, analysis["worst_wsnm"]),
-                    "is_worst_write_margin": same_output_cell(row, analysis["worst_write_margin"])}
-                   for row in analysis["rows"]]
-    with open(out / "multi_chip_snm_summary.csv", "w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(export_rows[0])); writer.writeheader(); writer.writerows(export_rows)
     for name, shmoo in (("read", analysis["median_target_read_shmoo"]),
                          ("write", analysis["median_target_write_shmoo"])):
         with open(out / f"median_target_{name}_shmoo.csv", "w", newline="", encoding="utf-8-sig") as stream:
@@ -6989,7 +7077,8 @@ def write_multi_chip_outputs(analysis: dict, out_dir: str | os.PathLike[str],
 def process_multi_vdd_6t_excel(
         source_path: str | os.PathLike[str], cfg: Config,
         output_base: str | os.PathLike[str],
-        vdd_groups: list[dict[str, object]] | None = None) -> dict[str, object]:
+        vdd_groups: list[dict[str, object]] | None = None,
+        include_shmoo: bool = True) -> dict[str, object]:
     """Run per-sheet Multi-Cell analysis, then aggregate all VDDs into Vmin curves."""
     source = Path(source_path)
     groups = (vdd_groups if vdd_groups is not None else
@@ -7001,7 +7090,8 @@ def process_multi_vdd_6t_excel(
         chips = list(group["chips"])
         lot_wafers.update(chip.lot_wafer for chip in chips)
         model_config = replace(cfg, nominal_vdd=vdd, wat_vdd=vdd)
-        analysis = analyze_multi_chip_wafer(chips, model_config)
+        analysis = analyze_multi_chip_wafer(
+            chips, model_config, include_shmoo=include_shmoo)
         analysis["source_sheet_names"] = list(group["sheet_names"])
         analyses.append(analysis)
 
@@ -7020,7 +7110,8 @@ def process_multi_vdd_6t_excel(
             write_multi_chip_outputs(analysis, vdd_dir, source))
 
     source_rows = estimate_rows_from_multi_chip_analyses(analyses)
-    estimate_analysis = analyze_estimate_vmin_curves(source_rows)
+    estimate_analysis = analyze_estimate_vmin_curves(
+        source_rows, include_shmoo=include_shmoo)
     estimate_analysis["multi_vdd_excel"] = True
     estimate_analysis["per_vdd_output_count"] = len(analyses)
     estimate_analysis["source_sheets"] = [
@@ -8300,9 +8391,12 @@ def launch_gui() -> None:
 
     ttk.Label(curve_input_card, text="Multi-Cell Estimate Vmin", style="Section.TLabel").pack(anchor="w")
     ttk.Label(curve_input_card,
-              text="Select generated multi_chip_snm_summary.csv files or raw 6T Multi-Cell Excel workbooks (.xlsx/.xlsm). For one-step multi-VDD analysis, name Excel sheets by Model VDD (for example 0.90V, 0.80V). Each sheet receives a full Multi-Cell output folder before all VDDs are combined into W/R Estimate Vmin curves.",
+              text="Select generated multi_chip_snm_summary.csv files or raw 6T Multi-Cell Excel workbooks (.xlsx/.xlsm). For one-step multi-VDD analysis, name Excel sheets by Model VDD (for example 0.90V, 0.80V). Each sheet receives its own output folder before all VDDs are combined into W/R Estimate Vmin curves.",
               style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(2, 12))
     selected_summary_paths: list[str] = []
+    curve_run_shmoo = tk.BooleanVar(
+        value=bool(saved_state.get("options", {}).get(
+            "estimate_vmin_run_shmoo", False)))
     selected_summary_text = tk.StringVar(value="No Multi-Cell summary selected")
     tk.Label(curve_input_card, textvariable=selected_summary_text, bg=CARD, fg=SECONDARY,
              font=("Calibri", 10), anchor="w", justify="left", wraplength=560).pack(fill="x", pady=(0, 10))
@@ -8314,6 +8408,14 @@ def launch_gui() -> None:
         selected_summary_text.set(
             f"{len(selected_summary_paths)} previously selected summary file(s)\n" +
             "\n".join(Path(item).name for item in selected_summary_paths[:5]))
+    ttk.Checkbutton(
+        curve_input_card,
+        text="Run Shmoo analysis (slower)",
+        variable=curve_run_shmoo).pack(anchor="w", pady=(0, 4))
+    ttk.Label(
+        curve_input_card,
+        text="Off: calculate SNM / BL Write Margin curves only. On: also run per-VDD CR/PR Shmoo and Drive Advisor.",
+        style="Meta.TLabel", wraplength=560).pack(anchor="w", pady=(0, 10))
     comparison_summary_paths: list[str] = []
     saved_comparison_paths = saved_state.get("estimate_vmin_comparison_paths", [])
     if isinstance(saved_comparison_paths, list):
@@ -8348,6 +8450,11 @@ def launch_gui() -> None:
         if curve_result:
             if curve_result.get("mode") == "shmoo_only":
                 curve_summary.set("Single-VDD input: Shmoo and Advisor outputs only.")
+                return
+            if curve_result.get("mode") == "single_vdd":
+                curve_summary.set(
+                    "Single-VDD fast mode: summary data exported; enable Shmoo "
+                    "to generate drive-balance analysis.")
                 return
             if curve_kind.get() == "stacked":
                 curve_summary.set("Comparison view: Read/Write SNM and BL Write Margin versus Model VDD.")
@@ -8384,18 +8491,24 @@ def launch_gui() -> None:
             curve_canvas.create_text(width / 2, height / 2, text="Estimate Vmin curve will appear here",
                                      fill=SECONDARY, font=("Calibri", 13))
             return
-        if curve_result.get("mode") == "shmoo_only":
-            curve_title.set("Multi-Cell Shmoo Analysis")
+        if curve_result.get("mode") in {"shmoo_only", "single_vdd"}:
+            shmoo_enabled = curve_result.get("mode") == "shmoo_only"
+            curve_title.set("Multi-Cell Shmoo Analysis" if shmoo_enabled
+                            else "Multi-Cell Fast Analysis")
             vdds = [float(row["vdd_v"]) for row in curve_result["rows"]]
             vdd_text = (f"{vdds[0]:.3f} V" if len(vdds) == 1 else
                         f"{vdds[0]:.3f}–{vdds[-1]:.3f} V ({len(vdds)} points)")
             curve_canvas.create_text(
                 width / 2, height / 2 - 18,
-                text=f"Model VDD {vdd_text} · Shmoo-only output complete",
+                text=(f"Model VDD {vdd_text} · " +
+                      ("Shmoo output complete" if shmoo_enabled
+                       else "fast summary output complete")),
                 fill=TEXT, font=("Calibri", 16, "bold"))
             curve_canvas.create_text(
                 width / 2, height / 2 + 18,
-                text="Open HTML Result to inspect the CR/PR Shmoo and Drive-to-Preferred Advisor.",
+                text=("Open HTML Result to inspect the CR/PR Shmoo and Drive-to-Preferred Advisor."
+                      if shmoo_enabled else
+                      "Enable Run Shmoo analysis when CR/PR grading is required."),
                 fill=SECONDARY, font=("Calibri", 11))
             return
         if curve_kind.get() == "stacked":
@@ -8661,7 +8774,7 @@ def launch_gui() -> None:
         curve_status_label.configure(fg=SECONDARY)
 
     def curve_worker(summary_paths: list[str], out_path: Path, wafer_id: str,
-                     model_config: Config) -> None:
+                     model_config: Config, include_shmoo: bool) -> None:
         try:
             if len(summary_paths) == 1 and Path(summary_paths[0]).suffix.lower() in {".xlsx", ".xlsm"}:
                 vdd_groups = read_multi_chip_6t_excel_vdd_sheets(
@@ -8669,14 +8782,18 @@ def launch_gui() -> None:
                     allow_no_vdd_sheets=True)
                 if vdd_groups:
                     result = process_multi_vdd_6t_excel(
-                        summary_paths[0], model_config, out_path, vdd_groups)
+                        summary_paths[0], model_config, out_path, vdd_groups,
+                        include_shmoo=include_shmoo)
                     curve_result_queue.put(
                         (True, result["analysis"], result["report"]))
                     return
             source_rows = read_multi_chip_snm_summary(
-                summary_paths, model_config.nominal_vdd, model_config)
+                summary_paths, model_config.nominal_vdd, model_config,
+                include_shmoo=include_shmoo)
             analysis = analyze_estimate_vmin_curves(
-                source_rows, force_shmoo_only=len(summary_paths) == 1)
+                source_rows,
+                force_shmoo_only=len(summary_paths) == 1 and include_shmoo,
+                include_shmoo=include_shmoo)
             run_dir = create_run_output_dir(out_path, wafer_id, "estimate_vmin_curve")
             report = write_estimate_vmin_outputs(analysis, run_dir, summary_paths)
             curve_result_queue.put((True, analysis, report))
@@ -8781,6 +8898,10 @@ def launch_gui() -> None:
                 summary = (f'Shmoo-only analysis complete for {len(analysis["rows"])} '
                            'VDD point(s); Estimate Vmin curves were not generated.')
                 curve_summary_label.configure(fg=SECONDARY)
+            elif analysis.get("mode") == "single_vdd":
+                summary = ("Single-VDD fast analysis complete; summary exported "
+                           "without Shmoo analysis or an Estimate Vmin trend.")
+                curve_summary_label.configure(fg=SECONDARY)
             elif curve_kind.get() == "stacked":
                 summary = "Comparison view: Read/Write SNM and BL Write Margin versus Model VDD."
                 curve_summary_label.configure(fg=SECONDARY)
@@ -8806,7 +8927,7 @@ def launch_gui() -> None:
                     f"saved to {Path(payload).parent}")
             curve_status_label.configure(fg=GREEN)
             curve_open_button.state(["!disabled"])
-            if analysis.get("mode") == "shmoo_only":
+            if analysis.get("mode") in {"shmoo_only", "single_vdd"}:
                 curve_stacked_button.state(["disabled"])
                 curve_transparent_button.state(["disabled"])
             else:
@@ -8843,7 +8964,8 @@ def launch_gui() -> None:
         output_path = Path(values["out"].get())
         threading.Thread(target=curve_worker,
                          args=(list(selected_summary_paths), output_path, wafer_id,
-                               model_config), daemon=True).start()
+                               model_config, bool(curve_run_shmoo.get())),
+                         daemon=True).start()
         root.after(80, poll_curve_result)
 
     def open_curve_report() -> None:
@@ -9211,7 +9333,10 @@ def launch_gui() -> None:
             "values": {key: variable.get() for key, variable in values.items()},
             "wat": {key: variable.get() for key, variable in wat_values.items()},
             "targets": {key: variable.get() for key, variable in target_values.items()},
-            "options": {"use_wat_target_reference": use_wat_target_reference.get()},
+            "options": {
+                "use_wat_target_reference": use_wat_target_reference.get(),
+                "estimate_vmin_run_shmoo": curve_run_shmoo.get(),
+            },
             "numeric": {key: variable.get() for key, variable in numeric.items()},
             "assumptions": {key: variable.get() for key, variable in assumption_values.items()},
             "training": {key: variable.get() for key, variable in training_values.items()},

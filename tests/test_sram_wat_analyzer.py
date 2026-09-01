@@ -648,9 +648,12 @@ class AnalyzerTests(unittest.TestCase):
                              [.80, .90])
 
             result = process_multi_vdd_6t_excel(
-                path, Config(grid_points=101), root / "output", groups)
+                path, Config(grid_points=101), root / "output", groups,
+                include_shmoo=False)
             analysis = result["analysis"]
             self.assertEqual(analysis["mode"], "estimate_vmin")
+            self.assertFalse(analysis["shmoo_enabled"])
+            self.assertEqual(analysis["ratio_shmoos"], [])
             self.assertEqual([row["vdd_v"] for row in analysis["rows"]], [.80, .90])
             self.assertEqual(analysis["per_vdd_output_count"], 2)
             run_dir = result["run_dir"]
@@ -659,6 +662,8 @@ class AnalyzerTests(unittest.TestCase):
                 self.assertTrue((folder / "multi_cell_wafer_report.html").exists())
                 self.assertTrue((folder / f"imported_6t_vt_idsat_data_{vdd:.3f}V.xlsx").exists())
                 self.assertTrue((folder / "multi_chip_snm_summary.csv").exists())
+                self.assertFalse((folder / "images" /
+                                  "03_multi_cell_wafer_relative_shmoo.png").exists())
             estimate_dir = run_dir / "estimate_vmin"
             self.assertTrue((estimate_dir / "estimate_vmin_report.html").exists())
             self.assertTrue((estimate_dir / "multi_chip_snm_summary_combined.csv").exists())
@@ -691,14 +696,15 @@ class AnalyzerTests(unittest.TestCase):
         self.assertNotIn("WL Write Margin", stacked)
         self.assertIn("SNM (mV)", stacked)
         self.assertIn("Vtrip (mV)", stacked)
-        self.assertIn('class="curve-data-label"', stacked)
-        self.assertIn('>90.0 mV</text>', stacked)
+        self.assertIn('class="multi-lot-data-label"', stacked)
+        self.assertIn('0.40 V', stacked)
+        self.assertIn('10.0 mV</text>', stacked)
         self.assertIn('class="vertical-vdd-label"', stacked)
         self.assertIn('>0.50 V</text>', stacked)
-        self.assertIn('Left: Read / Write SNM', stacked)
+        self.assertIn('X range 0.400', stacked)
+        self.assertIn('0.800 V', stacked)
         self.assertEqual(stacked.count('>Model VDD (V)</text>'), 2)
-        self.assertEqual(stacked.count('class="measured-vdd-guide"'), 6)
-        self.assertIn('stroke="#8E8E93" stroke-width="1.4" stroke-dasharray="5 5"', stacked)
+        self.assertNotIn('class="measured-vdd-guide"', stacked)
         self.assertNotIn('data-extrapolated-to-zero="true"', stacked)
         self.assertNotIn("Largest RSNM slope:", stacked)
         transparent = estimate_vmin_stacked_svg(result, transparent_background=True)
@@ -850,9 +856,25 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual((closure["low_vdd_v"], closure["high_vdd_v"]), (.60, .80))
         svg = estimate_vmin_curve_svg(result["curves"]["rsnm_mv"])
         self.assertIn("Extrapolated eye-closure VDD 0.4000 V", svg)
-        self.assertIn("Two-lowest-VDD slope: 200.00 mV/V", svg)
-        self.assertIn('data-extrapolated-to-zero="true"', svg)
-        self.assertIn('stroke-dasharray="8 6"', svg)
+        # The estimate remains available as text/data, but the chart starts at
+        # the lowest measured VDD and no longer draws into the empty 0 V area.
+        self.assertNotIn('data-extrapolated-to-zero="true"', svg)
+        self.assertNotIn('stroke-dasharray="8 6"', svg)
+        self.assertIn('>0.60 V</text>', svg)
+
+    def test_estimate_vmin_fast_mode_skips_shmoo_calculation(self):
+        rows = []
+        for vdd, margin in ((.60, 40.0), (.80, 80.0)):
+            row = {"vdd_v": vdd, "sample_count": 1, "samples": []}
+            for key in ("rsnm_mv", "wsnm_mv", "write_margin_mv"):
+                row[key] = margin
+                row[f"{key}_chip_id"] = "C01"
+                row[f"{key}_lot_wafer"] = "W01"
+            rows.append(row)
+        result = analyze_estimate_vmin_curves(rows, include_shmoo=False)
+        self.assertEqual(result["mode"], "estimate_vmin")
+        self.assertFalse(result["shmoo_enabled"])
+        self.assertEqual(result["ratio_shmoos"], [])
 
     def test_estimate_vmin_rejects_nonpositive_low_vdd_slope(self):
         rows = []
