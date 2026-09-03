@@ -3179,6 +3179,9 @@ _ESTIMATE_VMIN_SAMPLE_FIELDS = {
     "lot_wafer", "chip_id", "rsnm_mv", "wsnm_mv", "write_margin_mv",
     "cell_ratio_beta", "pull_up_ratio_beta", "pu_vt_v", "pu_idsat_ua",
     "pg_vt_v", "pg_idsat_ua", "pd_vt_v", "pd_idsat_ua",
+    "pul_vt_v", "pul_idsat_ua", "pur_vt_v", "pur_idsat_ua",
+    "pgl_vt_v", "pgl_idsat_ua", "pgr_vt_v", "pgr_idsat_ua",
+    "pdl_vt_v", "pdl_idsat_ua", "pdr_vt_v", "pdr_idsat_ua",
 }
 
 
@@ -3305,9 +3308,13 @@ def read_multi_chip_snm_summary(
                     }
                     # Optional fields added by newer Multi-Cell exports. Keeping
                     # them optional preserves compatibility with legacy summaries.
-                    for field in ("cell_ratio_beta", "pull_up_ratio_beta",
-                                  "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
-                                  "pd_vt_v", "pd_idsat_ua"):
+                    for field in (
+                            "cell_ratio_beta", "pull_up_ratio_beta",
+                            "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
+                            "pd_vt_v", "pd_idsat_ua",
+                            "pul_vt_v", "pul_idsat_ua", "pur_vt_v", "pur_idsat_ua",
+                            "pgl_vt_v", "pgl_idsat_ua", "pgr_vt_v", "pgr_idsat_ua",
+                            "pdl_vt_v", "pdl_idsat_ua", "pdr_vt_v", "pdr_idsat_ua"):
                         if raw.get(field) not in (None, ""):
                             try:
                                 sample[field] = float(raw[field])
@@ -4449,59 +4456,16 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
             voltage = vdd_min + vdd_span * vdd_step / 5
             x, _y = xy(voltage, 0)
             parts.append(f'<path d="M{x:.1f} {panel_top}V{panel_bottom}" stroke="#F1F1F4"/>')
-        all_points = [xy(float(row["vdd_v"]), float(row[key]))
-                      for dataset in datasets for key, _prefix, _dash in series_specs
-                      for row in dataset["rows"]]
-        label_requests: list[tuple[float, float, str]] = []
-        label_metadata: list[tuple[dict[str, object], dict[str, object], str, float, float]] = []
         measured_voltages: set[float] = set()
         for dataset in datasets:
             for key, prefix, dash in series_specs:
                 points = [xy(float(row["vdd_v"]), float(row[key])) for row in dataset["rows"]]
-                dataset_vdds = [float(row["vdd_v"]) for row in dataset["rows"]]
-                labelled_vdds = {min(dataset_vdds)}
                 dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
                 parts.append(f'<polyline points="{" ".join(f"{x:.1f},{y:.1f}" for x, y in points)}" fill="none" stroke="{dataset["color"]}" stroke-width="3"{dash_attr}/>')
                 for row, (x, y) in zip(dataset["rows"], points):
                     voltage = float(row["vdd_v"])
                     measured_voltages.add(voltage)
                     parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#FFF" stroke="{dataset["color"]}" stroke-width="2"/>')
-                    if voltage in labelled_vdds:
-                        lot_prefix = (f'{dataset["lot_wafer"]} · '
-                                      if len(datasets) > 1 else '')
-                        label_requests.append(
-                            (x, y, f'{lot_prefix}{voltage:.2f} V · '
-                             f'{float(row[key]):.1f} mV'))
-                        label_metadata.append((dataset, row, key, x, y))
-        label_bounds = (
-            panel_left + 5, panel_top + 5,
-            panel_left + plot_w - 5, panel_bottom - 5)
-        placed_labels = (
-            _place_endpoint_label_columns(label_requests, label_bounds, 11.0)
-            if len(datasets) > 1 else
-            _place_chart_labels(label_requests, all_points, label_bounds, 11.0))
-        for (label_x, label_y, anchor), (dataset, row, metric_key, point_x, point_y) in zip(
-                placed_labels, label_metadata):
-            lot_prefix = (f'{dataset["lot_wafer"]} · '
-                          if len(datasets) > 1 else '')
-            label = (f'{lot_prefix}{float(row["vdd_v"]):.2f} V · '
-                     f'{float(row[metric_key]):.1f} mV')
-            label_width = max(92.0, len(label) * 6.2 + 12.0)
-            if anchor == "middle":
-                label_left = label_x - label_width / 2
-            elif anchor == "end":
-                label_left = label_x - label_width
-            else:
-                label_left = label_x
-            label_center = label_left + label_width / 2
-            parts += [
-                f'<rect class="multi-lot-data-label-bg" x="{label_left:.1f}" '
-                f'y="{label_y-15:.1f}" width="{label_width:.1f}" height="20" rx="5" '
-                f'fill="#F2F7FF" stroke="{dataset["color"]}" stroke-opacity=".35"/>',
-                f'<text class="multi-lot-data-label" x="{label_center:.1f}" '
-                f'y="{label_y:.1f}" text-anchor="middle" fill="{dataset["color"]}" '
-                f'font-size="11" font-weight="700">{html.escape(label)}</text>',
-            ]
         for voltage in sorted(measured_voltages):
             x, _y = xy(voltage, 0)
             parts += [
@@ -4517,6 +4481,215 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
     return "".join(parts)
 
 
+_COMPARISON_WORST_METRICS = (
+    ("rsnm_mv", "Read SNM"),
+    ("wsnm_mv", "Write SNM"),
+    ("write_margin_mv", "BL Write Margin"),
+)
+_SIX_MOS_NAMES = ("pul", "pur", "pgl", "pgr", "pdl", "pdr")
+
+
+def _comparison_row_samples(dataset: dict[str, object],
+                            row: dict[str, object]) -> list[dict[str, object]]:
+    """Return full per-cell samples, with a reduced-row compatibility fallback."""
+    samples = [dict(item) for item in row.get("samples", [])]
+    if samples:
+        return samples
+    fallback = dict(row)
+    fallback.setdefault("lot_wafer", dataset.get("lot_wafer", "Wafer"))
+    fallback.setdefault("chip_id", "Unavailable")
+    return [fallback]
+
+
+def _comparison_sample_value(sample: dict[str, object], key: str) -> float | None:
+    """Read one metric, falling back from side-specific to family-average WAT."""
+    value = sample.get(key)
+    if value not in (None, ""):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    if key[:3] in _SIX_MOS_NAMES:
+        family = key[:2]
+        fallback_key = f'{family}_{key.split("_", 1)[1]}'
+        value = sample.get(fallback_key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def estimate_vmin_comparison_worst_rows(
+        datasets: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Select the limiting Cell for every source, VDD and comparison metric."""
+    records: list[dict[str, object]] = []
+    for dataset in datasets:
+        for row in dataset["rows"]:
+            samples = _comparison_row_samples(dataset, row)
+            for metric_key, metric_label in _COMPARISON_WORST_METRICS:
+                valid = [(sample, _comparison_sample_value(sample, metric_key))
+                         for sample in samples]
+                valid = [(sample, value) for sample, value in valid
+                         if value is not None]
+                if not valid:
+                    continue
+                sample, margin = min(valid, key=lambda item: item[1])
+                record: dict[str, object] = {
+                    "source": str(dataset["lot_wafer"]),
+                    "vdd_v": float(row["vdd_v"]),
+                    "metric": metric_label,
+                    "metric_key": metric_key,
+                    "margin_mv": float(margin),
+                    "lot_wafer": str(sample.get(
+                        "lot_wafer", dataset["lot_wafer"])),
+                    "chip_id": str(sample.get(
+                        "chip_id", row.get(f"{metric_key}_chip_id", "Unavailable"))),
+                    "raw_6t_available": all(
+                        sample.get(f"{device}_{quantity}") not in (None, "")
+                        for device in _SIX_MOS_NAMES
+                        for quantity in ("vt_v", "idsat_ua")),
+                }
+                for key in ("cell_ratio_beta", "pull_up_ratio_beta",
+                            "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
+                            "pd_vt_v", "pd_idsat_ua"):
+                    record[key] = _comparison_sample_value(sample, key)
+                for device in _SIX_MOS_NAMES:
+                    record[f"{device}_vt_v"] = _comparison_sample_value(
+                        sample, f"{device}_vt_v")
+                    record[f"{device}_idsat_ua"] = _comparison_sample_value(
+                        sample, f"{device}_idsat_ua")
+                records.append(record)
+    return records
+
+
+def estimate_vmin_distribution_boxplots_svg(
+        datasets: list[dict[str, object]],
+        metrics: tuple[tuple[str, str, str, str], ...],
+        title: str, width: int = 1500, panel_height: int = 350) -> str:
+    """Render VDD-grouped Tukey box plots from per-cell comparison samples."""
+    vdds = sorted({float(row["vdd_v"])
+                   for dataset in datasets for row in dataset["rows"]})
+    column_count = 2
+    row_count = max(1, math.ceil(len(metrics) / column_count))
+    height = 105 + row_count * panel_height + 45
+    left, right, gap_x = 95.0, 45.0, 75.0
+    panel_w = (width - left - right - gap_x) / column_count
+    plot_top_offset, plot_bottom_offset = 48.0, 62.0
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+        'style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        f'<text x="56" y="46" fill="#1D1D1F" font-size="34" font-weight="700">'
+        f'{html.escape(title)}</text>',
+        '<text x="56" y="74" fill="#6E6E73" font-size="15">'
+        'All imported sources are pooled within each VDD · Box = Q1–Q3 · median line · Tukey 1.5×IQR whiskers · circles = outliers</text>',
+    ]
+    for metric_index, (key, label, unit, color) in enumerate(metrics):
+        panel_column = metric_index % column_count
+        panel_row = metric_index // column_count
+        panel_left = left + panel_column * (panel_w + gap_x)
+        panel_top = 105 + panel_row * panel_height
+        plot_top = panel_top + plot_top_offset
+        plot_bottom = panel_top + panel_height - plot_bottom_offset
+        plot_h = plot_bottom - plot_top
+        grouped: dict[float, list[float]] = {vdd: [] for vdd in vdds}
+        for dataset in datasets:
+            for row in dataset["rows"]:
+                vdd = float(row["vdd_v"])
+                for sample in _comparison_row_samples(dataset, row):
+                    value = _comparison_sample_value(sample, key)
+                    if value is not None and math.isfinite(value):
+                        grouped[vdd].append(value)
+        all_values = [value for values in grouped.values() for value in values]
+        parts += [
+            f'<text x="{panel_left:.1f}" y="{panel_top+22:.1f}" fill="#1D1D1F" '
+            f'font-size="20" font-weight="700">{html.escape(label)}</text>',
+        ]
+        if not all_values:
+            parts.append(
+                f'<text x="{panel_left+panel_w/2:.1f}" y="{plot_top+plot_h/2:.1f}" '
+                'text-anchor="middle" fill="#8E8E93" font-size="16">Raw per-cell data unavailable</text>')
+            continue
+        value_min, value_max = min(all_values), max(all_values)
+        span = max(value_max - value_min, abs(value_max) * .08, 1e-6)
+        y_min = min(0.0, value_min - span * .10)
+        y_max = value_max + span * .12
+        if y_max <= y_min:
+            y_max = y_min + 1.0
+
+        def y_of(value: float) -> float:
+            return plot_top + (y_max - value) / (y_max - y_min) * plot_h
+
+        parts.append(
+            f'<rect x="{panel_left:.1f}" y="{plot_top:.1f}" width="{panel_w:.1f}" '
+            f'height="{plot_h:.1f}" fill="#FFFFFF" stroke="#D8DDE3"/>')
+        for step in range(5):
+            value = y_min + (y_max - y_min) * step / 4
+            y = y_of(value)
+            parts += [
+                f'<path d="M{panel_left:.1f} {y:.1f}H{panel_left+panel_w:.1f}" '
+                'stroke="#E5E5EA"/>',
+                f'<text x="{panel_left-10:.1f}" y="{y+4:.1f}" text-anchor="end" '
+                f'fill="#6E6E73" font-size="12">{value:.2f}</text>',
+            ]
+        category_w = panel_w / max(len(vdds), 1)
+        box_w = min(38.0, category_w * .48)
+        for vdd_index, vdd in enumerate(vdds):
+            x = panel_left + category_w * (vdd_index + .5)
+            values = grouped[vdd]
+            parts.append(
+                f'<text x="{x:.1f}" y="{plot_bottom+21:.1f}" text-anchor="middle" '
+                f'fill="#3A3A3C" font-size="12" font-weight="700">{vdd:.2f} V</text>')
+            if not values:
+                continue
+            stats = _tukey_box(values)
+            y_low = y_of(float(stats["whisker_low"]))
+            y_high = y_of(float(stats["whisker_high"]))
+            y_q1 = y_of(float(stats["q1"]))
+            y_q3 = y_of(float(stats["q3"]))
+            y_median = y_of(float(stats["median"]))
+            median_digits = 3 if key in {
+                "cell_ratio_beta", "pull_up_ratio_beta"} else 1
+            median_text = f'{float(stats["median"]):.{median_digits}f}'
+            parts += [
+                f'<path d="M{x:.1f} {y_high:.1f}V{y_low:.1f}" stroke="#4A4A4A" stroke-width="1.5"/>',
+                f'<path d="M{x-box_w*.28:.1f} {y_high:.1f}H{x+box_w*.28:.1f} '
+                f'M{x-box_w*.28:.1f} {y_low:.1f}H{x+box_w*.28:.1f}" '
+                'stroke="#4A4A4A" stroke-width="1.5"/>',
+                f'<rect x="{x-box_w/2:.1f}" y="{min(y_q1,y_q3):.1f}" width="{box_w:.1f}" '
+                f'height="{max(abs(y_q1-y_q3),1.5):.1f}" fill="{color}" fill-opacity=".18" '
+                f'stroke="{color}" stroke-width="2"/>',
+                f'<path d="M{x-box_w/2:.1f} {y_median:.1f}H{x+box_w/2:.1f}" '
+                f'stroke="{color}" stroke-width="3"/>',
+                f'<text class="boxplot-median-label" x="{x:.1f}" '
+                f'y="{y_median-6:.1f}" text-anchor="middle" fill="#1D1D1F" '
+                f'font-size="11" font-weight="700" '
+                f'style="paint-order:stroke;stroke:#FFFFFF;stroke-width:4">'
+                f'{median_text}</text>',
+                f'<text x="{x:.1f}" y="{plot_bottom+39:.1f}" text-anchor="middle" '
+                f'fill="#8E8E93" font-size="10">N={len(values)}</text>',
+            ]
+            for outlier_index, value in enumerate(stats["outliers"]):
+                jitter = ((outlier_index % 5) - 2) * min(2.5, box_w / 12)
+                parts.append(
+                    f'<circle cx="{x+jitter:.1f}" cy="{y_of(float(value)):.1f}" r="2.6" '
+                    f'fill="#FFFFFF" stroke="{color}" stroke-width="1.4"/>')
+        axis_x = panel_left - 63
+        center_y = plot_top + plot_h / 2
+        parts += [
+            f'<text x="{axis_x:.1f}" y="{center_y:.1f}" '
+            f'transform="rotate(-90 {axis_x:.1f} {center_y:.1f})" text-anchor="middle" '
+            f'fill="#1D1D1F" font-size="15" font-weight="700">{html.escape(unit)}</text>',
+            f'<text x="{panel_left+panel_w/2:.1f}" y="{panel_top+panel_height-5:.1f}" '
+            'text-anchor="middle" fill="#1D1D1F" font-size="15" '
+            'font-weight="700">Model VDD (V)</text>',
+        ]
+    parts.append('</svg>')
+    return "".join(parts)
+
+
 def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, object]],
                                           out_dir: str | os.PathLike[str]) -> Path:
     """Export the Multi-VDD SNM / BL-margin comparison as HTML, SVG, PNG and CSV."""
@@ -4525,6 +4698,10 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
     png_path = image_dir / "01_estimate_vmin_combined_comparison.png"
     transparent_svg_path = image_dir / "01_estimate_vmin_combined_comparison_transparent.svg"
     transparent_png_path = image_dir / "01_estimate_vmin_combined_comparison_transparent.png"
+    distribution_svg_path = image_dir / "02_vdd_margin_ratio_boxplots.svg"
+    distribution_png_path = image_dir / "02_vdd_margin_ratio_boxplots.png"
+    idsat_svg_path = image_dir / "03_vdd_6t_idsat_boxplots.svg"
+    idsat_png_path = image_dir / "03_vdd_6t_idsat_boxplots.png"
     svg_path.write_text(estimate_vmin_combined_comparison_svg(datasets), encoding="utf-8")
     transparent_svg_path.write_text(
         estimate_vmin_combined_comparison_svg(datasets, transparent_background=True),
@@ -4544,6 +4721,77 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
     renderPM.drawToFile(
         transparent_drawing, str(transparent_png_path), fmt="PNG", dpi=180,
         bg=None, backend="rlPyCairo", backendFmt="RGBA")
+    distribution_metrics = (
+        ("rsnm_mv", "Read SNM distribution", "RSNM (mV)", "#007AFF"),
+        ("write_margin_mv", "BL Write Margin distribution", "Vtrip (mV)", "#007AFF"),
+        ("cell_ratio_beta", "Cell Ratio distribution", "CR = MOSdrive(PD) / MOSdrive(PG)", "#007AFF"),
+        ("pull_up_ratio_beta", "Pull-up Ratio distribution", "PR = MOSdrive(PG) / MOSdrive(PU)", "#007AFF"),
+    )
+    distribution_svg_path.write_text(
+        estimate_vmin_distribution_boxplots_svg(
+            datasets, distribution_metrics,
+            "Per-Cell Margin and Drive-Ratio Distributions by Model VDD"),
+        encoding="utf-8")
+    distribution_drawing = svg2rlg(str(distribution_svg_path))
+    if distribution_drawing is None:
+        raise RuntimeError("Could not render VDD margin / ratio box plots")
+    renderPM.drawToFile(
+        distribution_drawing, str(distribution_png_path), fmt="PNG", dpi=180,
+        backend="rlPyCairo")
+    idsat_metrics = (
+        ("pul_idsat_ua", "PUL Idsat", "Idsat (µA)", "#D92D55"),
+        ("pur_idsat_ua", "PUR Idsat", "Idsat (µA)", "#D92D55"),
+        ("pgl_idsat_ua", "PGL Idsat", "Idsat (µA)", "#008F5D"),
+        ("pgr_idsat_ua", "PGR Idsat", "Idsat (µA)", "#008F5D"),
+        ("pdl_idsat_ua", "PDL Idsat", "Idsat (µA)", "#007AFF"),
+        ("pdr_idsat_ua", "PDR Idsat", "Idsat (µA)", "#007AFF"),
+    )
+    idsat_svg_path.write_text(
+        estimate_vmin_distribution_boxplots_svg(
+            datasets, idsat_metrics,
+            "Six-MOS Idsat Distributions by Model VDD", panel_height=315),
+        encoding="utf-8")
+    idsat_drawing = svg2rlg(str(idsat_svg_path))
+    if idsat_drawing is None:
+        raise RuntimeError("Could not render six-MOS Idsat box plots")
+    renderPM.drawToFile(
+        idsat_drawing, str(idsat_png_path), fmt="PNG", dpi=180,
+        backend="rlPyCairo")
+    statistic_fields = [
+        "metric", "label", "unit", "vdd_v", "count", "minimum",
+        "q1", "median", "q3", "maximum", "whisker_low", "whisker_high",
+        "mean", "outlier_count",
+    ]
+    with (out / "estimate_vmin_boxplot_statistics.csv").open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=statistic_fields)
+        writer.writeheader()
+        for key, label, unit, _color in distribution_metrics + idsat_metrics:
+            for vdd in sorted({float(row["vdd_v"])
+                               for dataset in datasets for row in dataset["rows"]}):
+                values = []
+                for dataset in datasets:
+                    for row in dataset["rows"]:
+                        if abs(float(row["vdd_v"]) - vdd) > 1e-12:
+                            continue
+                        for sample in _comparison_row_samples(dataset, row):
+                            value = _comparison_sample_value(sample, key)
+                            if value is not None and math.isfinite(value):
+                                values.append(value)
+                if not values:
+                    continue
+                stats = _tukey_box(values)
+                writer.writerow({
+                    "metric": key, "label": label, "unit": unit,
+                    "vdd_v": vdd, "count": stats["count"],
+                    "minimum": stats["minimum"], "q1": stats["q1"],
+                    "median": stats["median"], "q3": stats["q3"],
+                    "maximum": stats["maximum"],
+                    "whisker_low": stats["whisker_low"],
+                    "whisker_high": stats["whisker_high"],
+                    "mean": stats["mean"],
+                    "outlier_count": len(stats["outliers"]),
+                })
     fields = ["lot_wafer", "vdd_v", "sample_count", "rsnm_mv", "wsnm_mv", "write_margin_mv", "source_files"]
     with (out / "estimate_vmin_combined_comparison.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader()
@@ -4553,8 +4801,65 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
                                  "sample_count": row["sample_count"], "rsnm_mv": row["rsnm_mv"],
                                  "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
                                  "source_files": " | ".join(dataset["sources"])})
+    worst_rows = estimate_vmin_comparison_worst_rows(datasets)
+    worst_fields = [
+        "source", "vdd_v", "metric", "margin_mv", "lot_wafer", "chip_id",
+        "cell_ratio_beta", "pull_up_ratio_beta", "raw_6t_available",
+    ] + [f"{device}_{quantity}" for device in _SIX_MOS_NAMES
+         for quantity in ("vt_v", "idsat_ua")]
+    with (out / "estimate_vmin_worst_cell_details.csv").open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=worst_fields)
+        writer.writeheader()
+        writer.writerows({key: row.get(key, "") for key in worst_fields}
+                         for row in worst_rows)
+    sample_fields = [
+        "source", "vdd_v", "lot_wafer", "chip_id", "rsnm_mv", "wsnm_mv",
+        "write_margin_mv", "cell_ratio_beta", "pull_up_ratio_beta",
+        "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
+        "pd_vt_v", "pd_idsat_ua",
+    ] + [f"{device}_{quantity}" for device in _SIX_MOS_NAMES
+         for quantity in ("vt_v", "idsat_ua")]
+    with (out / "estimate_vmin_comparison_per_cell_data.csv").open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=sample_fields)
+        writer.writeheader()
+        for dataset in datasets:
+            for row in dataset["rows"]:
+                for sample in _comparison_row_samples(dataset, row):
+                    record = {"source": dataset["lot_wafer"],
+                              "vdd_v": row["vdd_v"], **sample}
+                    writer.writerow({key: record.get(key, "")
+                                     for key in sample_fields})
+    def cell_text(value: object, digits: int = 4) -> str:
+        if value in (None, ""):
+            return "—"
+        try:
+            return f"{float(value):.{digits}f}"
+        except (TypeError, ValueError):
+            return html.escape(str(value))
+
+    worst_table_rows = "".join(
+        '<tr>'
+        f'<td>{html.escape(str(row["source"]))}</td>'
+        f'<td>{float(row["vdd_v"]):.3f}</td>'
+        f'<td>{html.escape(str(row["metric"]))}</td>'
+        f'<td>{float(row["margin_mv"]):.2f}</td>'
+        f'<td>{html.escape(str(row["lot_wafer"]))}</td>'
+        f'<td>{html.escape(str(row["chip_id"]))}</td>'
+        f'<td>{cell_text(row.get("cell_ratio_beta"), 3)}</td>'
+        f'<td>{cell_text(row.get("pull_up_ratio_beta"), 3)}</td>'
+        + ''.join(
+            f'<td>{cell_text(row.get(f"{device}_vt_v"))} / '
+            f'{cell_text(row.get(f"{device}_idsat_ua"), 3)}</td>'
+            for device in _SIX_MOS_NAMES)
+        + f'<td>{"6T raw" if row.get("raw_6t_available") else "family-average fallback"}</td>'
+        '</tr>' for row in worst_rows)
+    device_headers = "".join(
+        f'<th>{device.upper()}<br><small>Vt (V) / Idsat (µA)</small></th>'
+        for device in _SIX_MOS_NAMES)
     report = out / "estimate_vmin_combined_comparison.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estimate Vmin Combined Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1650px;margin:auto}}h1,.note,.downloads{{text-align:center}}section{{background:#fff;padding:22px;border-radius:16px}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}</style></head><body><main><h1>Estimate Vmin Curves - Comparison View</h1><p class="note">Compared summaries: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}</p><section><img src="images/{png_path.name}" alt="Estimate Vmin combined summary comparison"></section><p class="downloads">Original: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a>　 Transparent background: <a href="images/{transparent_svg_path.name}">SVG</a> · <a href="images/{transparent_png_path.name}">PNG</a>　 Data: <a href="estimate_vmin_combined_comparison.csv">CSV</a></p></main></body></html>''', encoding="utf-8")
+    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estimate Vmin Combined Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1750px;margin:auto}}h1{{margin-bottom:4px}}section{{background:#fff;padding:22px;border-radius:16px;margin:18px 0}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}.table-wrap{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;min-width:1650px;font-variant-numeric:tabular-nums}}th,td{{padding:9px 10px;border-bottom:1px solid #e5e5ea;text-align:right;white-space:nowrap}}th{{position:sticky;top:0;background:#f8f8fa;color:#3a3a3c}}th:first-child,td:first-child,th:nth-child(3),td:nth-child(3),th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){{text-align:left}}small{{color:#6e6e73;font-weight:400}}</style></head><body><main><h1>Estimate Vmin Curves - Comparison View</h1><p class="note">Compared summaries: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}. Point labels are moved to the table below to keep dense curves readable.</p><section><h2>W/R Estimate Vmin trends</h2><img src="images/{png_path.name}" alt="Estimate Vmin combined summary comparison"><p class="downloads">Original: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a>　 Transparent background: <a href="images/{transparent_svg_path.name}">SVG</a> · <a href="images/{transparent_png_path.name}">PNG</a>　 Trend data: <a href="estimate_vmin_combined_comparison.csv">CSV</a></p></section><section><h2>Worst Cell at each Model VDD</h2><p class="note">One limiting Cell is listed for Read SNM, Write SNM and BL Write Margin at every source/VDD. New Multi-Cell summaries contain side-specific six-MOS WAT data; legacy summaries fall back to PU/PG/PD family averages.</p><div class="table-wrap"><table><thead><tr><th>Source</th><th>VDD (V)</th><th>Limit</th><th>Margin (mV)</th><th>Lot/Wafer</th><th>Cell/Chip</th><th>CR</th><th>PR</th>{device_headers}<th>Data detail</th></tr></thead><tbody>{worst_table_rows}</tbody></table></div><p class="downloads"><a href="estimate_vmin_worst_cell_details.csv">Download worst-Cell details</a> · <a href="estimate_vmin_comparison_per_cell_data.csv">Download per-Cell comparison data</a></p></section><section><h2>Margin and CR/PR distributions</h2><p class="note">All selected Lot/Wafer sources are pooled within each Model VDD; compare median, IQR and outliers rather than only the limiting Cell.</p><img src="images/{distribution_png_path.name}" alt="Per-cell margin and drive ratio box plots"><p class="downloads"><a href="images/{distribution_svg_path.name}">SVG</a> · <a href="images/{distribution_png_path.name}">PNG</a> · <a href="estimate_vmin_boxplot_statistics.csv">Box statistics CSV</a></p></section><section><h2>Six-MOS Idsat distributions</h2><p class="note">Side-specific PUL/PUR/PGL/PGR/PDL/PDR Idsat is retained when available. Legacy files use family-average fallback and are identified in the worst-Cell table.</p><img src="images/{idsat_png_path.name}" alt="Six-MOS Idsat box plots by VDD"><p class="downloads"><a href="images/{idsat_svg_path.name}">SVG</a> · <a href="images/{idsat_png_path.name}">PNG</a></p></section></main></body></html>''', encoding="utf-8")
     return report
 
 
@@ -6930,6 +7235,16 @@ def _multi_chip_summary_export_rows(analysis: dict) -> list[dict[str, object]]:
                 str(left_row.get("chip_id", "")) ==
                 str(right_row.get("chip_id", "")))
 
+    def device_idsat(row: dict, label: str, field: str) -> float:
+        raw_value = row.get("raw_idsat_ua", {}).get(label)
+        return (float(raw_value) if raw_value is not None
+                else float(getattr(row["cell"], field).ids))
+
+    device_map = {
+        "pul": "pu1", "pur": "pu2", "pgl": "pg1",
+        "pgr": "pg2", "pdl": "pd1", "pdr": "pd2",
+    }
+
     return [{"lot_wafer": row["lot_wafer"], "chip_id": row["chip_id"],
              "model_vdd_v": analysis["vdd_v"], "rsnm_mv": row["rsnm_mv"],
              "upper_rsnm_mv": row["upper_rsnm_mv"],
@@ -6944,6 +7259,10 @@ def _multi_chip_summary_export_rows(analysis: dict) -> list[dict[str, object]]:
              "pg_idsat_ua": family_average(row, "pg", "ids"),
              "pd_vt_v": family_average(row, "pd", "vt"),
              "pd_idsat_ua": family_average(row, "pd", "ids"),
+             **{f"{label}_vt_v": float(getattr(row["cell"], field).vt)
+                for label, field in device_map.items()},
+             **{f"{label}_idsat_ua": device_idsat(row, label, field)
+                for label, field in device_map.items()},
              "is_worst_rsnm": same_output_cell(row, analysis["worst_rsnm"]),
              "is_worst_rsnm_upper": same_output_cell(
                  row, analysis["worst_rsnm_upper"]),

@@ -10,7 +10,7 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_combined_comparison_svg, estimate_vmin_curve_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_combined_files,
+    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_combined_comparison_svg, estimate_vmin_comparison_worst_rows, estimate_vmin_curve_svg, estimate_vmin_distribution_boxplots_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_combined_files,
     analyze_write_trip_margin_curve,
     analyze_lot_wafer_drive_advisor,
     build_batch_drive_to_preferred_advice, build_drive_to_preferred_advice,
@@ -27,7 +27,8 @@ from sram_wat_analyzer import (
     process_multi_vdd_6t_excel, write_iv_curve_excel_template,
     write_multi_chip_6t_excel_template, write_multi_chip_outputs, write_outputs,
     write_rsnm_vcc_curve_outputs, write_single_6t_wat_excel,
-    write_estimate_vmin_outputs, write_lot_wafer_drive_advisor_outputs,
+    write_estimate_vmin_combined_comparison_outputs, write_estimate_vmin_outputs,
+    write_lot_wafer_drive_advisor_outputs,
     write_trip_margin_curve_svg, write_write_trip_margin_outputs,
 )
 
@@ -571,6 +572,9 @@ class AnalyzerTests(unittest.TestCase):
                 summary_rows = list(csv.DictReader(stream))
             self.assertEqual([row["lot_wafer"] for row in summary_rows],
                              ["DEMO28_TT_W01", "DEMO28_TT_W02"])
+            self.assertIn("pul_vt_v", summary_rows[0])
+            self.assertIn("pdr_idsat_ua", summary_rows[0])
+            self.assertAlmostEqual(float(summary_rows[0]["pul_idsat_ua"]), -44.0)
             self.assertIn("Minimum RSNM source 6T WAT values",
                           (report.parent / "images" / "01_multi_chip_read_vtc.svg").read_text(encoding="utf-8"))
             self.assertIn(">-44.00</text>",
@@ -696,9 +700,8 @@ class AnalyzerTests(unittest.TestCase):
         self.assertNotIn("WL Write Margin", stacked)
         self.assertIn("SNM (mV)", stacked)
         self.assertIn("Vtrip (mV)", stacked)
-        self.assertIn('class="multi-lot-data-label"', stacked)
+        self.assertNotIn('class="multi-lot-data-label"', stacked)
         self.assertIn('0.40 V', stacked)
-        self.assertIn('10.0 mV</text>', stacked)
         self.assertIn('class="vertical-vdd-label"', stacked)
         self.assertIn('>0.50 V</text>', stacked)
         self.assertIn('X range 0.400', stacked)
@@ -748,17 +751,11 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("Read SNM", svg)
             self.assertIn("Write SNM", svg)
             self.assertIn("BL Write Margin", svg)
-            self.assertIn('class="multi-lot-data-label"', svg)
+            self.assertNotIn('class="multi-lot-data-label"', svg)
             self.assertIn('<text x="56" y="46" fill="#1D1D1F" font-size="34"', svg)
             self.assertEqual(svg.count('y="156.0" fill="#1D1D1F" font-size="20"'), 2)
             self.assertEqual(svg.count('>Model VDD (V)</text>'), 2)
-            self.assertIn('class="multi-lot-data-label-bg"', svg)
-            self.assertIn('fill="#F2F7FF"', svg)
-            self.assertRegex(
-                svg, r'class="multi-lot-data-label"[^>]+text-anchor="middle"')
-            self.assertNotRegex(
-                svg, r'class="multi-lot-data-label"[^>]+text-anchor="(?:start|end)"')
-            self.assertIn('>LOT_A_W01 · 0.50 V · 50.0 mV</text>', svg)
+            self.assertNotIn('class="multi-lot-data-label-bg"', svg)
             self.assertNotIn('>R 50.0', svg)
             self.assertNotIn('>W 70.0', svg)
             self.assertNotIn('>BL 25.0', svg)
@@ -807,7 +804,7 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn('class="vertical-vdd-label" data-vdd="0.6000" x="92.0"', svg)
             self.assertIn('class="vertical-vdd-label" data-vdd="0.8000" x="736.0"', svg)
 
-    def test_multi_curve_labels_only_each_source_lowest_vdd(self):
+    def test_multi_curve_uses_axis_ticks_instead_of_point_labels(self):
         def rows(offset: float) -> list[dict[str, object]]:
             return [{"vdd_v": vdd, "sample_count": 8,
                      "rsnm_mv": value + offset,
@@ -822,22 +819,65 @@ class AnalyzerTests(unittest.TestCase):
              "color": "#AF52DE", "sources": ["B"]},
         ]
         svg = estimate_vmin_combined_comparison_svg(datasets)
-        self.assertIn("LOT_A_W01 · 0.40 V · 40.0 mV", svg)
-        self.assertNotIn("LOT_A_W01 · 0.60 V", svg)
-        self.assertNotIn("LOT_B_W02 · 0.60 V", svg)
-        self.assertNotIn("LOT_A_W01 · 0.80 V", svg)
-        self.assertNotIn("LOT_B_W02 · 0.80 V", svg)
-        # 2 sources × one lowest VDD × (Read + Write + BL margin).
-        self.assertEqual(svg.count('class="multi-lot-data-label"'), 6)
-        # Each panel's endpoint columns use vertically separated background boxes.
-        background_rows = re.findall(
-            r'class="multi-lot-data-label-bg" x="([0-9.]+)" y="([0-9.]+)"', svg)
-        self.assertEqual(len(background_rows), 6)
-        for x_value in {float(item[0]) for item in background_rows}:
-            ys = sorted(float(item[1]) for item in background_rows
-                        if abs(float(item[0]) - x_value) < .05)
-            self.assertTrue(all(second - first >= 19.9
-                                for first, second in zip(ys, ys[1:])))
+        self.assertNotIn("LOT_A_W01 · 0.40 V · 40.0 mV", svg)
+        self.assertNotIn('class="multi-lot-data-label"', svg)
+        self.assertNotIn('class="multi-lot-data-label-bg"', svg)
+        self.assertEqual(svg.count('>0.40 V</text>'), 2)
+        self.assertEqual(svg.count('>0.60 V</text>'), 2)
+        self.assertEqual(svg.count('>0.80 V</text>'), 2)
+
+    def test_comparison_worst_table_and_vdd_boxplots_use_per_cell_raw_data(self):
+        def sample(chip: str, rsnm: float, margin: float, offset: float) -> dict:
+            item = {
+                "lot_wafer": "LOT_A_W01", "chip_id": chip,
+                "rsnm_mv": rsnm, "wsnm_mv": rsnm - 5,
+                "write_margin_mv": margin,
+                "cell_ratio_beta": 1.4 + offset,
+                "pull_up_ratio_beta": 1.2 + offset,
+            }
+            for index, device in enumerate(("pul", "pur", "pgl", "pgr", "pdl", "pdr")):
+                item[f"{device}_vt_v"] = .30 + index * .01 + offset
+                item[f"{device}_idsat_ua"] = 40 + index * 10 + offset
+            return item
+
+        rows = []
+        for vdd, shift in ((.60, 0.0), (.80, .1)):
+            samples = [sample("C01", 80 + shift * 100, 50 + shift * 50, shift),
+                       sample("C02", 65 + shift * 100, 42 + shift * 50, shift)]
+            rows.append({"vdd_v": vdd, "sample_count": len(samples),
+                         "samples": samples, "rsnm_mv": min(s["rsnm_mv"] for s in samples),
+                         "wsnm_mv": min(s["wsnm_mv"] for s in samples),
+                         "write_margin_mv": min(s["write_margin_mv"] for s in samples)})
+        datasets = [{"lot_wafer": "LOT_A_W01", "rows": rows,
+                     "color": "#007AFF", "sources": ["summary.csv"]}]
+        worst = estimate_vmin_comparison_worst_rows(datasets)
+        self.assertEqual(len(worst), 6)
+        self.assertTrue(all(row["chip_id"] == "C02" for row in worst))
+        self.assertTrue(all(row["raw_6t_available"] for row in worst))
+        self.assertEqual(worst[0]["pul_idsat_ua"], 40.0)
+        svg = estimate_vmin_distribution_boxplots_svg(
+            datasets,
+            (("rsnm_mv", "Read SNM distribution", "RSNM (mV)", "#007AFF"),),
+            "Distribution test")
+        self.assertIn("Read SNM distribution", svg)
+        self.assertIn("0.60 V", svg)
+        self.assertIn("N=2", svg)
+        self.assertEqual(svg.count('class="boxplot-median-label"'), 2)
+        with tempfile.TemporaryDirectory() as td:
+            report = write_estimate_vmin_combined_comparison_outputs(
+                datasets, Path(td))
+            self.assertTrue(report.exists())
+            self.assertTrue((report.parent / "images" /
+                             "02_vdd_margin_ratio_boxplots.png").exists())
+            self.assertTrue((report.parent / "images" /
+                             "03_vdd_6t_idsat_boxplots.png").exists())
+            self.assertTrue((report.parent /
+                             "estimate_vmin_worst_cell_details.csv").exists())
+            self.assertTrue((report.parent /
+                             "estimate_vmin_boxplot_statistics.csv").exists())
+            document = report.read_text(encoding="utf-8")
+            self.assertIn("Worst Cell at each Model VDD", document)
+            self.assertIn("PUL", document)
 
     def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):
         rows = []
