@@ -4389,19 +4389,79 @@ def read_estimate_vmin_combined_files(
     return datasets
 
 
+def estimate_vmin_lot_wafer_ranking(
+        datasets: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Rank Lot/Wafer sources by balanced RSNM and BL-margin percentiles."""
+    scores: dict[str, list[tuple[float, float, float]]] = {
+        str(dataset["lot_wafer"]): [] for dataset in datasets}
+    by_vdd: dict[float, list[tuple[str, dict[str, object]]]] = {}
+    for dataset in datasets:
+        for row in dataset["rows"]:
+            by_vdd.setdefault(float(row["vdd_v"]), []).append(
+                (str(dataset["lot_wafer"]), row))
+    for entries in by_vdd.values():
+        if len(entries) < 2:
+            continue
+        read_values = [float(row["rsnm_mv"]) for _label, row in entries]
+        write_values = [float(row["write_margin_mv"]) for _label, row in entries]
+        for label, row in entries:
+            read_pct = _midrank_percentile(read_values, float(row["rsnm_mv"]))
+            write_pct = _midrank_percentile(
+                write_values, float(row["write_margin_mv"]))
+            scores[label].append((read_pct, write_pct,
+                                  min(read_pct, write_pct)))
+    records = []
+    for dataset in datasets:
+        label = str(dataset["lot_wafer"]); points = scores[label]
+        records.append({
+            "lot_wafer": label,
+            "balanced_score_pct": (100.0 * statlib.fmean(item[2] for item in points)
+                                   if points else None),
+            "mean_rsnm_percentile_pct": (100.0 * statlib.fmean(item[0] for item in points)
+                                         if points else None),
+            "mean_write_margin_percentile_pct": (
+                100.0 * statlib.fmean(item[1] for item in points)
+                if points else None),
+            "evaluated_vdd_count": len(points),
+        })
+    records.sort(key=lambda item: (
+        item["balanced_score_pct"] is None,
+        -float(item["balanced_score_pct"] or 0.0),
+        str(item["lot_wafer"])))
+    comparable_rank = 0
+    for record in records:
+        if record["balanced_score_pct"] is None:
+            record["rank"] = None
+        else:
+            comparable_rank += 1; record["rank"] = comparable_rank
+    return records
+
+
 def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
                                 width: int = 1500, height: int = 720,
                                 transparent_background: bool = False) -> str:
-    """Overlay combined-summary files in paired SNM and BL-margin panels."""
+    """Overlay Lot/Wafer RSNM and BL-margin trends with balanced ranking."""
     groups = (
-        ("Read / Write SNM",
-         (("rsnm_mv", "R", ""), ("wsnm_mv", "W", "8 5")), "SNM (mV)"),
+        ("Read SNM", (("rsnm_mv", "R", ""),), "RSNM (mV)"),
         ("BL Write Margin", (("write_margin_mv", "BL", ""),), "Vtrip (mV)"),
     )
     left, right, bottom, panel_gap = 92, 48, 84, 72
-    legend_items = [(str(item["lot_wafer"]),
-                     max(210.0, 78.0 + len(str(item["lot_wafer"])) * 9.5),
-                     str(item["color"])) for item in datasets]
+    ranking = estimate_vmin_lot_wafer_ranking(datasets)
+    rank_by_label = {str(item["lot_wafer"]): item for item in ranking}
+    ranked_datasets = sorted(
+        datasets, key=lambda item: int(
+            rank_by_label[str(item["lot_wafer"])]["rank"] or 9999))
+    legend_items = []
+    for dataset in ranked_datasets:
+        result = rank_by_label[str(dataset["lot_wafer"])]
+        score = result["balanced_score_pct"]
+        rank_text = (f'#{result["rank"]}' if result["rank"] is not None
+                     else "Unranked")
+        score_text = "N/A" if score is None else f'{float(score):.1f}'
+        label = (f'{rank_text} {dataset["lot_wafer"]} · {score_text} · '
+                 f'{result["evaluated_vdd_count"]} VDD')
+        legend_items.append((label, max(245.0, 70.0 + len(label) * 8.0),
+                             str(dataset["color"])))
     legend_rows: list[list[tuple[str, float, str]]] = [[]]
     current_width = 0.0
     for item in legend_items:
@@ -4423,10 +4483,10 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
     panel_fill = "none" if transparent_background else "#FFFFFF"
     parts += ['<text x="56" y="46" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
              f'<text x="56" y="73" fill="#6E6E73" font-size="16">{len(datasets)} Multi-VDD source(s) · X range {vdd_min:.3f}–{vdd_max:.3f} V</text>',
-             '<path d="M56 108h30" stroke="#3A3A3C" stroke-width="4"/><text x="96" y="113" fill="#3A3A3C" font-size="14">Read SNM / BL Write Margin</text>',
-             '<path d="M330 108h30" stroke="#3A3A3C" stroke-width="4" stroke-dasharray="8 5"/><text x="370" y="113" fill="#3A3A3C" font-size="14">Write SNM</text>']
+             '<text x="330" y="91" fill="#6E6E73" font-size="12" font-weight="700">Lot/Wafer balanced rank · score · compared VDDs</text>',
+             '<path d="M56 108h30" stroke="#3A3A3C" stroke-width="4"/><text x="96" y="113" fill="#3A3A3C" font-size="14">RSNM / BL Write Margin</text>']
     for row_index, legend_row in enumerate(legend_rows):
-        legend_x = 650 if row_index == 0 else 56
+        legend_x = 330 if row_index == 0 else 56
         legend_y = 113 + row_index * 27
         for label_text, item_width, color in legend_row:
             label = html.escape(label_text)
@@ -4483,7 +4543,6 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
 
 _COMPARISON_WORST_METRICS = (
     ("rsnm_mv", "Read SNM"),
-    ("wsnm_mv", "Write SNM"),
     ("write_margin_mv", "BL Write Margin"),
 )
 _SIX_MOS_NAMES = ("pul", "pur", "pgl", "pgr", "pdl", "pdr")
@@ -4519,6 +4578,131 @@ def _comparison_sample_value(sample: dict[str, object], key: str) -> float | Non
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _comparison_sample_cell(sample: dict[str, object], name: str) -> SixTWatCell | None:
+    """Rebuild a physical 6T WAT cell when side-specific raw data is present."""
+    device_fields = (
+        ("pu1", "pul"), ("pu2", "pur"), ("pg1", "pgl"),
+        ("pg2", "pgr"), ("pd1", "pdl"), ("pd2", "pdr"),
+    )
+    devices: list[MosWat] = []
+    for _attribute, label in device_fields:
+        vt = _comparison_sample_value(sample, f"{label}_vt_v")
+        ids = _comparison_sample_value(sample, f"{label}_idsat_ua")
+        if vt is None or ids is None:
+            return None
+        devices.append(MosWat(abs(vt), abs(ids)))
+    return SixTWatCell(name, *devices)
+
+
+def estimate_vmin_worst_cell_attributions(
+        datasets: list[dict[str, object]],
+        reversal_tolerance_mv: float = 0.5) -> list[dict[str, object]]:
+    """Explain adjacent-VDD minimum reversals using the two worst Cells.
+
+    Population P10/median values are context only.  MOS attribution replaces
+    one complete MOS (Vt + Idsat) of the high-VDD worst Cell with the matching
+    MOS from the low-VDD worst Cell and recomputes both at the higher VDD.
+    """
+    device_fields = (
+        ("PUL", "pu1", "pul"), ("PUR", "pu2", "pur"),
+        ("PGL", "pg1", "pgl"), ("PGR", "pg2", "pgr"),
+        ("PDL", "pd1", "pdl"), ("PDR", "pd2", "pdr"),
+    )
+    records: list[dict[str, object]] = []
+    for dataset in datasets:
+        rows = sorted(dataset["rows"], key=lambda row: float(row["vdd_v"]))
+        for low_row, high_row in zip(rows, rows[1:]):
+            for metric_key, metric_label in (
+                    ("rsnm_mv", "Read SNM"),
+                    ("write_margin_mv", "BL Write Margin")):
+                low_samples = _comparison_row_samples(dataset, low_row)
+                high_samples = _comparison_row_samples(dataset, high_row)
+                low_valid = [(sample, _comparison_sample_value(sample, metric_key))
+                             for sample in low_samples]
+                high_valid = [(sample, _comparison_sample_value(sample, metric_key))
+                              for sample in high_samples]
+                low_valid = [(sample, float(value)) for sample, value in low_valid
+                             if value is not None]
+                high_valid = [(sample, float(value)) for sample, value in high_valid
+                              if value is not None]
+                if not low_valid or not high_valid:
+                    continue
+                low_worst, low_min = min(low_valid, key=lambda item: item[1])
+                high_worst, high_min = min(high_valid, key=lambda item: item[1])
+                if high_min >= low_min - reversal_tolerance_mv:
+                    continue
+                low_values = [value for _sample, value in low_valid]
+                high_values = [value for _sample, value in high_valid]
+                record: dict[str, object] = {
+                    "source": str(dataset["lot_wafer"]),
+                    "metric": metric_label,
+                    "metric_key": metric_key,
+                    "low_vdd_v": float(low_row["vdd_v"]),
+                    "high_vdd_v": float(high_row["vdd_v"]),
+                    "low_worst_lot_wafer": str(low_worst.get(
+                        "lot_wafer", dataset["lot_wafer"])),
+                    "low_worst_chip_id": str(low_worst.get("chip_id", "Unavailable")),
+                    "high_worst_lot_wafer": str(high_worst.get(
+                        "lot_wafer", dataset["lot_wafer"])),
+                    "high_worst_chip_id": str(high_worst.get("chip_id", "Unavailable")),
+                    "low_min_mv": low_min,
+                    "high_min_mv": high_min,
+                    "minimum_delta_mv": high_min - low_min,
+                    "low_p10_mv": _linear_quantile(low_values, .10),
+                    "high_p10_mv": _linear_quantile(high_values, .10),
+                    "low_median_mv": _linear_quantile(low_values, .50),
+                    "high_median_mv": _linear_quantile(high_values, .50),
+                    "sample_count_low": len(low_values),
+                    "sample_count_high": len(high_values),
+                    "device_recovery": [],
+                    "model_status": "side-specific six-MOS data unavailable",
+                }
+                low_cell = _comparison_sample_cell(low_worst, "LOW_VDD_WORST")
+                high_cell = _comparison_sample_cell(high_worst, "HIGH_VDD_WORST")
+                if low_cell is not None and high_cell is not None:
+                    reference_vdd = float(high_row["vdd_v"])
+                    cfg = Config(nominal_vdd=reference_vdd,
+                                 wat_vdd=reference_vdd, grid_points=501)
+                    low_reference = _multi_cell_metrics(
+                        low_cell, cfg, reference_vdd, 501)
+                    high_reference = _multi_cell_metrics(
+                        high_cell, cfg, reference_vdd, 501)
+                    baseline = float(high_reference[metric_key])
+                    device_rows = []
+                    for device, attribute, label in device_fields:
+                        hybrid = replace(
+                            high_cell, **{attribute: getattr(low_cell, attribute)})
+                        hybrid_value = float(_multi_cell_metrics(
+                            hybrid, cfg, reference_vdd, 501)[metric_key])
+                        device_rows.append({
+                            "device": device,
+                            "recovery_mv": hybrid_value - baseline,
+                            "hybrid_margin_mv": hybrid_value,
+                            "low_vt_v": _comparison_sample_value(
+                                low_worst, f"{label}_vt_v"),
+                            "high_vt_v": _comparison_sample_value(
+                                high_worst, f"{label}_vt_v"),
+                            "low_idsat_ua": _comparison_sample_value(
+                                low_worst, f"{label}_idsat_ua"),
+                            "high_idsat_ua": _comparison_sample_value(
+                                high_worst, f"{label}_idsat_ua"),
+                        })
+                    device_rows.sort(key=lambda item: -float(item["recovery_mv"]))
+                    record.update({
+                        "reference_vdd_v": reference_vdd,
+                        "low_cell_at_reference_mv": float(
+                            low_reference[metric_key]),
+                        "high_cell_at_reference_mv": baseline,
+                        "device_recovery": device_rows,
+                        "top_device": str(device_rows[0]["device"]),
+                        "top_recovery_mv": float(device_rows[0]["recovery_mv"]),
+                        "model_status": "common-VDD compact-model sensitivity",
+                    })
+                records.append(record)
+    records.sort(key=lambda item: float(item["minimum_delta_mv"]))
+    return records
 
 
 def estimate_vmin_comparison_worst_rows(
@@ -4792,15 +4976,51 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
                     "mean": stats["mean"],
                     "outlier_count": len(stats["outliers"]),
                 })
-    fields = ["lot_wafer", "vdd_v", "sample_count", "rsnm_mv", "wsnm_mv", "write_margin_mv", "source_files"]
+    fields = ["lot_wafer", "vdd_v", "sample_count", "rsnm_mv",
+              "write_margin_mv", "source_files"]
     with (out / "estimate_vmin_combined_comparison.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader()
         for dataset in datasets:
             for row in dataset["rows"]:
                 writer.writerow({"lot_wafer": dataset["lot_wafer"], "vdd_v": row["vdd_v"],
                                  "sample_count": row["sample_count"], "rsnm_mv": row["rsnm_mv"],
-                                 "wsnm_mv": row["wsnm_mv"], "write_margin_mv": row["write_margin_mv"],
+                                 "write_margin_mv": row["write_margin_mv"],
                                  "source_files": " | ".join(dataset["sources"])})
+    ranking = estimate_vmin_lot_wafer_ranking(datasets)
+    ranking_fields = [
+        "rank", "lot_wafer", "balanced_score_pct",
+        "mean_rsnm_percentile_pct", "mean_write_margin_percentile_pct",
+        "evaluated_vdd_count",
+    ]
+    with (out / "estimate_vmin_lot_wafer_ranking.csv").open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=ranking_fields)
+        writer.writeheader()
+        writer.writerows({key: row.get(key, "") for key in ranking_fields}
+                         for row in ranking)
+    attributions = estimate_vmin_worst_cell_attributions(datasets)
+    attribution_fields = [
+        "source", "metric", "low_vdd_v", "high_vdd_v",
+        "low_worst_lot_wafer", "low_worst_chip_id",
+        "high_worst_lot_wafer", "high_worst_chip_id",
+        "low_min_mv", "high_min_mv", "minimum_delta_mv",
+        "low_p10_mv", "high_p10_mv", "low_median_mv", "high_median_mv",
+        "sample_count_low", "sample_count_high", "reference_vdd_v",
+        "low_cell_at_reference_mv", "high_cell_at_reference_mv",
+        "device", "recovery_mv", "hybrid_margin_mv",
+        "low_vt_v", "high_vt_v", "low_idsat_ua", "high_idsat_ua",
+        "model_status",
+    ]
+    with (out / "estimate_vmin_worst_cell_mos_attribution.csv").open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=attribution_fields)
+        writer.writeheader()
+        for record in attributions:
+            device_rows = record.get("device_recovery") or [{}]
+            for device in device_rows:
+                row = {**record, **device}
+                writer.writerow({key: row.get(key, "")
+                                 for key in attribution_fields})
     worst_rows = estimate_vmin_comparison_worst_rows(datasets)
     worst_fields = [
         "source", "vdd_v", "metric", "margin_mv", "lot_wafer", "chip_id",
@@ -4814,7 +5034,7 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
         writer.writerows({key: row.get(key, "") for key in worst_fields}
                          for row in worst_rows)
     sample_fields = [
-        "source", "vdd_v", "lot_wafer", "chip_id", "rsnm_mv", "wsnm_mv",
+        "source", "vdd_v", "lot_wafer", "chip_id", "rsnm_mv",
         "write_margin_mv", "cell_ratio_beta", "pull_up_ratio_beta",
         "pu_vt_v", "pu_idsat_ua", "pg_vt_v", "pg_idsat_ua",
         "pd_vt_v", "pd_idsat_ua",
@@ -4858,8 +5078,37 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
     device_headers = "".join(
         f'<th>{device.upper()}<br><small>Vt (V) / Idsat (µA)</small></th>'
         for device in _SIX_MOS_NAMES)
+    ranking_table_rows = "".join(
+        '<tr>'
+        f'<td>{int(row["rank"]) if row["rank"] is not None else "—"}</td>'
+        f'<td>{html.escape(str(row["lot_wafer"]))}</td>'
+        f'<td>{cell_text(row.get("balanced_score_pct"), 1)}</td>'
+        f'<td>{cell_text(row.get("mean_rsnm_percentile_pct"), 1)}</td>'
+        f'<td>{cell_text(row.get("mean_write_margin_percentile_pct"), 1)}</td>'
+        f'<td>{int(row["evaluated_vdd_count"])}</td>'
+        '</tr>' for row in ranking)
+    attribution_table_rows = "".join(
+        '<tr>'
+        f'<td>{html.escape(str(row["source"]))}</td>'
+        f'<td>{html.escape(str(row["metric"]))}</td>'
+        f'<td>{float(row["low_vdd_v"]):.3f} → {float(row["high_vdd_v"]):.3f}</td>'
+        f'<td>{html.escape(str(row["low_worst_lot_wafer"]))} / '
+        f'{html.escape(str(row["low_worst_chip_id"]))}<br>'
+        f'{float(row["low_min_mv"]):.2f} mV</td>'
+        f'<td>{html.escape(str(row["high_worst_lot_wafer"]))} / '
+        f'{html.escape(str(row["high_worst_chip_id"]))}<br>'
+        f'{float(row["high_min_mv"]):.2f} mV</td>'
+        f'<td>{float(row["minimum_delta_mv"]):+.2f}</td>'
+        f'<td>{float(row["low_p10_mv"]):.2f} → {float(row["high_p10_mv"]):.2f}</td>'
+        f'<td>{float(row["low_median_mv"]):.2f} → {float(row["high_median_mv"]):.2f}</td>'
+        f'<td>{html.escape(str(row.get("top_device", "—")))}</td>'
+        f'<td>{cell_text(row.get("top_recovery_mv"), 2)}</td>'
+        f'<td>{html.escape(str(row["model_status"]))}</td>'
+        '</tr>' for row in attributions) or (
+            '<tr><td colspan="11">No adjacent-VDD minimum reversal was detected.</td></tr>')
     report = out / "estimate_vmin_combined_comparison.html"
-    report.write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estimate Vmin Combined Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1750px;margin:auto}}h1{{margin-bottom:4px}}section{{background:#fff;padding:22px;border-radius:16px;margin:18px 0}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}.table-wrap{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;min-width:1650px;font-variant-numeric:tabular-nums}}th,td{{padding:9px 10px;border-bottom:1px solid #e5e5ea;text-align:right;white-space:nowrap}}th{{position:sticky;top:0;background:#f8f8fa;color:#3a3a3c}}th:first-child,td:first-child,th:nth-child(3),td:nth-child(3),th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){{text-align:left}}small{{color:#6e6e73;font-weight:400}}</style></head><body><main><h1>Estimate Vmin Curves - Comparison View</h1><p class="note">Compared summaries: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}. Point labels are moved to the table below to keep dense curves readable.</p><section><h2>W/R Estimate Vmin trends</h2><img src="images/{png_path.name}" alt="Estimate Vmin combined summary comparison"><p class="downloads">Original: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a>　 Transparent background: <a href="images/{transparent_svg_path.name}">SVG</a> · <a href="images/{transparent_png_path.name}">PNG</a>　 Trend data: <a href="estimate_vmin_combined_comparison.csv">CSV</a></p></section><section><h2>Worst Cell at each Model VDD</h2><p class="note">One limiting Cell is listed for Read SNM, Write SNM and BL Write Margin at every source/VDD. New Multi-Cell summaries contain side-specific six-MOS WAT data; legacy summaries fall back to PU/PG/PD family averages.</p><div class="table-wrap"><table><thead><tr><th>Source</th><th>VDD (V)</th><th>Limit</th><th>Margin (mV)</th><th>Lot/Wafer</th><th>Cell/Chip</th><th>CR</th><th>PR</th>{device_headers}<th>Data detail</th></tr></thead><tbody>{worst_table_rows}</tbody></table></div><p class="downloads"><a href="estimate_vmin_worst_cell_details.csv">Download worst-Cell details</a> · <a href="estimate_vmin_comparison_per_cell_data.csv">Download per-Cell comparison data</a></p></section><section><h2>Margin and CR/PR distributions</h2><p class="note">All selected Lot/Wafer sources are pooled within each Model VDD; compare median, IQR and outliers rather than only the limiting Cell.</p><img src="images/{distribution_png_path.name}" alt="Per-cell margin and drive ratio box plots"><p class="downloads"><a href="images/{distribution_svg_path.name}">SVG</a> · <a href="images/{distribution_png_path.name}">PNG</a> · <a href="estimate_vmin_boxplot_statistics.csv">Box statistics CSV</a></p></section><section><h2>Six-MOS Idsat distributions</h2><p class="note">Side-specific PUL/PUR/PGL/PGR/PDL/PDR Idsat is retained when available. Legacy files use family-average fallback and are identified in the worst-Cell table.</p><img src="images/{idsat_png_path.name}" alt="Six-MOS Idsat box plots by VDD"><p class="downloads"><a href="images/{idsat_svg_path.name}">SVG</a> · <a href="images/{idsat_png_path.name}">PNG</a></p></section></main></body></html>''', encoding="utf-8")
+    report_html = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estimate Vmin Combined Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1750px;margin:auto}}h1{{margin-bottom:4px}}section{{background:#fff;padding:22px;border-radius:16px;margin:18px 0}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}.table-wrap{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;min-width:1200px;font-variant-numeric:tabular-nums}}th,td{{padding:9px 10px;border-bottom:1px solid #e5e5ea;text-align:right;white-space:nowrap}}th{{position:sticky;top:0;background:#f8f8fa;color:#3a3a3c}}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3),th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){{text-align:left}}small{{color:#6e6e73;font-weight:400}}</style></head><body><main><h1>Estimate Vmin Curves - Comparison View</h1><p class="note">Compared summaries: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}. Comparison View includes RSNM and BL Write Margin only.</p><section><h2>RSNM / BL Write Margin trends and Lot/Wafer ranking</h2><p class="note">At each shared VDD, both metrics are percentile-ranked across Lot/Wafer sources. The weaker percentile is averaged across VDDs to form the balanced rank; WSNM is excluded.</p><img src="images/{png_path.name}" alt="Estimate Vmin combined summary comparison"><p class="downloads">Original: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a>　 Transparent background: <a href="images/{transparent_svg_path.name}">SVG</a> · <a href="images/{transparent_png_path.name}">PNG</a>　 Trend data: <a href="estimate_vmin_combined_comparison.csv">CSV</a> · <a href="estimate_vmin_lot_wafer_ranking.csv">Ranking CSV</a></p><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Lot/Wafer</th><th>Balanced score (%)</th><th>Mean RSNM percentile (%)</th><th>Mean BL-margin percentile (%)</th><th>Compared VDD count</th></tr></thead><tbody>{ranking_table_rows}</tbody></table></div></section><section><h2>Worst-Cell MOS attribution for reversed adjacent VDD points</h2><p class="note">The two Cells that actually form the minimum curve points are compared. Minimum, P10 and median provide population context. When side-specific six-MOS data exists, both Cells are recalculated at the higher reference VDD and each high-VDD MOS is replaced once by the matching low-VDD MOS; the largest positive recovery identifies the strongest sensitivity candidate. This is attribution screening, not proof of process causality.</p><div class="table-wrap"><table><thead><tr><th>Source</th><th>Metric</th><th>VDD pair</th><th>Low-VDD worst</th><th>High-VDD worst</th><th>Δ minimum (mV)</th><th>P10 low → high</th><th>Median low → high</th><th>Top MOS</th><th>Recovery (mV)</th><th>Method</th></tr></thead><tbody>{attribution_table_rows}</tbody></table></div><p class="downloads"><a href="estimate_vmin_worst_cell_mos_attribution.csv">Download MOS-attribution details</a></p></section><section><h2>Worst Cell at each Model VDD</h2><p class="note">One limiting Cell is listed for Read SNM and BL Write Margin at every source/VDD. New Multi-Cell summaries contain side-specific six-MOS WAT data; legacy summaries fall back to PU/PG/PD family averages.</p><div class="table-wrap"><table><thead><tr><th>Source</th><th>VDD (V)</th><th>Limit</th><th>Margin (mV)</th><th>Lot/Wafer</th><th>Cell/Chip</th><th>CR</th><th>PR</th>{device_headers}<th>Data detail</th></tr></thead><tbody>{worst_table_rows}</tbody></table></div><p class="downloads"><a href="estimate_vmin_worst_cell_details.csv">Download worst-Cell details</a> · <a href="estimate_vmin_comparison_per_cell_data.csv">Download per-Cell comparison data</a></p></section><section><h2>Margin and CR/PR distributions</h2><p class="note">All selected Lot/Wafer sources are pooled within each Model VDD; compare median, IQR and outliers rather than only the limiting Cell.</p><img src="images/{distribution_png_path.name}" alt="Per-cell margin and drive ratio box plots"><p class="downloads"><a href="images/{distribution_svg_path.name}">SVG</a> · <a href="images/{distribution_png_path.name}">PNG</a> · <a href="estimate_vmin_boxplot_statistics.csv">Box statistics CSV</a></p></section><section><h2>Six-MOS Idsat distributions</h2><p class="note">Side-specific PUL/PUR/PGL/PGR/PDL/PDR Idsat is retained when available. Legacy files use family-average fallback and are identified in the worst-Cell table.</p><img src="images/{idsat_png_path.name}" alt="Six-MOS Idsat box plots by VDD"><p class="downloads"><a href="images/{idsat_svg_path.name}">SVG</a> · <a href="images/{idsat_png_path.name}">PNG</a></p></section></main></body></html>'''
+    report.write_text(report_html, encoding="utf-8")
     return report
 
 
@@ -8776,7 +9025,7 @@ def launch_gui() -> None:
                     "to generate drive-balance analysis.")
                 return
             if curve_kind.get() == "stacked":
-                curve_summary.set("Comparison view: Read/Write SNM and BL Write Margin versus Model VDD.")
+                curve_summary.set("Comparison view: RSNM and BL Write Margin versus Model VDD.")
                 return
             curve = curve_result["curves"][curve_kind.get()]
             closure = curve.get("eye_closure")
@@ -8833,7 +9082,7 @@ def launch_gui() -> None:
         if curve_kind.get() == "stacked":
             curve_title.set("Estimate Vmin Curves - Comparison View")
             groups = (
-                ("Read / Write SNM", ("rsnm_mv", "wsnm_mv"), "SNM (mV)"),
+                ("Read SNM", ("rsnm_mv",), "RSNM (mV)"),
                 ("BL Write Margin", ("write_margin_mv",), "Vtrip (mV)"),
             )
             panel_gap = 74
@@ -9222,7 +9471,7 @@ def launch_gui() -> None:
                            "without Shmoo analysis or an Estimate Vmin trend.")
                 curve_summary_label.configure(fg=SECONDARY)
             elif curve_kind.get() == "stacked":
-                summary = "Comparison view: Read/Write SNM and BL Write Margin versus Model VDD."
+                summary = "Comparison view: RSNM and BL Write Margin versus Model VDD."
                 curve_summary_label.configure(fg=SECONDARY)
             else:
                 curve = analysis["curves"][curve_kind.get()]

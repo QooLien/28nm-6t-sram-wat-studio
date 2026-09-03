@@ -10,7 +10,7 @@ from sram_wat_analyzer import (
     AsymmetricSram6T, Config, DatasheetTargets, Device, MosWat, RsnmVccPoint,
     SixTWatCell, Sram6T, ThreeTWatCell, WaferChipWat,
     WatPoint, analyze, analyze_six_mos, analyze_three_mos,
-    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_combined_comparison_svg, estimate_vmin_comparison_worst_rows, estimate_vmin_curve_svg, estimate_vmin_distribution_boxplots_svg, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, read_estimate_vmin_combined_files,
+    _read_wat_excel_rows, analyze_estimate_vmin_curves, analyze_multi_chip_wafer, analyze_rsnm_vcc_curve, estimate_vmin_combined_comparison_svg, estimate_vmin_comparison_worst_rows, estimate_vmin_curve_svg, estimate_vmin_distribution_boxplots_svg, estimate_vmin_lot_wafer_ranking, estimate_vmin_ratio_shmoo_svg, estimate_vmin_stacked_svg, estimate_vmin_worst_cell_attributions, read_estimate_vmin_combined_files,
     analyze_write_trip_margin_curve,
     analyze_lot_wafer_drive_advisor,
     build_batch_drive_to_preferred_advice, build_drive_to_preferred_advice,
@@ -749,8 +749,9 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIn("LOT_A_W01", svg)
             self.assertIn("LOT_B_W02", svg)
             self.assertIn("Read SNM", svg)
-            self.assertIn("Write SNM", svg)
+            self.assertNotIn("Write SNM", svg)
             self.assertIn("BL Write Margin", svg)
+            self.assertIn("#1 LOT_B_W02", svg)
             self.assertNotIn('class="multi-lot-data-label"', svg)
             self.assertIn('<text x="56" y="46" fill="#1D1D1F" font-size="34"', svg)
             self.assertEqual(svg.count('y="156.0" fill="#1D1D1F" font-size="20"'), 2)
@@ -761,7 +762,7 @@ class AnalyzerTests(unittest.TestCase):
             self.assertNotIn('>BL 25.0', svg)
             self.assertNotIn('class="measured-vdd-guide"', svg)
             self.assertEqual(svg.count('>0.50 V</text>'), 2)
-            self.assertIn('stroke-dasharray="8 5"', svg)
+            self.assertNotIn('stroke-dasharray="8 5"', svg)
             transparent = estimate_vmin_combined_comparison_svg(
                 datasets, transparent_background=True)
             self.assertNotIn('<rect width="100%" height="100%" fill="#FFFFFF"/>',
@@ -794,7 +795,7 @@ class AnalyzerTests(unittest.TestCase):
                              [.60, .80])
             self.assertEqual(len(datasets[0]["sources"]), 2)
             svg = estimate_vmin_combined_comparison_svg(datasets)
-            self.assertIn("Read / Write SNM", svg)
+            self.assertIn("Read SNM", svg)
             self.assertIn("BL Write Margin", svg)
             self.assertIn(">0.60 V</text>", svg)
             self.assertIn(">0.80 V</text>", svg)
@@ -851,8 +852,9 @@ class AnalyzerTests(unittest.TestCase):
         datasets = [{"lot_wafer": "LOT_A_W01", "rows": rows,
                      "color": "#007AFF", "sources": ["summary.csv"]}]
         worst = estimate_vmin_comparison_worst_rows(datasets)
-        self.assertEqual(len(worst), 6)
+        self.assertEqual(len(worst), 4)
         self.assertTrue(all(row["chip_id"] == "C02" for row in worst))
+        self.assertNotIn("Write SNM", {row["metric"] for row in worst})
         self.assertTrue(all(row["raw_6t_available"] for row in worst))
         self.assertEqual(worst[0]["pul_idsat_ua"], 40.0)
         svg = estimate_vmin_distribution_boxplots_svg(
@@ -875,9 +877,55 @@ class AnalyzerTests(unittest.TestCase):
                              "estimate_vmin_worst_cell_details.csv").exists())
             self.assertTrue((report.parent /
                              "estimate_vmin_boxplot_statistics.csv").exists())
+            self.assertTrue((report.parent /
+                             "estimate_vmin_lot_wafer_ranking.csv").exists())
+            self.assertTrue((report.parent /
+                             "estimate_vmin_worst_cell_mos_attribution.csv").exists())
             document = report.read_text(encoding="utf-8")
             self.assertIn("Worst Cell at each Model VDD", document)
+            self.assertIn("Worst-Cell MOS attribution", document)
             self.assertIn("PUL", document)
+
+    def test_ranking_and_worst_cell_attribution_use_requested_metrics(self):
+        def raw_sample(chip: str, rsnm: float, margin: float,
+                       pg_scale: float = 1.0) -> dict[str, object]:
+            sample = {"lot_wafer": "LOT_A_W01", "chip_id": chip,
+                      "rsnm_mv": rsnm, "wsnm_mv": rsnm - 5,
+                      "write_margin_mv": margin}
+            values = {
+                "pul": (.385, 44), "pur": (.385, 44),
+                "pgl": (.365, 82 * pg_scale), "pgr": (.365, 82),
+                "pdl": (.355, 124), "pdr": (.355, 124),
+            }
+            for device, (vt, ids) in values.items():
+                sample[f"{device}_vt_v"] = vt
+                sample[f"{device}_idsat_ua"] = ids
+            return sample
+
+        low_samples = [raw_sample("L01", 35, 18),
+                       raw_sample("L02", 50, 30)]
+        high_samples = [raw_sample("H01", 42, 9, .65),
+                        raw_sample("H02", 65, 38)]
+        dataset = {"lot_wafer": "LOT_A_W01", "color": "#007AFF",
+                   "sources": ["summary.csv"], "rows": [
+                       {"vdd_v": .4, "sample_count": 2,
+                        "samples": low_samples, "rsnm_mv": 35,
+                        "wsnm_mv": 30, "write_margin_mv": 18},
+                       {"vdd_v": .5, "sample_count": 2,
+                        "samples": high_samples, "rsnm_mv": 42,
+                        "wsnm_mv": 37, "write_margin_mv": 9},
+                   ]}
+        records = estimate_vmin_worst_cell_attributions([dataset])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["metric"], "BL Write Margin")
+        self.assertEqual(records[0]["low_worst_chip_id"], "L01")
+        self.assertEqual(records[0]["high_worst_chip_id"], "H01")
+        self.assertEqual(records[0]["minimum_delta_mv"], -9.0)
+        self.assertEqual(len(records[0]["device_recovery"]), 6)
+        self.assertIn(records[0]["top_device"],
+                      {"PUL", "PUR", "PGL", "PGR", "PDL", "PDR"})
+        ranking = estimate_vmin_lot_wafer_ranking([dataset])
+        self.assertIsNone(ranking[0]["rank"])
 
     def test_estimate_vmin_extrapolates_two_lowest_vdd_points_to_zero(self):
         rows = []
