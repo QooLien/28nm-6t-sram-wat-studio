@@ -4437,35 +4437,55 @@ def estimate_vmin_lot_wafer_ranking(
     return records
 
 
+def estimate_vmin_lowest_vdd_metric_rankings(
+        datasets: list[dict[str, object]]) -> dict[str, object]:
+    """Rank each margin independently from its measured value at minimum VDD."""
+    vdds = sorted({float(row["vdd_v"])
+                   for dataset in datasets for row in dataset["rows"]})
+    if not vdds:
+        return {"vdd_v": None, "rsnm_mv": [], "write_margin_mv": []}
+    minimum_vdd = vdds[0]
+    result: dict[str, object] = {"vdd_v": minimum_vdd}
+    for metric in ("rsnm_mv", "write_margin_mv"):
+        records = []
+        for dataset in datasets:
+            matching = [row for row in dataset["rows"]
+                        if abs(float(row["vdd_v"]) - minimum_vdd) <= 1e-12]
+            value = float(matching[0][metric]) if matching else None
+            records.append({
+                "lot_wafer": str(dataset["lot_wafer"]),
+                "color": str(dataset["color"]),
+                "value_mv": value,
+            })
+        records.sort(key=lambda item: (
+            item["value_mv"] is None, -float(item["value_mv"] or 0.0),
+            str(item["lot_wafer"])))
+        for rank, record in enumerate(records, start=1):
+            record["rank"] = rank if record["value_mv"] is not None else None
+        result[metric] = records
+    return result
+
+
 def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
                                 width: int = 1500, height: int = 720,
                                 transparent_background: bool = False) -> str:
-    """Overlay Lot/Wafer RSNM and BL-margin trends with balanced ranking."""
+    """Overlay Lot/Wafer RSNM and BL-margin trends with a visible rank table."""
     groups = (
         ("Read SNM", (("rsnm_mv", "R", ""),), "RSNM (mV)"),
         ("BL Write Margin", (("write_margin_mv", "BL", ""),), "Vtrip (mV)"),
     )
     left, right, bottom, panel_gap = 92, 48, 84, 72
-    ranking = estimate_vmin_lot_wafer_ranking(datasets)
-    rank_by_label = {str(item["lot_wafer"]): item for item in ranking}
-    ranked_datasets = sorted(
-        datasets, key=lambda item: int(
-            rank_by_label[str(item["lot_wafer"])]["rank"] or 9999))
+    lowest_vdd_rankings = estimate_vmin_lowest_vdd_metric_rankings(datasets)
+    ranked_datasets = list(datasets)
     legend_items = []
     for dataset in ranked_datasets:
-        result = rank_by_label[str(dataset["lot_wafer"])]
-        score = result["balanced_score_pct"]
-        rank_text = (f'#{result["rank"]}' if result["rank"] is not None
-                     else "Unranked")
-        score_text = "N/A" if score is None else f'{float(score):.1f}'
-        label = (f'{rank_text} {dataset["lot_wafer"]} · {score_text} · '
-                 f'{result["evaluated_vdd_count"]} VDD')
-        legend_items.append((label, max(245.0, 70.0 + len(label) * 8.0),
+        label = str(dataset["lot_wafer"])
+        legend_items.append((label, max(150.0, 44.0 + len(label) * 7.0),
                              str(dataset["color"])))
     legend_rows: list[list[tuple[str, float, str]]] = [[]]
     current_width = 0.0
     for item in legend_items:
-        if legend_rows[-1] and current_width + item[1] > width - 700:
+        if legend_rows[-1] and current_width + item[1] > width - 104:
             legend_rows.append([]); current_width = 0.0
         legend_rows[-1].append(item); current_width += item[1]
     top = 145 + len(legend_rows) * 27
@@ -4477,16 +4497,20 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
         raise ValueError("Comparison View requires at least two distinct Model VDD points")
     vdd_min, vdd_max = measured_vdds[0], measured_vdds[-1]
     vdd_span = vdd_max - vdd_min
+    # Place compact, metric-specific minimum-VDD rankings in upper-left plot
+    # space. Each card uses actual RSNM or BL Write Margin, not score.
+    rank_card_width = min(270.0, plot_w - 26.0)
+    rank_card_header_h, rank_card_row_h = 25.0, 20.0
+    rank_card_height = rank_card_header_h + rank_card_row_h * len(datasets) + 6.0
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" style="font-family:Calibri,Microsoft JhengHei,Arial,sans-serif">']
     if not transparent_background:
         parts.append('<rect width="100%" height="100%" fill="#FFFFFF"/>')
     panel_fill = "none" if transparent_background else "#FFFFFF"
     parts += ['<text x="56" y="46" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
              f'<text x="56" y="73" fill="#6E6E73" font-size="16">{len(datasets)} Multi-VDD source(s) · X range {vdd_min:.3f}–{vdd_max:.3f} V</text>',
-             '<text x="330" y="91" fill="#6E6E73" font-size="12" font-weight="700">Lot/Wafer balanced rank · score · compared VDDs</text>',
-             '<path d="M56 108h30" stroke="#3A3A3C" stroke-width="4"/><text x="96" y="113" fill="#3A3A3C" font-size="14">RSNM / BL Write Margin</text>']
+             f'<text x="56" y="91" fill="#6E6E73" font-size="12" font-weight="700">Lowest-VDD ranking at {float(lowest_vdd_rankings["vdd_v"]):.3f} V · actual RSNM / BL Write Margin</text>']
     for row_index, legend_row in enumerate(legend_rows):
-        legend_x = 330 if row_index == 0 else 56
+        legend_x = 56
         legend_y = 113 + row_index * 27
         for label_text, item_width, color in legend_row:
             label = html.escape(label_text)
@@ -4537,6 +4561,36 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
         axis_x = panel_left - 54
         parts += [f'<text x="{axis_x:.1f}" y="{center_y:.1f}" transform="rotate(-90 {axis_x:.1f} {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_label}</text>',
                   f'<text x="{panel_left+plot_w/2:.1f}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Model VDD (V)</text>']
+    minimum_vdd = float(lowest_vdd_rankings["vdd_v"])
+    card_specs = (
+        ("rsnm_mv", "RSNM ranking", "RSNM (mV)"),
+        ("write_margin_mv", "BL Write Margin ranking", "Vtrip (mV)"),
+    )
+    for panel_index, (metric, title, value_label) in enumerate(card_specs):
+        card_left = left + panel_index * (plot_w + panel_gap) + 14.0
+        card_top = top + 14.0
+        card_label_x = card_left + 48.0
+        value_x = card_left + rank_card_width - 12.0
+        parts += [
+            f'<rect x="{card_left:.1f}" y="{card_top:.1f}" width="{rank_card_width:.1f}" height="{rank_card_height:.1f}" rx="8" fill="#FFFFFF" fill-opacity="0.94" stroke="#D8DDE3"/>',
+            f'<rect x="{card_left:.1f}" y="{card_top:.1f}" width="{rank_card_width:.1f}" height="{rank_card_header_h:.1f}" rx="8" fill="#F5F7FA"/>',
+            f'<text x="{card_left + 10:.1f}" y="{card_top + 17:.1f}" fill="#1D1D1F" font-size="11" font-weight="700">{title} @ {minimum_vdd:.2f} V</text>',
+            f'<text x="{value_x:.1f}" y="{card_top + 17:.1f}" text-anchor="end" fill="#6E6E73" font-size="9">{value_label}</text>'
+        ]
+        for row_index, record in enumerate(lowest_vdd_rankings[metric]):
+            row_top = card_top + rank_card_header_h + row_index * rank_card_row_h
+            rank_text = (f'#{record["rank"]}' if record["rank"] is not None
+                         else "—")
+            value_text = ("—" if record["value_mv"] is None else
+                          f'{float(record["value_mv"]):.1f}')
+            if row_index % 2 == 0:
+                parts.append(f'<rect x="{card_left + 1:.1f}" y="{row_top:.1f}" width="{rank_card_width - 2:.1f}" height="{rank_card_row_h:.1f}" fill="#FAFBFC"/>')
+            parts += [
+                f'<text x="{card_left + 10:.1f}" y="{row_top + 14:.1f}" fill="#3A3A3C" font-size="10" font-weight="700">{rank_text}</text>',
+                f'<path d="M{card_left + 31:.1f} {row_top + 12:.1f}h12" stroke="{record["color"]}" stroke-width="4"/>',
+                f'<text x="{card_label_x:.1f}" y="{row_top + 14:.1f}" fill="#1D1D1F" font-size="10">{html.escape(str(record["lot_wafer"]))}</text>',
+                f'<text x="{value_x:.1f}" y="{row_top + 14:.1f}" text-anchor="end" fill="#1D1D1F" font-size="10" font-weight="700">{value_text}</text>'
+            ]
     parts.append('</svg>')
     return "".join(parts)
 
@@ -4986,18 +5040,21 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
                                  "sample_count": row["sample_count"], "rsnm_mv": row["rsnm_mv"],
                                  "write_margin_mv": row["write_margin_mv"],
                                  "source_files": " | ".join(dataset["sources"])})
-    ranking = estimate_vmin_lot_wafer_ranking(datasets)
-    ranking_fields = [
-        "rank", "lot_wafer", "balanced_score_pct",
-        "mean_rsnm_percentile_pct", "mean_write_margin_percentile_pct",
-        "evaluated_vdd_count",
-    ]
+    lowest_vdd_rankings = estimate_vmin_lowest_vdd_metric_rankings(datasets)
+    ranking_fields = ["metric", "rank", "lot_wafer", "minimum_vdd_v", "value_mv"]
     with (out / "estimate_vmin_lot_wafer_ranking.csv").open(
             "w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=ranking_fields)
         writer.writeheader()
-        writer.writerows({key: row.get(key, "") for key in ranking_fields}
-                         for row in ranking)
+        for metric, label in (("rsnm_mv", "RSNM"),
+                              ("write_margin_mv", "BL Write Margin")):
+            for row in lowest_vdd_rankings[metric]:
+                writer.writerow({
+                    "metric": label, "rank": row["rank"],
+                    "lot_wafer": row["lot_wafer"],
+                    "minimum_vdd_v": lowest_vdd_rankings["vdd_v"],
+                    "value_mv": row["value_mv"],
+                })
     attributions = estimate_vmin_worst_cell_attributions(datasets)
     attribution_fields = [
         "source", "metric", "low_vdd_v", "high_vdd_v",
@@ -5080,13 +5137,15 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
         for device in _SIX_MOS_NAMES)
     ranking_table_rows = "".join(
         '<tr>'
+        f'<td>{html.escape(metric_label)}</td>'
         f'<td>{int(row["rank"]) if row["rank"] is not None else "—"}</td>'
         f'<td>{html.escape(str(row["lot_wafer"]))}</td>'
-        f'<td>{cell_text(row.get("balanced_score_pct"), 1)}</td>'
-        f'<td>{cell_text(row.get("mean_rsnm_percentile_pct"), 1)}</td>'
-        f'<td>{cell_text(row.get("mean_write_margin_percentile_pct"), 1)}</td>'
-        f'<td>{int(row["evaluated_vdd_count"])}</td>'
-        '</tr>' for row in ranking)
+        f'<td>{float(lowest_vdd_rankings["vdd_v"]):.3f}</td>'
+        f'<td>{cell_text(row.get("value_mv"), 1)}</td>'
+        '</tr>'
+        for metric, metric_label in (("rsnm_mv", "RSNM"),
+                                     ("write_margin_mv", "BL Write Margin"))
+        for row in lowest_vdd_rankings[metric])
     attribution_table_rows = "".join(
         '<tr>'
         f'<td>{html.escape(str(row["source"]))}</td>'
@@ -5108,6 +5167,13 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
             '<tr><td colspan="11">No adjacent-VDD minimum reversal was detected.</td></tr>')
     report = out / "estimate_vmin_combined_comparison.html"
     report_html = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Estimate Vmin Combined Comparison</title><style>*{{box-sizing:border-box}}body{{margin:0;padding:clamp(10px,2vw,30px);font-family:Calibri,"Microsoft JhengHei",Arial,sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:1750px;margin:auto}}h1{{margin-bottom:4px}}section{{background:#fff;padding:22px;border-radius:16px;margin:18px 0}}img{{display:block;width:100%;height:auto}}.note{{color:#6e6e73}}.downloads{{margin:18px 0}}.table-wrap{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;min-width:1200px;font-variant-numeric:tabular-nums}}th,td{{padding:9px 10px;border-bottom:1px solid #e5e5ea;text-align:right;white-space:nowrap}}th{{position:sticky;top:0;background:#f8f8fa;color:#3a3a3c}}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3),th:nth-child(5),td:nth-child(5),th:nth-child(6),td:nth-child(6){{text-align:left}}small{{color:#6e6e73;font-weight:400}}</style></head><body><main><h1>Estimate Vmin Curves - Comparison View</h1><p class="note">Compared summaries: {" · ".join(html.escape(str(item["lot_wafer"])) for item in datasets)}. Comparison View includes RSNM and BL Write Margin only.</p><section><h2>RSNM / BL Write Margin trends and Lot/Wafer ranking</h2><p class="note">At each shared VDD, both metrics are percentile-ranked across Lot/Wafer sources. The weaker percentile is averaged across VDDs to form the balanced rank; WSNM is excluded.</p><img src="images/{png_path.name}" alt="Estimate Vmin combined summary comparison"><p class="downloads">Original: <a href="images/{svg_path.name}">SVG</a> · <a href="images/{png_path.name}">PNG</a>　 Transparent background: <a href="images/{transparent_svg_path.name}">SVG</a> · <a href="images/{transparent_png_path.name}">PNG</a>　 Trend data: <a href="estimate_vmin_combined_comparison.csv">CSV</a> · <a href="estimate_vmin_lot_wafer_ranking.csv">Ranking CSV</a></p><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Lot/Wafer</th><th>Balanced score (%)</th><th>Mean RSNM percentile (%)</th><th>Mean BL-margin percentile (%)</th><th>Compared VDD count</th></tr></thead><tbody>{ranking_table_rows}</tbody></table></div></section><section><h2>Worst-Cell MOS attribution for reversed adjacent VDD points</h2><p class="note">The two Cells that actually form the minimum curve points are compared. Minimum, P10 and median provide population context. When side-specific six-MOS data exists, both Cells are recalculated at the higher reference VDD and each high-VDD MOS is replaced once by the matching low-VDD MOS; the largest positive recovery identifies the strongest sensitivity candidate. This is attribution screening, not proof of process causality.</p><div class="table-wrap"><table><thead><tr><th>Source</th><th>Metric</th><th>VDD pair</th><th>Low-VDD worst</th><th>High-VDD worst</th><th>Δ minimum (mV)</th><th>P10 low → high</th><th>Median low → high</th><th>Top MOS</th><th>Recovery (mV)</th><th>Method</th></tr></thead><tbody>{attribution_table_rows}</tbody></table></div><p class="downloads"><a href="estimate_vmin_worst_cell_mos_attribution.csv">Download MOS-attribution details</a></p></section><section><h2>Worst Cell at each Model VDD</h2><p class="note">One limiting Cell is listed for Read SNM and BL Write Margin at every source/VDD. New Multi-Cell summaries contain side-specific six-MOS WAT data; legacy summaries fall back to PU/PG/PD family averages.</p><div class="table-wrap"><table><thead><tr><th>Source</th><th>VDD (V)</th><th>Limit</th><th>Margin (mV)</th><th>Lot/Wafer</th><th>Cell/Chip</th><th>CR</th><th>PR</th>{device_headers}<th>Data detail</th></tr></thead><tbody>{worst_table_rows}</tbody></table></div><p class="downloads"><a href="estimate_vmin_worst_cell_details.csv">Download worst-Cell details</a> · <a href="estimate_vmin_comparison_per_cell_data.csv">Download per-Cell comparison data</a></p></section><section><h2>Margin and CR/PR distributions</h2><p class="note">All selected Lot/Wafer sources are pooled within each Model VDD; compare median, IQR and outliers rather than only the limiting Cell.</p><img src="images/{distribution_png_path.name}" alt="Per-cell margin and drive ratio box plots"><p class="downloads"><a href="images/{distribution_svg_path.name}">SVG</a> · <a href="images/{distribution_png_path.name}">PNG</a> · <a href="estimate_vmin_boxplot_statistics.csv">Box statistics CSV</a></p></section><section><h2>Six-MOS Idsat distributions</h2><p class="note">Side-specific PUL/PUR/PGL/PGR/PDL/PDR Idsat is retained when available. Legacy files use family-average fallback and are identified in the worst-Cell table.</p><img src="images/{idsat_png_path.name}" alt="Six-MOS Idsat box plots by VDD"><p class="downloads"><a href="images/{idsat_svg_path.name}">SVG</a> · <a href="images/{idsat_png_path.name}">PNG</a></p></section></main></body></html>'''
+    report_html = (report_html
+        .replace(
+            "At each shared VDD, both metrics are percentile-ranked across Lot/Wafer sources. The weaker percentile is averaged across VDDs to form the balanced rank; WSNM is excluded.",
+            "Rankings use the actual minimum measured Model VDD only. RSNM and BL Write Margin are independently sorted from high to low; WSNM is excluded.")
+        .replace(
+            "<tr><th>Rank</th><th>Lot/Wafer</th><th>Balanced score (%)</th><th>Mean RSNM percentile (%)</th><th>Mean BL-margin percentile (%)</th><th>Compared VDD count</th></tr>",
+            "<tr><th>Metric</th><th>Rank</th><th>Lot/Wafer</th><th>Minimum Model VDD (V)</th><th>Actual value (mV)</th></tr>"))
     report.write_text(report_html, encoding="utf-8")
     return report
 
