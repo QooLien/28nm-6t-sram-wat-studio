@@ -4437,20 +4437,30 @@ def estimate_vmin_lot_wafer_ranking(
     return records
 
 
-def estimate_vmin_lowest_vdd_metric_rankings(
+def estimate_vmin_reference_vdd_metric_rankings(
         datasets: list[dict[str, object]]) -> dict[str, object]:
-    """Rank each margin independently from its measured value at minimum VDD."""
-    vdds = sorted({float(row["vdd_v"])
-                   for dataset in datasets for row in dataset["rows"]})
-    if not vdds:
+    """Rank each margin at the highest VDD shared by all sources.
+
+    The lowest VDD is often below the write-trip resolution, so every
+    BL-write-margin value can be zero and produce a meaningless tie.  The
+    highest shared measured VDD is a stable nominal reference for ranking;
+    the curve still retains the complete VDD sweep for low-voltage analysis.
+    """
+    vdd_sets = [
+        {float(row["vdd_v"]) for row in dataset["rows"]}
+        for dataset in datasets if dataset.get("rows")
+    ]
+    if not vdd_sets:
         return {"vdd_v": None, "rsnm_mv": [], "write_margin_mv": []}
-    minimum_vdd = vdds[0]
-    result: dict[str, object] = {"vdd_v": minimum_vdd}
+    shared_vdds = set.intersection(*vdd_sets)
+    all_vdds = set.union(*vdd_sets)
+    reference_vdd = max(shared_vdds or all_vdds)
+    result: dict[str, object] = {"vdd_v": reference_vdd}
     for metric in ("rsnm_mv", "write_margin_mv"):
         records = []
         for dataset in datasets:
             matching = [row for row in dataset["rows"]
-                        if abs(float(row["vdd_v"]) - minimum_vdd) <= 1e-12]
+                        if abs(float(row["vdd_v"]) - reference_vdd) <= 1e-12]
             value = float(matching[0][metric]) if matching else None
             records.append({
                 "lot_wafer": str(dataset["lot_wafer"]),
@@ -4466,6 +4476,12 @@ def estimate_vmin_lowest_vdd_metric_rankings(
     return result
 
 
+def estimate_vmin_lowest_vdd_metric_rankings(
+        datasets: list[dict[str, object]]) -> dict[str, object]:
+    """Backward-compatible alias for the dynamic reference-VDD ranking."""
+    return estimate_vmin_reference_vdd_metric_rankings(datasets)
+
+
 def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
                                 width: int = 1500, height: int = 720,
                                 transparent_background: bool = False) -> str:
@@ -4475,7 +4491,7 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
         ("BL Write Margin", (("write_margin_mv", "BL", ""),), "Vtrip (mV)"),
     )
     left, right, bottom, panel_gap = 92, 48, 84, 72
-    lowest_vdd_rankings = estimate_vmin_lowest_vdd_metric_rankings(datasets)
+    reference_vdd_rankings = estimate_vmin_reference_vdd_metric_rankings(datasets)
     ranked_datasets = list(datasets)
     legend_items = []
     for dataset in ranked_datasets:
@@ -4508,7 +4524,7 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
     panel_fill = "none" if transparent_background else "#FFFFFF"
     parts += ['<text x="56" y="46" fill="#1D1D1F" font-size="34" font-weight="700">Estimate Vmin Curves - Comparison View</text>',
              f'<text x="56" y="73" fill="#6E6E73" font-size="16">{len(datasets)} Multi-VDD source(s) · X range {vdd_min:.3f}–{vdd_max:.3f} V</text>',
-             f'<text x="56" y="91" fill="#6E6E73" font-size="12" font-weight="700">Lowest-VDD ranking at {float(lowest_vdd_rankings["vdd_v"]):.3f} V · actual RSNM / BL Write Margin</text>']
+             f'<text x="56" y="91" fill="#6E6E73" font-size="12" font-weight="700">Ranking at highest shared VDD {float(reference_vdd_rankings["vdd_v"]):.3f} V · actual RSNM / BL Write Margin</text>']
     for row_index, legend_row in enumerate(legend_rows):
         legend_x = 56
         legend_y = 113 + row_index * 27
@@ -4561,7 +4577,7 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
         axis_x = panel_left - 54
         parts += [f'<text x="{axis_x:.1f}" y="{center_y:.1f}" transform="rotate(-90 {axis_x:.1f} {center_y:.1f})" text-anchor="middle" fill="#1D1D1F" font-size="16" font-weight="700">{y_label}</text>',
                   f'<text x="{panel_left+plot_w/2:.1f}" y="{height-18}" text-anchor="middle" fill="#1D1D1F" font-size="17" font-weight="700">Model VDD (V)</text>']
-    minimum_vdd = float(lowest_vdd_rankings["vdd_v"])
+    reference_vdd = float(reference_vdd_rankings["vdd_v"])
     card_specs = (
         ("rsnm_mv", "RSNM ranking", "RSNM (mV)"),
         ("write_margin_mv", "BL Write Margin ranking", "Vtrip (mV)"),
@@ -4574,10 +4590,10 @@ def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
         parts += [
             f'<rect x="{card_left:.1f}" y="{card_top:.1f}" width="{rank_card_width:.1f}" height="{rank_card_height:.1f}" rx="8" fill="#FFFFFF" fill-opacity="0.94" stroke="#D8DDE3"/>',
             f'<rect x="{card_left:.1f}" y="{card_top:.1f}" width="{rank_card_width:.1f}" height="{rank_card_header_h:.1f}" rx="8" fill="#F5F7FA"/>',
-            f'<text x="{card_left + 10:.1f}" y="{card_top + 17:.1f}" fill="#1D1D1F" font-size="11" font-weight="700">{title} @ {minimum_vdd:.2f} V</text>',
+            f'<text x="{card_left + 10:.1f}" y="{card_top + 17:.1f}" fill="#1D1D1F" font-size="11" font-weight="700">{title} @ {reference_vdd:.2f} V</text>',
             f'<text x="{value_x:.1f}" y="{card_top + 17:.1f}" text-anchor="end" fill="#6E6E73" font-size="9">{value_label}</text>'
         ]
-        for row_index, record in enumerate(lowest_vdd_rankings[metric]):
+        for row_index, record in enumerate(reference_vdd_rankings[metric]):
             row_top = card_top + rank_card_header_h + row_index * rank_card_row_h
             rank_text = (f'#{record["rank"]}' if record["rank"] is not None
                          else "—")
@@ -5040,19 +5056,19 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
                                  "sample_count": row["sample_count"], "rsnm_mv": row["rsnm_mv"],
                                  "write_margin_mv": row["write_margin_mv"],
                                  "source_files": " | ".join(dataset["sources"])})
-    lowest_vdd_rankings = estimate_vmin_lowest_vdd_metric_rankings(datasets)
-    ranking_fields = ["metric", "rank", "lot_wafer", "minimum_vdd_v", "value_mv"]
+    reference_vdd_rankings = estimate_vmin_reference_vdd_metric_rankings(datasets)
+    ranking_fields = ["metric", "rank", "lot_wafer", "ranking_vdd_v", "value_mv"]
     with (out / "estimate_vmin_lot_wafer_ranking.csv").open(
             "w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=ranking_fields)
         writer.writeheader()
         for metric, label in (("rsnm_mv", "RSNM"),
                               ("write_margin_mv", "BL Write Margin")):
-            for row in lowest_vdd_rankings[metric]:
+            for row in reference_vdd_rankings[metric]:
                 writer.writerow({
                     "metric": label, "rank": row["rank"],
                     "lot_wafer": row["lot_wafer"],
-                    "minimum_vdd_v": lowest_vdd_rankings["vdd_v"],
+                    "ranking_vdd_v": reference_vdd_rankings["vdd_v"],
                     "value_mv": row["value_mv"],
                 })
     attributions = estimate_vmin_worst_cell_attributions(datasets)
@@ -5140,12 +5156,12 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
         f'<td>{html.escape(metric_label)}</td>'
         f'<td>{int(row["rank"]) if row["rank"] is not None else "—"}</td>'
         f'<td>{html.escape(str(row["lot_wafer"]))}</td>'
-        f'<td>{float(lowest_vdd_rankings["vdd_v"]):.3f}</td>'
+        f'<td>{float(reference_vdd_rankings["vdd_v"]):.3f}</td>'
         f'<td>{cell_text(row.get("value_mv"), 1)}</td>'
         '</tr>'
         for metric, metric_label in (("rsnm_mv", "RSNM"),
                                      ("write_margin_mv", "BL Write Margin"))
-        for row in lowest_vdd_rankings[metric])
+        for row in reference_vdd_rankings[metric])
     attribution_table_rows = "".join(
         '<tr>'
         f'<td>{html.escape(str(row["source"]))}</td>'
@@ -5170,10 +5186,10 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
     report_html = (report_html
         .replace(
             "At each shared VDD, both metrics are percentile-ranked across Lot/Wafer sources. The weaker percentile is averaged across VDDs to form the balanced rank; WSNM is excluded.",
-            "Rankings use the actual minimum measured Model VDD only. RSNM and BL Write Margin are independently sorted from high to low; WSNM is excluded.")
+            "Rankings use the highest Model VDD shared by all sources. RSNM and BL Write Margin are independently sorted from high to low; WSNM is excluded.")
         .replace(
             "<tr><th>Rank</th><th>Lot/Wafer</th><th>Balanced score (%)</th><th>Mean RSNM percentile (%)</th><th>Mean BL-margin percentile (%)</th><th>Compared VDD count</th></tr>",
-            "<tr><th>Metric</th><th>Rank</th><th>Lot/Wafer</th><th>Minimum Model VDD (V)</th><th>Actual value (mV)</th></tr>"))
+            "<tr><th>Metric</th><th>Rank</th><th>Lot/Wafer</th><th>Ranking VDD (V)</th><th>Actual value (mV)</th></tr>"))
     report.write_text(report_html, encoding="utf-8")
     return report
 
