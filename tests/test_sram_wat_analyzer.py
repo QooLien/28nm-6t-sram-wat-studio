@@ -888,6 +888,15 @@ class AnalyzerTests(unittest.TestCase):
                              "estimate_vmin_lot_wafer_ranking.csv").exists())
             self.assertTrue((report.parent /
                              "estimate_vmin_worst_cell_mos_attribution.csv").exists())
+            with (report.parent / "estimate_vmin_lot_wafer_ranking.csv").open(
+                    newline="", encoding="utf-8-sig") as stream:
+                ranking_rows = list(csv.DictReader(stream))
+            self.assertEqual(len(ranking_rows), 4)
+            self.assertEqual(sorted({float(row["vdd_v"]) for row in ranking_rows}),
+                             [.60, .80])
+            self.assertEqual({row["reference_vdd_v"] for row in ranking_rows}, {"0.8"})
+            self.assertEqual(sum(row["is_reference_vdd"] == "Y"
+                                 for row in ranking_rows), 2)
             document = report.read_text(encoding="utf-8")
             self.assertIn("Worst Cell at each Model VDD", document)
             self.assertIn("Worst-Cell MOS attribution", document)

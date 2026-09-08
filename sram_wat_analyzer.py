@@ -4482,6 +4482,38 @@ def estimate_vmin_lowest_vdd_metric_rankings(
     return estimate_vmin_reference_vdd_metric_rankings(datasets)
 
 
+def estimate_vmin_all_vdd_metric_rankings(
+        datasets: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return independent RSNM/write-margin rankings for every measured VDD."""
+    vdds = sorted({float(row["vdd_v"])
+                   for dataset in datasets for row in dataset["rows"]})
+    records: list[dict[str, object]] = []
+    for vdd in vdds:
+        for metric, metric_label in (
+                ("rsnm_mv", "RSNM"),
+                ("write_margin_mv", "BL Write Margin")):
+            entries = []
+            for dataset in datasets:
+                matching = [row for row in dataset["rows"]
+                            if abs(float(row["vdd_v"]) - vdd) <= 1e-12]
+                value = (float(matching[0][metric]) if matching else None)
+                entries.append({
+                    "metric": metric_label,
+                    "lot_wafer": str(dataset["lot_wafer"]),
+                    "vdd_v": vdd,
+                    "value_mv": value,
+                    "color": str(dataset["color"]),
+                })
+            entries.sort(key=lambda item: (
+                item["value_mv"] is None,
+                -float(item["value_mv"] or 0.0),
+                str(item["lot_wafer"])))
+            for rank, entry in enumerate(entries, start=1):
+                entry["rank"] = rank if entry["value_mv"] is not None else None
+                records.append(entry)
+    return records
+
+
 def estimate_vmin_combined_comparison_svg(datasets: list[dict[str, object]],
                                 width: int = 1500, height: int = 720,
                                 transparent_background: bool = False) -> str:
@@ -5057,20 +5089,25 @@ def write_estimate_vmin_combined_comparison_outputs(datasets: list[dict[str, obj
                                  "write_margin_mv": row["write_margin_mv"],
                                  "source_files": " | ".join(dataset["sources"])})
     reference_vdd_rankings = estimate_vmin_reference_vdd_metric_rankings(datasets)
-    ranking_fields = ["metric", "rank", "lot_wafer", "ranking_vdd_v", "value_mv"]
+    all_vdd_rankings = estimate_vmin_all_vdd_metric_rankings(datasets)
+    ranking_vdd = float(reference_vdd_rankings["vdd_v"])
+    ranking_fields = [
+        "metric", "rank", "lot_wafer", "vdd_v", "value_mv",
+        "reference_vdd_v", "is_reference_vdd",
+    ]
     with (out / "estimate_vmin_lot_wafer_ranking.csv").open(
             "w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=ranking_fields)
         writer.writeheader()
-        for metric, label in (("rsnm_mv", "RSNM"),
-                              ("write_margin_mv", "BL Write Margin")):
-            for row in reference_vdd_rankings[metric]:
-                writer.writerow({
-                    "metric": label, "rank": row["rank"],
-                    "lot_wafer": row["lot_wafer"],
-                    "ranking_vdd_v": reference_vdd_rankings["vdd_v"],
-                    "value_mv": row["value_mv"],
-                })
+        for row in all_vdd_rankings:
+            writer.writerow({
+                "metric": row["metric"], "rank": row["rank"],
+                "lot_wafer": row["lot_wafer"], "vdd_v": row["vdd_v"],
+                "value_mv": row["value_mv"],
+                "reference_vdd_v": ranking_vdd,
+                "is_reference_vdd": ("Y" if abs(float(row["vdd_v"]) - ranking_vdd) <= 1e-12
+                                      else "N"),
+            })
     attributions = estimate_vmin_worst_cell_attributions(datasets)
     attribution_fields = [
         "source", "metric", "low_vdd_v", "high_vdd_v",
