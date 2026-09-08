@@ -220,6 +220,10 @@ The manual curve tab uses the same dated archive structure with the `rsnm_vdd_cu
 
 The WAT Vt/Idsat conversion, Read SNM, analytical RSNM, and Write Margin Test equations are explained in Traditional Chinese in the [HV28 SRAM Analysis Formula Guide (PDF)](https://github.com/QooLien/28nm-6t-sram-wat-studio/releases/download/v1.5.0/HV28_SRAM_Analysis_Formula_Guide.pdf). The reproducible source is `tools/generate_formula_guide_zh.py`.
 
+## 64-chip Wafer Vmin P90 tool
+
+The standalone macro-enabled workbook and its fixed wafer-coordinate reference are stored in `wafer_vmin_p90_tool/`. The wafer map contains 64 chips from Y10 through Y17, with X10Y10 as the top-left chip. Calculated P90 Vmin values are automatically placed at their matching X/Y coordinates.
+
 ## Presentation decks
 
 - `output/reference/presentations/HV28_SRAM_Core_Formulas_Chinese_v5.pptx`: Traditional Chinese explanation with curve-matched Read SNM and Write SNM figures.

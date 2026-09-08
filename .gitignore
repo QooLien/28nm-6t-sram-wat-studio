@@ -24,3 +24,5 @@ venv/
 *.log
 Thumbs.db
 .DS_Store
+node_modules/
+wafer_vmin_p90_tool/build/
